@@ -20,6 +20,9 @@ pub struct Config {
     /// Группы, к которым подключаемся автоматически при старте `run`.
     #[serde(default)]
     pub autojoin: Vec<u32>,
+    /// Тема оформления TUI: dark | light | contrast.
+    #[serde(default)]
+    pub theme: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

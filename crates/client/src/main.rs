@@ -24,10 +24,12 @@
 //!   del-friend <alias>          — удалить друга
 //!   friends                     — список друзей
 //!   run                         — поднять туннель (autojoin-группы)
+//!   tui                         — поднять туннель с графическим интерфейсом
 
 mod engine;
 mod store;
 mod tun;
+mod tui;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -319,14 +321,27 @@ fn main() -> Result<()> {
                 println!("{:<16} {}", f.alias, f.pubkey);
             }
         }
-        "run" => {
+        "run" | "tui" | "ui" => {
             let (server, pub_key) = pick_server(&cfg, server_sel.as_deref())?;
             if cfg.name.is_empty() {
                 bail!("задай имя: set-name <имя>");
             }
             save(&cfg)?;
             let cfg = Arc::new(cfg);
-            engine::run(cfg, server, pub_key, identity.clone(), &adapter, dll)?;
+            if cmd == "run" {
+                engine::run(cfg, server, pub_key, identity.clone(), &adapter, dll)?;
+            } else {
+                let store = Arc::new(store::Store::new(&dir));
+                tui::run(
+                    cfg,
+                    server,
+                    pub_key,
+                    identity.clone(),
+                    &adapter,
+                    dll,
+                    store,
+                )?;
+            }
         }
         other => {
             eprintln!("неизвестная команда: {other:?}");
@@ -354,6 +369,7 @@ global: --dir <path> --debug
   friend-groups <peer>
   add-friend <code> [alias] | del-friend <alias> | friends
   run                         поднять туннель (global: --adapter --dll --server <N>)
+  tui                         то же, но с графическим интерфейсом (ratatui)
 peer = friend code (TUN-…) | hex | alias"#
     );
 }

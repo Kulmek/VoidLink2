@@ -144,6 +144,8 @@ pub enum Cmd {
     Ban(u32, [u8; 32]),
     SetName(String),
     SetStatus(String),
+    /// Переключить автовход в группу (локальная настройка).
+    ToggleAutojoin(u32),
     FriendGroups([u8; 32]),
     Quit,
 }
@@ -158,6 +160,16 @@ pub struct Engine {
     pub events: mpsc::Receiver<Event>,
     pub cmds: mpsc::Sender<Cmd>,
     pub cfg: Arc<Mutex<Config>>,
+    /// Колбэк сохранения конфига (UI может править client.json напрямую).
+    save: Arc<dyn Fn(&Config) + Send + Sync>,
+}
+
+impl Engine {
+    /// Сохраняет конфиг через колбэк движка.
+    pub fn save_config(&self, cfg: &Config) -> Result<()> {
+        (self.save)(cfg);
+        Ok(())
+    }
 }
 
 // ---------- общий контекст потоков ----------
@@ -357,6 +369,12 @@ impl CtrlConn {
 
 // ---------- запуск ----------
 
+/// Заглушка дата-сокета до первого подключения: tun-поток читает текущий
+/// сокет сам, поэтому значение заменяется при успешном connect.
+fn conn_sock_placeholder() -> Arc<UdpSocket> {
+    Arc::new(UdpSocket::bind("0.0.0.0:0").expect("bind placeholder socket"))
+}
+
 /// Загружает Wintun, создаёт адаптер, запускает потоки и возвращает дескриптор
 /// движка. Первое подключение выполняется синхронно (ошибка видна вызывающему).
 pub fn start(
@@ -403,6 +421,7 @@ pub fn start(
     // Текущий дата-сокет (меняется при реконнекте); tun-поток берёт его сам.
     let cur_sock: Arc<RwLock<Arc<UdpSocket>>> = Arc::new(RwLock::new(conn_sock_placeholder()));
 
+    let save_arc = save.clone();
     let env = Arc::new(Env {
         groups: groups.clone(),
         meta: meta.clone(),
@@ -450,6 +469,7 @@ pub fn start(
         events: ev_rx,
         cmds: cmd_tx,
         cfg,
+        save: save_arc,
     })
 }
 
@@ -471,6 +491,7 @@ fn engine_loop(
     adapter: Arc<wintun::Adapter>,
     configured: Arc<Mutex<HashSet<u32>>>,
     session: Arc<wintun::Session>,
+    cur_sock: Arc<RwLock<Arc<UdpSocket>>>,
 ) {
     let mut backoff = Duration::from_secs(1);
     let mut cur: Option<CtrlConn> = Some(conn);
@@ -484,6 +505,8 @@ fn engine_loop(
             match CtrlConn::connect(&cfg_snap, env.server, &server_pub, &env.identity) {
                 Ok(c) => {
                     backoff = Duration::from_secs(1);
+                    // Новый дата-сокет — tun-поток должен писать в него.
+                    *cur_sock.write().unwrap() = c.sock.clone();
                     cur = Some(c);
                 }
                 Err(e) => {
@@ -517,7 +540,7 @@ fn engine_loop(
 }
 
 /// Пауза между попытками реконнекта; false = получен Quit.
-fn sleep_with_quit(env: &Env, cmd_rx: &mpsc::Receiver<Cmd>, d: Duration) -> bool {
+fn sleep_with_quit(_env: &Env, cmd_rx: &mpsc::Receiver<Cmd>, d: Duration) -> bool {
     let end = Instant::now() + d;
     loop {
         let now = Instant::now();
@@ -644,6 +667,14 @@ fn do_cmd(env: &Env, conn: &CtrlConn, cmd: Cmd) -> Flow {
             let cfg = env.cfg.lock().unwrap().clone();
             if !cfg.status.is_empty() {
                 conn.send_ctrl(ctrl::STATUS, &payloads::enc_status(&cfg.status));
+            }
+        }
+        Cmd::ToggleAutojoin(gid) => {
+            let on = env.cfg.lock().unwrap().autojoin.contains(&gid);
+            if on {
+                env.autojoin_remove(gid);
+            } else {
+                env.autojoin_add(gid);
             }
         }
         Cmd::FriendGroups(pk) => {
@@ -817,7 +848,7 @@ fn apply_group_state(
                 },
             );
         }
-        let mut cfg = configured.lock().unwrap();
+        let cfg = configured.lock().unwrap();
         (!cfg.contains(&st.my_ip), is_new)
     };
     if is_new {
