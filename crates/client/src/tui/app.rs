@@ -201,7 +201,7 @@ pub struct ListItem {
 
 pub enum ListAction {
     PickServer,
-    ToggleAutojoin(u32),
+    ToggleAutojoin,
 }
 
 pub struct ListPickPopup {
@@ -912,16 +912,43 @@ impl App {
                 KeyCode::Enter => {
                     match p.action {
                         ListAction::PickServer => {
-                            let label = p
-                                .items
-                                .get(p.sel)
-                                .map(|i| i.label.clone())
-                                .unwrap_or_default();
-                            self.status_msg = format!("сервер: {label}");
-                            self.toast(MsgKind::Info, format!("выбран сервер {label}"));
+                            // Выбранный сервер становится первым в client.json:
+                            // `run`/`tui` без --server берут первый. Раньше выбор
+                            // только показывал тост и нигде не сохранялся.
+                            let idx = p.items.get(p.sel).and_then(|i| i.value.parse::<usize>().ok());
+                            let mut cfg = eng.cfg.lock().unwrap().clone();
+                            match idx.filter(|i| *i < cfg.servers.len()) {
+                                Some(i) => {
+                                    let picked = cfg.servers.remove(i);
+                                    let addr = picked.addr.clone();
+                                    cfg.servers.insert(0, picked);
+                                    match save_cfg(eng, cfg) {
+                                        Ok(()) => {
+                                            self.status_msg = format!("сервер: {addr}");
+                                            self.toast(
+                                                MsgKind::Ok,
+                                                format!("сервер {addr} — применится после перезапуска"),
+                                            );
+                                        }
+                                        Err(e) => self
+                                            .toast(MsgKind::Error, format!("не сохранить сервер: {e}")),
+                                    }
+                                }
+                                None => self.toast(MsgKind::Warn, "сервер не выбран".into()),
+                            }
                         }
-                        ListAction::ToggleAutojoin(gid) => {
-                            let _ = eng.cmds.send(Cmd::ToggleAutojoin(gid));
+                        ListAction::ToggleAutojoin => {
+                            // gid берём из выбранной строки: в действии лежит
+                            // заглушка 0, из-за которой переключалась «группа 0».
+                            let gid = p.items.get(p.sel).and_then(|i| i.value.parse::<u32>().ok());
+                            if let Some(gid) = gid {
+                                let _ = eng.cmds.send(Cmd::ToggleAutojoin(gid));
+                                if let Some(item) = p.items.get_mut(p.sel) {
+                                    item.checked = !item.checked;
+                                }
+                                // Список остаётся открытым: можно отметить несколько групп.
+                                self.stack.push(Popup::ListPick(p));
+                            }
                         }
                     }
                 }
@@ -1256,9 +1283,15 @@ impl App {
                     .iter()
                     .enumerate()
                     .map(|(i, s)| ListItem {
-                        label: format!("{}: {}", i, s.addr),
-                        checked: false,
-                        value: s.label.clone(),
+                        label: if s.label.is_empty() {
+                            format!("{}: {}", i, s.addr)
+                        } else {
+                            format!("{}: {} ({})", i, s.addr, s.label)
+                        },
+                        // Отмечен сервер, к которому подключены сейчас.
+                        checked: s.addr.parse::<std::net::SocketAddr>().ok()
+                            == Some(eng.meta.lock().unwrap().server),
+                        value: i.to_string(),
                     })
                     .collect();
                 if items.is_empty() {
@@ -1291,7 +1324,7 @@ impl App {
                     title: "Автовход (Enter — переключить)".into(),
                     items,
                     sel: 0,
-                    action: ListAction::ToggleAutojoin(0),
+                    action: ListAction::ToggleAutojoin,
                 }));
             }
             SettingRow::Theme => {
