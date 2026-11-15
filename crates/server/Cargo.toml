@@ -1,8 +1,11 @@
 [package]
 name = "tunnel-server"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
 tunnel-protocol = { path = "../protocol" }
 anyhow.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
