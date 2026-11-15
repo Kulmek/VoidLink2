@@ -1,0 +1,17 @@
+# Rust / Cargo
+/target
+
+# Wintun driver artifacts (dll хранится в vendor/ намеренно)
+*.exp
+*.lib
+*.pdb
+
+# CodeGraph local state
+.codegraph/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini
