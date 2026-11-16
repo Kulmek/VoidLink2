@@ -193,7 +193,7 @@ pub fn run(cfg: &mut Config, adapter: &mut String, dll: &mut Option<String>) -> 
         dll: dll.clone().unwrap_or_default(),
     };
 
-    let mut term = setup_terminal()?;
+    let mut term = setup_terminal(false)?;
     let my_code = crate::store::ensure_identity(cfg).friend_code();
     let res = loop_(&mut term, &mut form, cfg, adapter, dll, &th, &my_code);
     restore_terminal(&mut term)?;

@@ -54,7 +54,7 @@ pub fn run(
         Arc::new(save),
     )?;
 
-    let mut term = setup_terminal()?;
+    let mut term = setup_terminal(true)?;
     let cfg_snapshot = eng.cfg.lock().unwrap().clone();
     let mut app = App::new(eng.my_pub, &eng.my_code, &cfg_snapshot);
     let res = event_loop(&mut term, &mut app, &eng);
@@ -64,12 +64,33 @@ pub fn run(
     res
 }
 
-pub(crate) fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
+/// `mouse` — захват мыши (клики, колесо; выделение текста терминалом — с
+/// Shift). Экрану первичной настройки мышь не нужна: без захвата поток
+/// событий движения не вызывает лишних перерисовок.
+pub(crate) fn setup_terminal(mouse: bool) -> Result<Terminal<CrosstermBackend<Stdout>>> {
+    install_panic_hook();
     enable_raw_mode()?;
     let mut out = std::io::stdout();
-    // Захват мыши: клики, колесо. Выделение текста терминалом — с Shift.
-    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(out, EnterAlternateScreen)?;
+    if mouse {
+        execute!(out, EnableMouseCapture)?;
+    }
     Ok(Terminal::new(CrosstermBackend::new(out))?)
+}
+
+/// При панике вернуть терминал в нормальный режим до печати сообщения —
+/// иначе консоль остаётся в raw-режиме, на альтернативном экране и с
+/// захватом мыши, а текст паники не виден.
+fn install_panic_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = disable_raw_mode();
+            let _ = execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+            prev(info);
+        }));
+    });
 }
 
 pub(crate) fn restore_terminal(term: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {

@@ -2,33 +2,58 @@
 //!
 //! Движок ничего не знает о UI: он публикует состояние (groups/meta/stats)
 //! и шлёт события в канал; команды UI → движок идут через канал Cmd.
-//! При потере сервера переподключается с нарастающим интервалом.
+//!
+//! Потоки:
+//! - `rx` — блокирующий приём с единственного UDP-сокета. Групповые фреймы
+//!   (DATA/PING/PONG/PUNCH/KEEPALIVE) обрабатывает сам, сразу; управляющие
+//!   фреймы сервера передаёт движку. P2P работает и пока сервер недоступен.
+//! - `engine` — состояние соединения с сервером, команды UI, таймеры (RTT,
+//!   NAT, CTRL_PING, список групп, повтор LEAVE). Таймеры идут по часам, а
+//!   не по паузам в приёме: под нагрузкой они не «замерзают».
+//! - `tun` — пакеты из адаптера → пирам (напрямую или через релей).
+//! - `sampler` — раз в секунду скорость трафика для спарклайна.
+//!
+//! Сокет один на всё время работы: при реконнекте шлётся новый HELLO с того
+//! же адреса, NAT-маппинги и прямые каналы с пирами не рвутся.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use tunnel_protocol as proto;
 use proto::ctrl;
 use proto::payloads;
+use tunnel_protocol as proto;
 
 use crate::store::Config;
 
 const MTU: usize = 1400;
 const RING_CAPACITY: u32 = 0x40_0000; // 4 MiB
-const TICK: Duration = Duration::from_millis(250);
-const RTT_EVERY: Duration = Duration::from_secs(1);
-const NAT_EVERY: Duration = Duration::from_secs(5);
-const LIST_EVERY: Duration = Duration::from_secs(10);
+/// Шаг цикла движка (верхняя граница задержки таймеров).
+const TICK: Duration = Duration::from_millis(100);
+/// RTT-зонд онлайн-пирам. Для прямых каналов он же держит NAT-маппинг.
+const RTT_EVERY: Duration = Duration::from_secs(2);
+/// PUNCH онлайн-пирам без прямого канала.
+const PUNCH_EVERY: Duration = Duration::from_secs(5);
+/// CTRL_PING серверу (сервер держит сессию 30 с без пакетов).
+const PING_EVERY: Duration = Duration::from_secs(5);
+const LIST_EVERY: Duration = Duration::from_secs(15);
 const SERVER_TIMEOUT: Duration = Duration::from_secs(20);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
+/// Нет прямых фреймов от пира столько — прямой канал считается потерянным,
+/// трафик идёт через релей (пир сменил порт, NAT закрыл маппинг…).
+const DIRECT_TIMEOUT: Duration = Duration::from_secs(12);
+/// LEAVE повторяется, пока сервер не подтвердит выход списком групп.
+const LEAVE_RETRY: Duration = Duration::from_secs(1);
+const LEAVE_GIVE_UP: Duration = Duration::from_secs(20);
 const HISTORY_LEN: usize = 60;
 const NEW_GROUP_GRACE: Duration = Duration::from_secs(10);
+/// Таймаут чтения rx-потока (как часто он проверяет флаг выхода).
+const RX_POLL: Duration = Duration::from_millis(250);
 
 static DEBUG: AtomicBool = AtomicBool::new(false);
 pub fn set_debug(on: bool) {
@@ -50,6 +75,8 @@ pub struct PeerSess {
     pub endpoint: Option<SocketAddr>,
     pub direct: bool,
     pub last_rx: Instant,
+    /// Последний фрейм пира, пришедший напрямую (не через релей).
+    pub last_direct: Option<Instant>,
     pub rtt_ms: Option<u64>,
 }
 
@@ -112,7 +139,7 @@ impl Meta {
 }
 
 /// События движок → UI.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Event {
     Connected(SocketAddr),
     Disconnected(String),
@@ -131,7 +158,7 @@ pub enum Event {
 }
 
 /// Команды UI → движок.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Cmd {
     RefreshList,
     Create { name: String, private: bool },
@@ -162,6 +189,7 @@ pub struct Engine {
     pub cfg: Arc<Mutex<Config>>,
     /// Колбэк сохранения конфига (UI может править client.json напрямую).
     save: Arc<dyn Fn(&Config) + Send + Sync>,
+    env: Arc<Env>,
 }
 
 impl Engine {
@@ -169,6 +197,63 @@ impl Engine {
     pub fn save_config(&self, cfg: &Config) -> Result<()> {
         (self.save)(cfg);
         Ok(())
+    }
+
+    /// Локальный адрес UDP-сокета движка.
+    #[allow(dead_code)]
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        self.env.sock.local_addr().ok()
+    }
+
+    /// Отправить IP-пакет в туннель так же, как это делает tun-поток
+    /// (для тестов и отладки без адаптера).
+    #[allow(dead_code)]
+    pub fn send_ip_packet(&self, packet: &[u8]) {
+        route_packet(&self.env, packet);
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        // Останавливаем потоки rx/engine (tun-поток завершится вместе с
+        // сессией адаптера).
+        self.env.quit.store(true, Ordering::Relaxed);
+        let _ = self.cmds.send(Cmd::Quit);
+    }
+}
+
+// ---------- устройство туннеля ----------
+
+/// То, что движку нужно от сетевого адаптера. Реальная реализация — Wintun;
+/// в тестах — заглушка, которая просто запоминает пакеты.
+pub trait TunDev: Send + Sync {
+    /// Вбросить IP-пакет «из сети» в систему.
+    fn inject(&self, packet: &[u8]) -> Result<()>;
+    /// Назначить адаптеру IP группы (идемпотентно).
+    fn ensure_address(&self, ip: u32) -> Result<()>;
+}
+
+struct WintunDev {
+    adapter: Arc<wintun::Adapter>,
+    session: Arc<wintun::Session>,
+    configured: Mutex<HashSet<u32>>,
+}
+
+impl TunDev for WintunDev {
+    fn inject(&self, packet: &[u8]) -> Result<()> {
+        let len: u16 = packet.len().try_into().context("packet too large")?;
+        let mut p = self
+            .session
+            .allocate_send_packet(len)
+            .context("allocate_send_packet")?;
+        p.bytes_mut().copy_from_slice(packet);
+        self.session.send_packet(p);
+        Ok(())
+    }
+
+    fn ensure_address(&self, ip: u32) -> Result<()> {
+        let mut cfg = self.configured.lock().unwrap();
+        crate::tun::ensure_address(&self.adapter, &mut cfg, ip)
     }
 }
 
@@ -183,6 +268,10 @@ struct Env {
     save: Arc<dyn Fn(&Config) + Send + Sync>,
     identity: proto::Identity,
     server: SocketAddr,
+    /// Единственный UDP-сокет: и сервер, и пиры.
+    sock: Arc<UdpSocket>,
+    tun: Arc<dyn TunDev>,
+    quit: AtomicBool,
     /// Кому адресован ответ FRIEND_GROUPS_RESP.
     pending_friend: Mutex<Option<[u8; 32]>>,
 }
@@ -190,6 +279,17 @@ struct Env {
 impl Env {
     fn emit(&self, e: Event) {
         let _ = self.ev.send(e);
+    }
+
+    fn quitting(&self) -> bool {
+        self.quit.load(Ordering::Relaxed)
+    }
+
+    fn send(&self, frame: &[u8], to: SocketAddr) {
+        if self.sock.send_to(frame, to).is_ok() {
+            self.stats.tx_pkts.fetch_add(1, Ordering::Relaxed);
+            self.stats.tx_bytes.fetch_add(frame.len() as u64, Ordering::Relaxed);
+        }
     }
 
     fn autojoin_add(&self, gid: u32) {
@@ -237,7 +337,25 @@ fn quoted(s: &str) -> Option<String> {
     Some(rest[..b].to_string())
 }
 
-// ---------- управляющее соединение ----------
+fn hello_frame(cfg: &Config, identity: &proto::Identity) -> Vec<u8> {
+    let sign_msg = payloads::hello_sign_bytes(
+        &identity.ed_pub(),
+        &identity.x_pub(),
+        &cfg.name,
+        proto::PROTOCOL_VERSION,
+    );
+    let sig = identity.sign(&sign_msg);
+    let hello = payloads::enc_hello(
+        &identity.ed_pub(),
+        &identity.x_pub(),
+        &cfg.name,
+        proto::PROTOCOL_VERSION,
+        &sig,
+    );
+    proto::plain_frame(ctrl::HELLO, &hello)
+}
+
+// ---------- однократное управляющее соединение (CLI-команды) ----------
 
 pub struct CtrlConn {
     pub sock: Arc<UdpSocket>,
@@ -255,30 +373,21 @@ impl CtrlConn {
         identity: &proto::Identity,
     ) -> Result<Self> {
         let sock = Arc::new(UdpSocket::bind("0.0.0.0:0").context("bind udp")?);
-        let sign_msg = payloads::hello_sign_bytes(
-            &identity.ed_pub(),
-            &identity.x_pub(),
-            &cfg.name,
-            proto::PROTOCOL_VERSION,
-        );
-        let sig = identity.sign(&sign_msg);
-        let hello = payloads::enc_hello(
-            &identity.ed_pub(),
-            &identity.x_pub(),
-            &cfg.name,
-            proto::PROTOCOL_VERSION,
-            &sig,
-        );
-        sock.send_to(&proto::plain_frame(ctrl::HELLO, &hello), server)?;
-
+        let hello = hello_frame(cfg, identity);
         sock.set_read_timeout(Some(Duration::from_millis(200))).ok();
         let deadline = Instant::now() + Duration::from_secs(10);
-        let ctrl_key;
+        let mut next_hello = Instant::now();
+        let mut buf = vec![0u8; 65_535];
         loop {
-            if Instant::now() > deadline {
+            let now = Instant::now();
+            if now > deadline {
                 anyhow::bail!("нет WELCOME от сервера (адрес/код сервера верны?)");
             }
-            let mut buf = vec![0u8; 65_535];
+            // HELLO повторяется: UDP может его потерять.
+            if now >= next_hello {
+                sock.send_to(&hello, server)?;
+                next_hello = now + Duration::from_secs(1);
+            }
             let (n, src) = match sock.recv_from(&mut buf) {
                 Ok(x) => x,
                 Err(_) => continue,
@@ -286,23 +395,20 @@ impl CtrlConn {
             if src != server {
                 continue;
             }
-            let (typ, body) = match proto::split_frame(&buf[..n]) {
-                Ok(x) => x,
-                Err(_) => continue,
+            let Ok((typ, body)) = proto::split_frame(&buf[..n]) else {
+                continue;
             };
             if typ != ctrl::WELCOME {
                 continue;
             }
             let (x_pub, w_sig) = payloads::dec_welcome(body)?;
             proto::Identity::verify(server_pub, &x_pub, &w_sig).context("WELCOME signature")?;
-            ctrl_key = identity.ctrl_key_with(&x_pub);
-            break;
+            return Ok(Self {
+                ctrl_key: identity.ctrl_key_with(&x_pub),
+                server,
+                sock,
+            });
         }
-        Ok(Self {
-            ctrl_key,
-            server,
-            sock,
-        })
     }
 
     pub fn send_ctrl(&self, typ: u8, payload: &[u8]) {
@@ -311,34 +417,15 @@ impl CtrlConn {
             .send_to(&proto::seal_ctrl(&self.ctrl_key, typ, payload), self.server);
     }
 
-    /// Повторный HELLO (та же identity, новое имя) — сервер обновит имя.
-    pub fn resend_hello(&self, cfg: &Config, identity: &proto::Identity) {
-        let sign_msg = payloads::hello_sign_bytes(
-            &identity.ed_pub(),
-            &identity.x_pub(),
-            &cfg.name,
-            proto::PROTOCOL_VERSION,
-        );
-        let sig = identity.sign(&sign_msg);
-        let hello = payloads::enc_hello(
-            &identity.ed_pub(),
-            &identity.x_pub(),
-            &cfg.name,
-            proto::PROTOCOL_VERSION,
-            &sig,
-        );
-        let _ = self.sock.send_to(&proto::plain_frame(ctrl::HELLO, &hello), self.server);
-    }
-
     /// Ждёт фрейм конкретного типа; ERROR превращает в Err; прочее игнорируется.
     pub fn wait_for(&self, expect: u8, timeout: Duration) -> Result<Vec<u8>> {
         let deadline = Instant::now() + timeout;
         self.sock.set_read_timeout(Some(Duration::from_millis(200))).ok();
+        let mut buf = vec![0u8; 65_535];
         loop {
             if Instant::now() > deadline {
                 anyhow::bail!("таймаут ожидания {expect:#04x} от сервера");
             }
-            let mut buf = vec![0u8; 65_535];
             let (n, src) = match self.sock.recv_from(&mut buf) {
                 Ok(x) => x,
                 Err(_) => continue,
@@ -369,12 +456,6 @@ impl CtrlConn {
 
 // ---------- запуск ----------
 
-/// Заглушка дата-сокета до первого подключения: tun-поток читает текущий
-/// сокет сам, поэтому значение заменяется при успешном connect.
-fn conn_sock_placeholder() -> Arc<UdpSocket> {
-    Arc::new(UdpSocket::bind("0.0.0.0:0").expect("bind placeholder socket"))
-}
-
 /// Загружает Wintun, создаёт адаптер, запускает потоки и возвращает дескриптор
 /// движка. Первое подключение выполняется синхронно (ошибка видна вызывающему).
 pub fn start(
@@ -386,10 +467,35 @@ pub fn start(
     dll: Option<String>,
     save: Arc<dyn Fn(&Config) + Send + Sync>,
 ) -> Result<Engine> {
-    let (ev_tx, ev_rx) = mpsc::channel();
-    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let wintun = crate::tun::load_wintun_dll(dll.as_deref())?;
+    let adapter = crate::tun::create_adapter(&wintun, adapter_name)?;
+    crate::tun::set_mtu(&adapter, MTU)?;
+    crate::tun::allow_firewall(adapter_name);
+    let session = Arc::new(adapter.start_session(RING_CAPACITY)?);
+    let dev = Arc::new(WintunDev {
+        adapter,
+        session: session.clone(),
+        configured: Mutex::new(HashSet::new()),
+    });
+    let eng = start_with_tun(cfg, server, server_pub, identity, dev, save)?;
+    spawn_tun_reader(session, eng.env.clone());
+    Ok(eng)
+}
 
-    let stats = Arc::new(Stats::new());
+/// Запуск движка поверх произвольного TUN-устройства (без чтения из него:
+/// исходящие пакеты подаются через [`Engine::send_ip_packet`] или tun-поток).
+pub fn start_with_tun(
+    cfg: Arc<Mutex<Config>>,
+    server: SocketAddr,
+    server_pub: [u8; 32],
+    identity: proto::Identity,
+    tun: Arc<dyn TunDev>,
+    save: Arc<dyn Fn(&Config) + Send + Sync>,
+) -> Result<Engine> {
+    let (ev_tx, ev_rx) = mpsc::channel();
+    let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
+    let (in_tx, in_rx) = mpsc::channel::<Input>();
+
     let server_label = cfg
         .lock()
         .unwrap()
@@ -408,277 +514,362 @@ pub fn start(
         started: Instant::now(),
     }));
 
-    // --- адаптер (один на все группы) ---
-    let wintun = crate::tun::load_wintun_dll(dll.as_deref())?;
-    let adapter = crate::tun::create_adapter(&wintun, adapter_name)?;
-    crate::tun::set_mtu(&adapter, MTU)?;
-    crate::tun::allow_firewall(adapter_name);
-    let session = Arc::new(adapter.start_session(RING_CAPACITY)?);
-    *TUN_SESSION.lock().unwrap() = Some(session.clone());
-    let configured: Arc<Mutex<HashSet<u32>>> = Arc::new(Mutex::new(HashSet::new()));
+    let bind: SocketAddr = if server.is_ipv6() {
+        "[::]:0".parse().unwrap()
+    } else {
+        "0.0.0.0:0".parse().unwrap()
+    };
+    let sock = Arc::new(UdpSocket::bind(bind).context("bind udp")?);
+    sock.set_read_timeout(Some(RX_POLL)).ok();
 
     let groups: Groups = Arc::new(Mutex::new(HashMap::new()));
-    // Текущий дата-сокет (меняется при реконнекте); tun-поток берёт его сам.
-    let cur_sock: Arc<RwLock<Arc<UdpSocket>>> = Arc::new(RwLock::new(conn_sock_placeholder()));
-
-    let save_arc = save.clone();
     let env = Arc::new(Env {
         groups: groups.clone(),
         meta: meta.clone(),
-        stats: stats.clone(),
+        stats: Arc::new(Stats::new()),
         ev: ev_tx,
         cfg: cfg.clone(),
-        save,
+        save: save.clone(),
         identity,
         server,
+        sock,
+        tun,
+        quit: AtomicBool::new(false),
         pending_friend: Mutex::new(None),
     });
     let my_pub = env.identity.ed_pub();
     let my_code = env.identity.friend_code();
 
-    // Первое подключение — синхронно. Событие Connected эмитится один раз —
-    // из engine_loop (иначе «подключено» дублируется в логе TUI).
-    let cfg_snap = env.cfg.lock().unwrap().clone();
-    let conn = CtrlConn::connect(&cfg_snap, server, &server_pub, &env.identity)?;
-    *cur_sock.write().unwrap() = conn.sock.clone();
-    env.meta.lock().unwrap().connected = true;
+    // Приём — отдельный поток с самого начала: он же доставит WELCOME.
+    {
+        let env = env.clone();
+        let in_tx = in_tx.clone();
+        thread::Builder::new()
+            .name("rx".into())
+            .spawn(move || rx_loop(env, in_tx))
+            .context("spawn rx thread")?;
+    }
+    // Команды UI → общий входной канал движка.
+    {
+        let in_tx = in_tx.clone();
+        thread::Builder::new()
+            .name("cmd".into())
+            .spawn(move || {
+                for c in cmd_rx {
+                    if in_tx.send(Input::Cmd(c)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .context("spawn cmd thread")?;
+    }
+    drop(in_tx);
 
-    spawn_tun_thread(
-        session.clone(),
-        groups.clone(),
-        cur_sock.clone(),
-        server,
-        stats.clone(),
-    );
+    // Первое подключение — синхронно, чтобы ошибка была видна сразу.
+    let mut st = State::new(server_pub);
+    if let Err(e) = first_connect(&env, &in_rx, &mut st) {
+        env.quit.store(true, Ordering::Relaxed);
+        return Err(e);
+    }
+
     spawn_sampler(env.clone());
-
-    let env2 = env.clone();
-    thread::Builder::new()
-        .name("engine".into())
-        .spawn(
-            move || engine_loop(env2, cmd_rx, conn, server_pub, adapter, configured, session, cur_sock),
-        )
-        .expect("spawn engine thread");
+    {
+        let env = env.clone();
+        thread::Builder::new()
+            .name("engine".into())
+            .spawn(move || engine_loop(env, in_rx, st))
+            .context("spawn engine thread")?;
+    }
 
     Ok(Engine {
         groups,
         meta,
-        stats,
+        stats: env.stats.clone(),
         my_pub,
         my_code,
         events: ev_rx,
         cmds: cmd_tx,
         cfg,
-        save: save_arc,
+        save,
+        env,
     })
 }
 
-// Сессия TUN, общая для recv-потока (вброс) и tun-потока (чтение).
-static TUN_SESSION: Mutex<Option<Arc<wintun::Session>>> = Mutex::new(None);
+// ---------- поток приёма ----------
 
-#[derive(Clone, Copy)]
-enum Flow {
-    Continue,
-    Quit,
+/// Входы цикла движка.
+enum Input {
+    Cmd(Cmd),
+    /// Не групповой фрейм от сервера (WELCOME/RESET — открытые, прочее — шифр).
+    Server { typ: u8, body: Vec<u8> },
 }
 
-/// Главный цикл: подключение → сессия → потеря → пауза → снова.
-fn engine_loop(
-    env: Arc<Env>,
-    cmd_rx: mpsc::Receiver<Cmd>,
-    conn: CtrlConn,
-    server_pub: [u8; 32],
-    adapter: Arc<wintun::Adapter>,
-    configured: Arc<Mutex<HashSet<u32>>>,
-    session: Arc<wintun::Session>,
-    cur_sock: Arc<RwLock<Arc<UdpSocket>>>,
-) {
-    let mut backoff = Duration::from_secs(1);
-    let mut cur: Option<CtrlConn> = Some(conn);
-    loop {
-        if cur.is_none() {
-            if !sleep_with_quit(&env, &cmd_rx, backoff) {
-                return;
-            }
-            backoff = (backoff * 2).min(RECONNECT_MAX);
-            let cfg_snap = env.cfg.lock().unwrap().clone();
-            match CtrlConn::connect(&cfg_snap, env.server, &server_pub, &env.identity) {
-                Ok(c) => {
-                    backoff = Duration::from_secs(1);
-                    // Новый дата-сокет — tun-поток должен писать в него.
-                    *cur_sock.write().unwrap() = c.sock.clone();
-                    cur = Some(c);
-                }
-                Err(e) => {
-                    env.emit(Event::Error(format!("сервер недоступен: {e}")));
-                }
-            }
-            continue;
-        }
-        let c = cur.as_ref().unwrap();
-        env.meta.lock().unwrap().connected = true;
-        env.emit(Event::Connected(env.server));
-
-        // Приветствие: статус, авто-джойн, список групп.
-        let cfg_snap = env.cfg.lock().unwrap().clone();
-        if !cfg_snap.status.is_empty() {
-            c.send_ctrl(ctrl::STATUS, &payloads::enc_status(&cfg_snap.status));
-        }
-        for gid in &cfg_snap.autojoin {
-            c.send_ctrl(ctrl::JOIN_GROUP, &payloads::enc_gid(*gid));
-        }
-        c.send_ctrl(ctrl::LIST_GROUPS, &payloads::enc_gid(0));
-
-        match session_loop(&env, &cmd_rx, c, &adapter, &configured, &session) {
-            Flow::Quit => return,
-            Flow::Continue => {}
-        }
-        env.meta.lock().unwrap().connected = false;
-        env.emit(Event::Disconnected("сервер не отвечает".into()));
-        cur = None;
-    }
-}
-
-/// Пауза между попытками реконнекта; false = получен Quit.
-fn sleep_with_quit(_env: &Env, cmd_rx: &mpsc::Receiver<Cmd>, d: Duration) -> bool {
-    let end = Instant::now() + d;
-    loop {
-        let now = Instant::now();
-        if now >= end {
-            return true;
-        }
-        if let Ok(Cmd::Quit) = cmd_rx.try_recv() {
-            return false;
-        }
-        thread::sleep((Duration::from_millis(100)).min(end - now));
-    }
-}
-
-// ---------- цикл сессии ----------
-
-fn session_loop(
-    env: &Env,
-    cmd_rx: &mpsc::Receiver<Cmd>,
-    conn: &CtrlConn,
-    adapter: &wintun::Adapter,
-    configured: &Mutex<HashSet<u32>>,
-    session: &Arc<wintun::Session>,
-) -> Flow {
+fn rx_loop(env: Arc<Env>, in_tx: mpsc::Sender<Input>) {
     let mut buf = vec![0u8; 65_535];
-    conn.sock.set_read_timeout(Some(TICK)).ok();
-    let mut last_rx = Instant::now();
-    let mut last_rtt = Instant::now();
-    let mut last_nat = Instant::now();
-    let mut last_list = Instant::now();
-
-    loop {
-        // 1. Команды UI.
-        loop {
-            match cmd_rx.try_recv() {
-                Ok(cmd) => {
-                    if let Flow::Quit = do_cmd(env, conn, cmd) {
-                        return Flow::Quit;
+    while !env.quitting() {
+        let (n, src) = match env.sock.recv_from(&mut buf) {
+            Ok(x) => x,
+            Err(e) => {
+                use std::io::ErrorKind::*;
+                match e.kind() {
+                    // Таймаут чтения — проверить флаг выхода.
+                    // ConnectionReset — Windows: ICMP unreachable после
+                    // send_to в мёртвый эндпоинт (офлайн-пир, старый порт).
+                    // Это не потеря связи — пропускаем.
+                    WouldBlock | TimedOut | ConnectionReset | Interrupted => {}
+                    _ => {
+                        if debug() {
+                            env.emit(Event::Error(format!("recv: {e}")));
+                        }
+                        thread::sleep(Duration::from_millis(50));
                     }
                 }
-                Err(_) => break,
-            }
-        }
-        // 2. Приём.
-        let (n, src) = match conn.sock.recv_from(&mut buf) {
-            Ok(x) => x,
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                let now = Instant::now();
-                if now.duration_since(last_rx) > SERVER_TIMEOUT {
-                    return Flow::Continue; // реконнект
-                }
-                if now.duration_since(last_rtt) >= RTT_EVERY {
-                    last_rtt = now;
-                    rtt_round(env, &conn.sock);
-                }
-                if now.duration_since(last_nat) >= NAT_EVERY {
-                    last_nat = now;
-                    nat_round(env, conn);
-                }
-                if now.duration_since(last_list) >= LIST_EVERY {
-                    last_list = now;
-                    conn.send_ctrl(ctrl::LIST_GROUPS, &payloads::enc_gid(0));
-                }
                 continue;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
-                // Windows: send_to в мёртвый эндпоинт (NAT-punch офлайн-пиру,
-                // PING по устаревшему endpoint) даёт ICMP unreachable, и
-                // следующий recv_from возвращает WSAECONNRESET. Это не потеря
-                // связи с сервером — съедаем ошибку и продолжаем сессию.
-                // (Несколько reset'ов = несколько ошибок, каждая съедается
-                // своим recv_from.) Без этого сессия рвалась бы и клиент
-                // переподключался каждые NAT_EVERY.
-                continue;
-            }
-            Err(e) => {
-                env.emit(Event::Error(format!("recv: {e}")));
-                return Flow::Continue;
             }
         };
-        last_rx = Instant::now();
         let datagram = &buf[..n];
-        let (typ, body) = match proto::split_frame(datagram) {
-            Ok(x) => x,
-            Err(_) => continue,
+        let Ok((typ, body)) = proto::split_frame(datagram) else {
+            continue;
         };
         if (proto::grp::DATA..=proto::grp::KEEPALIVE).contains(&typ) {
-            handle_group_frame(env, session, &conn.sock, src, env.server, datagram);
-            continue;
+            handle_group_frame(&env, src, datagram);
+        } else if src == env.server
+            && in_tx
+                .send(Input::Server {
+                    typ,
+                    body: body.to_vec(),
+                })
+                .is_err()
+        {
+            break;
         }
-        let payload = match proto::open_ctrl(&conn.ctrl_key, typ, body) {
-            Ok(p) => p,
-            Err(_) => continue, // например, WELCOME на resend_hello (открытый текст)
-        };
-        on_ctrl(env, conn, adapter, configured, typ, &payload);
     }
 }
 
-fn do_cmd(env: &Env, conn: &CtrlConn, cmd: Cmd) -> Flow {
+// ---------- цикл движка ----------
+
+/// Состояние цикла движка (живёт только в потоке engine).
+struct State {
+    server_pub: [u8; 32],
+    ctrl_key: Option<proto::SymKey>,
+    connected: bool,
+    /// Последний подлинный (расшифрованный) фрейм от сервера.
+    last_server_rx: Instant,
+    next_hello: Instant,
+    backoff: Duration,
+    /// Группы, из которых вышли, но сервер ещё не подтвердил: gid → начало.
+    leaving: HashMap<u32, Instant>,
+    last_ping: Instant,
+    last_list: Instant,
+    last_rtt: Instant,
+    last_punch: Instant,
+    last_leave: Instant,
+}
+
+impl State {
+    fn new(server_pub: [u8; 32]) -> Self {
+        let now = Instant::now();
+        Self {
+            server_pub,
+            ctrl_key: None,
+            connected: false,
+            last_server_rx: now,
+            next_hello: now,
+            backoff: Duration::from_secs(1),
+            leaving: HashMap::new(),
+            last_ping: now,
+            last_list: now,
+            last_rtt: now,
+            last_punch: now,
+            last_leave: now,
+        }
+    }
+
+    fn send_ctrl(&self, env: &Env, typ: u8, payload: &[u8]) {
+        if let Some(key) = &self.ctrl_key {
+            env.send(&proto::seal_ctrl(key, typ, payload), env.server);
+        }
+    }
+
+    fn send_hello(&mut self, env: &Env) {
+        let cfg = env.cfg.lock().unwrap().clone();
+        env.send(&hello_frame(&cfg, &env.identity), env.server);
+    }
+}
+
+/// Синхронное первое подключение: HELLO с повтором раз в секунду, до 10 с.
+fn first_connect(env: &Env, in_rx: &mpsc::Receiver<Input>, st: &mut State) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut next = Instant::now();
+    let mut early: Vec<Cmd> = Vec::new();
+    loop {
+        let now = Instant::now();
+        if now > deadline {
+            anyhow::bail!("нет WELCOME от сервера (адрес/код сервера верны?)");
+        }
+        if now >= next {
+            st.send_hello(env);
+            next = now + Duration::from_secs(1);
+        }
+        match in_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(Input::Server { typ: ctrl::WELCOME, body }) => {
+                let (x_pub, w_sig) = payloads::dec_welcome(&body)?;
+                proto::Identity::verify(&st.server_pub, &x_pub, &w_sig)
+                    .context("WELCOME: подпись не от того сервера (неверный код сервера?)")?;
+                st.ctrl_key = Some(env.identity.ctrl_key_with(&x_pub));
+                on_connected(env, st);
+                // Команды, пришедшие до подключения, — после него.
+                for c in early {
+                    do_cmd(env, st, c);
+                }
+                return Ok(());
+            }
+            Ok(Input::Cmd(Cmd::Quit)) => anyhow::bail!("остановлено"),
+            Ok(Input::Cmd(c)) => early.push(c),
+            Ok(Input::Server { .. }) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => anyhow::bail!("rx-поток остановлен"),
+        }
+    }
+}
+
+fn engine_loop(env: Arc<Env>, in_rx: mpsc::Receiver<Input>, mut st: State) {
+    loop {
+        match in_rx.recv_timeout(TICK) {
+            Ok(Input::Cmd(Cmd::Quit)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                env.quit.store(true, Ordering::Relaxed);
+                return;
+            }
+            Ok(Input::Cmd(c)) => do_cmd(&env, &mut st, c),
+            Ok(Input::Server { typ, body }) => on_server_frame(&env, &mut st, typ, &body),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if env.quitting() {
+            return;
+        }
+        tick(&env, &mut st, Instant::now());
+    }
+}
+
+/// Сервер принял HELLO: приветствие и восстановление состояния.
+fn on_connected(env: &Env, st: &mut State) {
+    let now = Instant::now();
+    st.connected = true;
+    st.last_server_rx = now;
+    st.backoff = Duration::from_secs(1);
+    st.last_ping = now;
+    st.last_list = now;
+    env.meta.lock().unwrap().connected = true;
+    env.emit(Event::Connected(env.server));
+
+    let cfg = env.cfg.lock().unwrap().clone();
+    if !cfg.status.is_empty() {
+        st.send_ctrl(env, ctrl::STATUS, &payloads::enc_status(&cfg.status));
+    }
+    for gid in &cfg.autojoin {
+        if !st.leaving.contains_key(gid) {
+            st.send_ctrl(env, ctrl::JOIN_GROUP, &payloads::enc_gid(*gid));
+        }
+    }
+    for gid in st.leaving.keys() {
+        st.send_ctrl(env, ctrl::LEAVE_GROUP, &payloads::enc_gid(*gid));
+    }
+    st.send_ctrl(env, ctrl::LIST_GROUPS, &payloads::enc_gid(0));
+}
+
+fn lose_server(env: &Env, st: &mut State, reason: &str) {
+    if !st.connected {
+        return;
+    }
+    st.connected = false;
+    st.backoff = Duration::from_secs(1);
+    st.next_hello = Instant::now();
+    env.meta.lock().unwrap().connected = false;
+    env.emit(Event::Disconnected(reason.to_string()));
+}
+
+fn on_server_frame(env: &Env, st: &mut State, typ: u8, body: &[u8]) {
+    match typ {
+        ctrl::WELCOME => {
+            let Ok((x_pub, w_sig)) = payloads::dec_welcome(body) else {
+                return;
+            };
+            if proto::Identity::verify(&st.server_pub, &x_pub, &w_sig).is_err() {
+                return;
+            }
+            st.ctrl_key = Some(env.identity.ctrl_key_with(&x_pub));
+            if st.connected {
+                // Ответ на повторный HELLO (смена имени) — сессия та же.
+                st.last_server_rx = Instant::now();
+            } else {
+                on_connected(env, st);
+            }
+        }
+        ctrl::RESET => {
+            // Сервер не знает нашу сессию (перезапуск/истекла) — сразу HELLO.
+            if st.connected {
+                lose_server(env, st, "сервер сбросил сессию");
+            }
+            if Instant::now() >= st.next_hello {
+                st.send_hello(env);
+                st.next_hello = Instant::now() + st.backoff;
+            }
+        }
+        _ => {
+            let Some(key) = st.ctrl_key else { return };
+            let Ok(payload) = proto::open_ctrl(&key, typ, body) else {
+                return;
+            };
+            st.last_server_rx = Instant::now();
+            on_ctrl(env, st, typ, &payload);
+        }
+    }
+}
+
+/// Таймеры: идут по часам на каждой итерации цикла.
+fn tick(env: &Env, st: &mut State, now: Instant) {
+    if st.connected && now.duration_since(st.last_server_rx) > SERVER_TIMEOUT {
+        lose_server(env, st, "сервер не отвечает");
+    }
+    if !st.connected {
+        if now >= st.next_hello {
+            st.send_hello(env);
+            st.next_hello = now + st.backoff;
+            st.backoff = (st.backoff * 2).min(RECONNECT_MAX);
+        }
+    } else {
+        if now.duration_since(st.last_ping) >= PING_EVERY {
+            st.last_ping = now;
+            st.send_ctrl(env, ctrl::CTRL_PING, &[]);
+        }
+        if now.duration_since(st.last_list) >= LIST_EVERY {
+            st.last_list = now;
+            st.send_ctrl(env, ctrl::LIST_GROUPS, &payloads::enc_gid(0));
+        }
+        if !st.leaving.is_empty() && now.duration_since(st.last_leave) >= LEAVE_RETRY {
+            st.last_leave = now;
+            st.leaving
+                .retain(|_, started| now.duration_since(*started) < LEAVE_GIVE_UP);
+            for gid in st.leaving.keys() {
+                st.send_ctrl(env, ctrl::LEAVE_GROUP, &payloads::enc_gid(*gid));
+            }
+        }
+    }
+    // P2P-таймеры работают и без сервера: прямые каналы живут сами.
+    if now.duration_since(st.last_rtt) >= RTT_EVERY {
+        st.last_rtt = now;
+        rtt_round(env, st.connected, now);
+    }
+    if now.duration_since(st.last_punch) >= PUNCH_EVERY {
+        st.last_punch = now;
+        punch_round(env);
+    }
+}
+
+fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
+    // Локальные команды — всегда, независимо от связи с сервером.
     match cmd {
-        Cmd::Quit => return Flow::Quit,
-        Cmd::RefreshList => conn.send_ctrl(ctrl::LIST_GROUPS, &payloads::enc_gid(0)),
-        Cmd::Create { name, private } => {
-            conn.send_ctrl(ctrl::CREATE_GROUP, &payloads::enc_create_group(&name, private))
-        }
-        Cmd::Join(gid) => conn.send_ctrl(ctrl::JOIN_GROUP, &payloads::enc_gid(gid)),
-        Cmd::Leave(gid) => {
-            conn.send_ctrl(ctrl::LEAVE_GROUP, &payloads::enc_gid(gid));
-            let name = env.groups.lock().unwrap().get(&gid).map(|g| g.name.clone());
-            if let Some(name) = name {
-                env.groups.lock().unwrap().remove(&gid);
-                env.autojoin_remove(gid);
-                env.emit(Event::GroupLeft { gid, name });
-            }
-        }
-        Cmd::Delete(gid) => conn.send_ctrl(ctrl::DELETE_GROUP, &payloads::enc_gid(gid)),
-        Cmd::Rename(gid, name) => {
-            conn.send_ctrl(ctrl::RENAME_GROUP, &payloads::enc_rename(gid, &name))
-        }
-        Cmd::Invite(gid, pk) => {
-            conn.send_ctrl(ctrl::INVITE, &payloads::enc_gid_target(gid, &pk))
-        }
-        Cmd::Kick(gid, pk) => conn.send_ctrl(ctrl::KICK, &payloads::enc_gid_target(gid, &pk)),
-        Cmd::Ban(gid, pk) => conn.send_ctrl(ctrl::BAN, &payloads::enc_gid_target(gid, &pk)),
-        Cmd::SetName(name) => {
-            env.set_name(name);
-            let cfg = env.cfg.lock().unwrap().clone();
-            conn.resend_hello(&cfg, &env.identity);
-        }
-        Cmd::SetStatus(text) => {
-            env.set_status(text);
-            let cfg = env.cfg.lock().unwrap().clone();
-            if !cfg.status.is_empty() {
-                conn.send_ctrl(ctrl::STATUS, &payloads::enc_status(&cfg.status));
-            }
-        }
+        Cmd::Quit => return,
         Cmd::ToggleAutojoin(gid) => {
             let on = env.cfg.lock().unwrap().autojoin.contains(&gid);
             if on {
@@ -686,33 +877,94 @@ fn do_cmd(env: &Env, conn: &CtrlConn, cmd: Cmd) -> Flow {
             } else {
                 env.autojoin_add(gid);
             }
+            return;
         }
+        Cmd::SetName(name) => {
+            env.set_name(name);
+            if st.connected {
+                // Повторный HELLO — сервер обновит имя (сессия сохранится).
+                st.send_hello(env);
+            }
+            return;
+        }
+        Cmd::SetStatus(text) => {
+            env.set_status(text.clone());
+            if st.connected {
+                st.send_ctrl(env, ctrl::STATUS, &payloads::enc_status(&text));
+            }
+            return;
+        }
+        Cmd::Leave(gid) => {
+            // Выход — сразу локально; LEAVE повторяется, пока сервер не
+            // подтвердит (иначе потерянный LEAVE или запоздавший
+            // GROUP_STATE возвращали группу обратно).
+            let name = env.groups.lock().unwrap().remove(&gid).map(|g| g.name);
+            env.autojoin_remove(gid);
+            st.leaving.insert(gid, Instant::now());
+            if st.connected {
+                st.send_ctrl(env, ctrl::LEAVE_GROUP, &payloads::enc_gid(gid));
+            }
+            if let Some(name) = name {
+                env.emit(Event::GroupLeft { gid, name });
+            }
+            return;
+        }
+        _ => {}
+    }
+    if !st.connected {
+        env.emit(Event::Error("нет связи с сервером — команда не отправлена".into()));
+        return;
+    }
+    match cmd {
+        Cmd::RefreshList => st.send_ctrl(env, ctrl::LIST_GROUPS, &payloads::enc_gid(0)),
+        Cmd::Create { name, private } => st.send_ctrl(
+            env,
+            ctrl::CREATE_GROUP,
+            &payloads::enc_create_group(&name, private),
+        ),
+        Cmd::Join(gid) => {
+            st.leaving.remove(&gid);
+            st.send_ctrl(env, ctrl::JOIN_GROUP, &payloads::enc_gid(gid))
+        }
+        Cmd::Delete(gid) => st.send_ctrl(env, ctrl::DELETE_GROUP, &payloads::enc_gid(gid)),
+        Cmd::Rename(gid, name) => {
+            st.send_ctrl(env, ctrl::RENAME_GROUP, &payloads::enc_rename(gid, &name))
+        }
+        Cmd::Invite(gid, pk) => {
+            st.send_ctrl(env, ctrl::INVITE, &payloads::enc_gid_target(gid, &pk))
+        }
+        Cmd::Kick(gid, pk) => st.send_ctrl(env, ctrl::KICK, &payloads::enc_gid_target(gid, &pk)),
+        Cmd::Ban(gid, pk) => st.send_ctrl(env, ctrl::BAN, &payloads::enc_gid_target(gid, &pk)),
         Cmd::FriendGroups(pk) => {
             *env.pending_friend.lock().unwrap() = Some(pk);
-            conn.send_ctrl(ctrl::FRIEND_GROUPS, &payloads::enc_pubkey(&pk));
+            st.send_ctrl(env, ctrl::FRIEND_GROUPS, &payloads::enc_pubkey(&pk));
         }
+        Cmd::Quit
+        | Cmd::ToggleAutojoin(_)
+        | Cmd::SetName(_)
+        | Cmd::SetStatus(_)
+        | Cmd::Leave(_) => {}
     }
-    Flow::Continue
 }
 
-fn on_ctrl(
-    env: &Env,
-    conn: &CtrlConn,
-    adapter: &wintun::Adapter,
-    configured: &Mutex<HashSet<u32>>,
-    typ: u8,
-    payload: &[u8],
-) {
+fn on_ctrl(env: &Env, st: &mut State, typ: u8, payload: &[u8]) {
     match typ {
         ctrl::GROUP_STATE => {
-            if let Ok(st) = payloads::dec_group_state(payload) {
-                apply_group_state(env, adapter, configured, &st);
+            if let Ok(gs) = payloads::dec_group_state(payload) {
+                if st.leaving.contains_key(&gs.gid) && !gs.deleted {
+                    // Запоздавшее состояние группы, из которой мы вышли.
+                    return;
+                }
+                apply_group_state(env, &gs);
             }
         }
         ctrl::GROUP_LIST => {
             if let Ok(items) = payloads::dec_group_list(payload) {
-                env.meta.lock().unwrap().group_list = items.clone();
-                reconcile(env, &items);
+                let mine: HashSet<u32> = items.iter().filter(|g| g.mine).map(|g| g.gid).collect();
+                // Сервер подтвердил выход — больше не повторяем LEAVE.
+                st.leaving.retain(|gid, _| mine.contains(gid));
+                reconcile(env, &mine);
+                env.meta.lock().unwrap().group_list = items;
             }
         }
         ctrl::INVITE_RCVD => {
@@ -724,7 +976,7 @@ fn on_ctrl(
                 });
                 let in_autojoin = env.cfg.lock().unwrap().autojoin.contains(&inv.gid);
                 if in_autojoin {
-                    conn.send_ctrl(ctrl::JOIN_GROUP, &payloads::enc_gid(inv.gid));
+                    st.send_ctrl(env, ctrl::JOIN_GROUP, &payloads::enc_gid(inv.gid));
                 }
             }
         }
@@ -746,18 +998,20 @@ fn on_ctrl(
 /// Ошибка от сервера. «Кик» парсим по тексту и убираем группу локально
 /// (сервер кикнутому GROUP_STATE не шлёт).
 fn handle_error(env: &Env, text: String) {
-    if text.contains("кикнул") {
-        if let Some(name) = quoted(&text) {
-            let found = {
-                let g = env.groups.lock().unwrap();
-                g.iter().find(|(_, gs)| gs.name == name).map(|(gid, gs)| (*gid, gs.name.clone()))
-            };
-            if let Some((gid, gname)) = found {
-                env.groups.lock().unwrap().remove(&gid);
-                env.autojoin_remove(gid);
-                env.emit(Event::Kicked { gid, name: gname });
-                return;
-            }
+    if (text.contains("кикнут") || text.contains("забанен"))
+        && let Some(name) = quoted(&text)
+    {
+        let found = {
+            let g = env.groups.lock().unwrap();
+            g.iter()
+                .find(|(_, gs)| gs.name == name)
+                .map(|(gid, gs)| (*gid, gs.name.clone()))
+        };
+        if let Some((gid, gname)) = found {
+            env.groups.lock().unwrap().remove(&gid);
+            env.autojoin_remove(gid);
+            env.emit(Event::Kicked { gid, name: gname });
+            return;
         }
     }
     env.emit(Event::Error(text));
@@ -765,18 +1019,23 @@ fn handle_error(env: &Env, text: String) {
 
 /// Локальные группы, которых больше нет на сервере (могли кикнуть/удалить,
 /// пока нас не было) — убрать.
-fn reconcile(env: &Env, items: &[payloads::GroupSummary]) {
-    let mine: HashSet<u32> = items.iter().filter(|g| g.mine).map(|g| g.gid).collect();
+fn reconcile(env: &Env, mine: &HashSet<u32>) {
     let now = Instant::now();
     let stale: Vec<(u32, String)> = {
-        let g = env.groups.lock().unwrap();
-        g.iter()
-            .filter(|(gid, gs)| !mine.contains(gid) && now.duration_since(gs.since) > NEW_GROUP_GRACE)
+        let mut g = env.groups.lock().unwrap();
+        let stale: Vec<(u32, String)> = g
+            .iter()
+            .filter(|(gid, gs)| {
+                !mine.contains(gid) && now.duration_since(gs.since) > NEW_GROUP_GRACE
+            })
             .map(|(gid, gs)| (*gid, gs.name.clone()))
-            .collect()
+            .collect();
+        for (gid, _) in &stale {
+            g.remove(gid);
+        }
+        stale
     };
     for (gid, name) in stale {
-        env.groups.lock().unwrap().remove(&gid);
         env.autojoin_remove(gid);
         env.emit(Event::Notice(format!("группа {name} больше недоступна")));
     }
@@ -784,12 +1043,7 @@ fn reconcile(env: &Env, items: &[payloads::GroupSummary]) {
 
 // ---------- состояние групп ----------
 
-fn apply_group_state(
-    env: &Env,
-    adapter: &wintun::Adapter,
-    configured: &Mutex<HashSet<u32>>,
-    st: &payloads::GroupState,
-) {
+fn apply_group_state(env: &Env, st: &payloads::GroupState) {
     let my_pub = env.identity.ed_pub();
     if st.deleted {
         let removed = { env.groups.lock().unwrap().remove(&st.gid).map(|g| g.name) };
@@ -800,7 +1054,7 @@ fn apply_group_state(
         return;
     }
     let mut events: Vec<Event> = Vec::new();
-    let (need_addr, is_new) = {
+    let is_new = {
         let mut g = env.groups.lock().unwrap();
         let is_new = !g.contains_key(&st.gid);
         let entry = g.entry(st.gid).or_insert_with(|| GroupSess {
@@ -823,24 +1077,31 @@ fn apply_group_state(
             .drain()
             .map(|(_ip, p)| (p.pubkey, p))
             .collect();
-        entry.members = HashMap::new();
         for m in &st.members {
             if m.pubkey == my_pub {
                 continue;
             }
             let prev = old.get(&m.pubkey);
-            let direct = prev.map(|p| p.direct).unwrap_or(false);
-            let rtt = prev.and_then(|p| p.rtt_ms);
-            let endpoint = m
-                .endpoint
-                .as_deref()
-                .and_then(|e| e.parse().ok())
-                .or_else(|| prev.and_then(|p| p.endpoint));
+            let server_ep: Option<SocketAddr> = m.endpoint.as_deref().and_then(|e| e.parse().ok());
+            let endpoint = server_ep.or_else(|| prev.and_then(|p| p.endpoint));
+            // Пир переподключился с другого адреса или ушёл офлайн — старый
+            // прямой канал недействителен.
+            let same_ep = prev.and_then(|p| p.endpoint) == endpoint;
+            let keep_direct = m.online && same_ep;
+            let direct = keep_direct && prev.map(|p| p.direct).unwrap_or(false);
             if prev.map(|p| p.online) != Some(m.online) {
                 if m.online {
-                    events.push(Event::PeerOnline { gid: st.gid, ip: m.ip, name: m.name.clone() });
+                    events.push(Event::PeerOnline {
+                        gid: st.gid,
+                        ip: m.ip,
+                        name: m.name.clone(),
+                    });
                 } else if prev.is_some() {
-                    events.push(Event::PeerOffline { gid: st.gid, ip: m.ip, name: m.name.clone() });
+                    events.push(Event::PeerOffline {
+                        gid: st.gid,
+                        ip: m.ip,
+                        name: m.name.clone(),
+                    });
                 }
             }
             entry.members.insert(
@@ -854,12 +1115,12 @@ fn apply_group_state(
                     endpoint,
                     direct,
                     last_rx: prev.map(|p| p.last_rx).unwrap_or_else(Instant::now),
-                    rtt_ms: rtt,
+                    last_direct: if keep_direct { prev.and_then(|p| p.last_direct) } else { None },
+                    rtt_ms: if m.online { prev.and_then(|p| p.rtt_ms) } else { None },
                 },
             );
         }
-        let cfg = configured.lock().unwrap();
-        (!cfg.contains(&st.my_ip), is_new)
+        is_new
     };
     if is_new {
         env.emit(Event::GroupJoined {
@@ -869,13 +1130,11 @@ fn apply_group_state(
         });
         env.autojoin_add(st.gid);
     }
-    if need_addr {
-        let mut cfg = configured.lock().unwrap();
-        if let Err(e) = crate::tun::ensure_address(adapter, &mut cfg, st.my_ip) {
-            if debug() {
-                env.emit(Event::Error(format!("netsh address: {e}")));
-            }
-        }
+    if let Err(e) = env.tun.ensure_address(st.my_ip) {
+        env.emit(Event::Error(format!(
+            "адрес {} на адаптере: {e}",
+            proto::ip_str(st.my_ip)
+        )));
     }
     for ev in events {
         env.emit(ev);
@@ -884,19 +1143,11 @@ fn apply_group_state(
 
 // ---------- групповые фреймы ----------
 
-fn handle_group_frame(
-    env: &Env,
-    session: &Arc<wintun::Session>,
-    sock: &UdpSocket,
-    src: SocketAddr,
-    server: SocketAddr,
-    datagram: &[u8],
-) {
+fn handle_group_frame(env: &Env, src: SocketAddr, datagram: &[u8]) {
     env.stats.rx_pkts.fetch_add(1, Ordering::Relaxed);
     env.stats.rx_bytes.fetch_add(datagram.len() as u64, Ordering::Relaxed);
-    let (gid, _src_ip, _dst_ip) = match proto::parse_group_header(datagram) {
-        Ok(x) => x,
-        Err(_) => return,
+    let Ok((gid, _src_ip, _dst_ip)) = proto::parse_group_header(datagram) else {
+        return;
     };
     let (key, my_ip) = {
         let g = env.groups.lock().unwrap();
@@ -905,120 +1156,140 @@ fn handle_group_frame(
             None => return,
         }
     };
-    let (typ, _gid, src_ip, dst_ip, payload) = match proto::open_group(&key, datagram) {
-        Ok(x) => x,
-        Err(_) => return,
+    let Ok((typ, _gid, src_ip, dst_ip, payload)) = proto::open_group(&key, datagram) else {
+        return;
     };
-    let is_relay = src == server;
+    if dst_ip != my_ip {
+        return;
+    }
+    let is_relay = src == env.server;
+    let now = Instant::now();
+    let mut became_direct: Option<String> = None;
     {
-        // Атрибуция отправителя по src_ip из заголовка.
+        // Атрибуция отправителя по src_ip (подлинность — ключ группы).
         let mut g = env.groups.lock().unwrap();
-        if let Some(gs) = g.get_mut(&gid) {
-            if let Some(peer) = gs.members.get_mut(&src_ip) {
-                if !is_relay {
-                    if !peer.direct {
-                        peer.direct = true;
-                        peer.endpoint = Some(src);
-                        env.emit(Event::Direct {
-                            gid,
-                            ip: src_ip,
-                            name: peer.name.clone(),
-                        });
-                    } else {
-                        peer.endpoint = Some(src);
-                    }
+        if let Some(peer) = g.get_mut(&gid).and_then(|gs| gs.members.get_mut(&src_ip)) {
+            peer.last_rx = now;
+            if !is_relay {
+                peer.endpoint = Some(src);
+                peer.last_direct = Some(now);
+                if !peer.direct {
+                    peer.direct = true;
+                    became_direct = Some(peer.name.clone());
                 }
-                peer.last_rx = Instant::now();
             }
         }
     }
+    if let Some(name) = became_direct {
+        env.emit(Event::Direct { gid, ip: src_ip, name });
+    }
     match typ {
         proto::grp::DATA => {
-            if dst_ip == my_ip {
-                if let Err(e) = inject_packet(session, &payload) {
-                    if debug() {
-                        env.emit(Event::Error(format!("inject: {e}")));
-                    }
-                }
+            if let Err(e) = env.tun.inject(&payload)
+                && debug()
+            {
+                env.emit(Event::Error(format!("inject: {e}")));
             }
         }
         proto::grp::PING => {
             let frame = proto::seal_group(&key, proto::grp::PONG, gid, my_ip, src_ip, &payload);
-            let _ = sock.send_to(&frame, src);
+            env.send(&frame, src);
         }
         proto::grp::PONG => {
             if let Ok(sent_ms) = payloads::dec_ping(&payload) {
                 let rtt = epoch_ms().saturating_sub(sent_ms);
                 let mut g = env.groups.lock().unwrap();
-                if let Some(gs) = g.get_mut(&gid) {
-                    if let Some(peer) = gs.members.get_mut(&src_ip) {
-                        peer.rtt_ms = Some(rtt);
-                    }
-                }
-                if debug() {
-                    env.emit(Event::Notice(format!(
-                        "rtt {gid}/{}: {rtt} мс",
-                        proto::ip_str(src_ip)
-                    )));
+                if let Some(peer) = g.get_mut(&gid).and_then(|gs| gs.members.get_mut(&src_ip)) {
+                    peer.rtt_ms = Some(rtt);
                 }
             }
         }
-        proto::grp::PUNCH => {
-            let frame = proto::seal_group(&key, proto::grp::PUNCH, gid, my_ip, src_ip, &[]);
-            let _ = sock.send_to(&frame, src);
+        proto::grp::PUNCH if !is_relay => {
+            // Ответ — KEEPALIVE, не PUNCH: на PUNCH отвечают, на KEEPALIVE —
+            // нет, поэтому пинг-понга PUNCH↔PUNCH (бесконечного спама между
+            // двумя клиентами) больше не возникает. Через релей не отвечаем:
+            // PUNCH нужен только для прямого канала.
+            let frame = proto::seal_group(&key, proto::grp::KEEPALIVE, gid, my_ip, src_ip, &[]);
+            env.send(&frame, src);
         }
         _ => {}
     }
 }
 
-fn inject_packet(session: &Arc<wintun::Session>, packet: &[u8]) -> Result<()> {
-    let mut p = session
-        .allocate_send_packet(packet.len().try_into().unwrap())
-        .context("allocate_send_packet")?;
-    p.bytes_mut().copy_from_slice(packet);
-    session.send_packet(p);
-    Ok(())
+/// IP-пакет из адаптера → пиру. Напрямую — только если прямой канал жив;
+/// иначе через релей сервера (раньше пакеты шли на endpoint пира ещё до
+/// пробития NAT и терялись).
+fn route_packet(env: &Env, bytes: &[u8]) {
+    let Ok(dst) = proto::ipv4_dst(bytes) else {
+        return;
+    };
+    let gid = proto::group_of_ip(dst);
+    let (key, my_ip, target) = {
+        let g = env.groups.lock().unwrap();
+        let Some(gs) = g.get(&gid) else { return };
+        if dst == gs.my_ip {
+            return;
+        }
+        let target = match gs.members.get(&dst) {
+            Some(p) if p.direct => p.endpoint.unwrap_or(env.server),
+            _ => env.server,
+        };
+        (gs.key, gs.my_ip, target)
+    };
+    let frame = proto::seal_group(&key, proto::grp::DATA, gid, my_ip, dst, bytes);
+    env.send(&frame, target);
 }
 
 // ---------- раунды RTT и NAT ----------
 
-/// Раз в секунду: RTT-зонд каждому пиру (direct — напрямую, иначе через релей).
-fn rtt_round(env: &Env, sock: &UdpSocket) {
+/// RTT-зонд онлайн-пирам: прямым — напрямую (это же держит NAT-маппинг),
+/// остальным — через релей. Заодно гасит протухшие прямые каналы.
+fn rtt_round(env: &Env, connected: bool, now: Instant) {
     let now_ms = epoch_ms();
-    let tasks: Vec<(u32, proto::SymKey, u32, u32, SocketAddr)> = {
-        let g = env.groups.lock().unwrap();
-        let mut out = Vec::new();
-        for (gid, gs) in g.iter() {
-            for (ip, peer) in &gs.members {
-                let Some(ep) = peer.endpoint else { continue };
-                let target = if peer.direct { ep } else { env.server };
-                out.push((*gid, gs.key, gs.my_ip, *ip, target));
+    let mut tasks: Vec<(u32, proto::SymKey, u32, u32, SocketAddr)> = Vec::new();
+    {
+        let mut g = env.groups.lock().unwrap();
+        for (gid, gs) in g.iter_mut() {
+            for (ip, peer) in gs.members.iter_mut() {
+                if !peer.online {
+                    continue;
+                }
+                if peer.direct
+                    && peer
+                        .last_direct
+                        .is_none_or(|t| now.duration_since(t) > DIRECT_TIMEOUT)
+                {
+                    peer.direct = false;
+                    peer.rtt_ms = None;
+                }
+                let target = match (peer.direct, peer.endpoint) {
+                    (true, Some(ep)) => ep,
+                    _ if connected => env.server,
+                    _ => continue,
+                };
+                tasks.push((*gid, gs.key, gs.my_ip, *ip, target));
             }
         }
-        out
-    };
+    }
+    let payload = payloads::enc_ping(now_ms);
     for (gid, key, my_ip, peer_ip, target) in tasks {
-        let ping = proto::seal_group(
-            &key,
-            proto::grp::PING,
-            gid,
-            my_ip,
-            peer_ip,
-            &payloads::enc_ping(now_ms),
-        );
-        let _ = sock.send_to(&ping, target);
+        let ping = proto::seal_group(&key, proto::grp::PING, gid, my_ip, peer_ip, &payload);
+        env.send(&ping, target);
     }
 }
 
-/// Раз в 5 секунд: CTRL_PING серверу + PUNCH/KEEPALIVE пирам (NAT-маппинги).
-fn nat_round(env: &Env, conn: &CtrlConn) {
-    conn.send_ctrl(ctrl::CTRL_PING, &[]);
+/// PUNCH онлайн-пирам без прямого канала, чей адрес известен. Пирам с прямым
+/// каналом не шлём ничего: их маппинг держат RTT-зонды.
+fn punch_round(env: &Env) {
     let tasks: Vec<(u32, proto::SymKey, u32, u32, SocketAddr)> = {
         let g = env.groups.lock().unwrap();
         let mut out = Vec::new();
         for (gid, gs) in g.iter() {
             for (ip, peer) in &gs.members {
-                if let Some(ep) = peer.endpoint {
+                if peer.online
+                    && !peer.direct
+                    && let Some(ep) = peer.endpoint
+                {
                     out.push((*gid, gs.key, gs.my_ip, *ip, ep));
                 }
             }
@@ -1027,56 +1298,23 @@ fn nat_round(env: &Env, conn: &CtrlConn) {
     };
     for (gid, key, my_ip, peer_ip, ep) in tasks {
         let punch = proto::seal_group(&key, proto::grp::PUNCH, gid, my_ip, peer_ip, &[]);
-        let _ = conn.sock.send_to(&punch, ep);
-        let ka = proto::seal_group(&key, proto::grp::KEEPALIVE, gid, my_ip, peer_ip, &[]);
-        let _ = conn.sock.send_to(&ka, ep);
+        env.send(&punch, ep);
     }
 }
 
 // ---------- фоновые потоки ----------
 
-fn spawn_tun_thread(
-    session: Arc<wintun::Session>,
-    groups: Groups,
-    cur_sock: Arc<RwLock<Arc<UdpSocket>>>,
-    server: SocketAddr,
-    stats: Arc<Stats>,
-) {
+fn spawn_tun_reader(session: Arc<wintun::Session>, env: Arc<Env>) {
     thread::Builder::new()
         .name("tun".into())
-        .spawn(move || loop {
-            let pkt = match session.receive_blocking() {
-                Ok(p) => p,
-                Err(_) => break,
-            };
-            let bytes = pkt.bytes();
-            let dst = match proto::ipv4_dst(bytes) {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
-            let gid = proto::group_of_ip(dst);
-            let (key, my_ip, target) = {
-                let g = groups.lock().unwrap();
-                let Some(gs) = g.get(&gid) else { continue };
-                if dst == gs.my_ip {
-                    continue;
-                }
-                let target = match gs.members.get(&dst) {
-                    Some(p) if p.direct => p.endpoint,
-                    Some(p) => p.endpoint.or(Some(server)), // endpoint неизвестен → релей
-                    None => Some(server),                   // не наш пир — пусть релей решит
+        .spawn(move || {
+            while !env.quitting() {
+                let pkt = match session.receive_blocking() {
+                    Ok(p) => p,
+                    Err(_) => break,
                 };
-                match target {
-                    Some(t) => (gs.key, gs.my_ip, t),
-                    None => continue,
-                }
-            };
-            let frame = proto::seal_group(&key, proto::grp::DATA, gid, my_ip, dst, bytes);
-            stats.tx_pkts.fetch_add(1, Ordering::Relaxed);
-            stats.tx_bytes.fetch_add(frame.len() as u64, Ordering::Relaxed);
-            // Сокет меняется при реконнекте — берём текущий на каждый пакет.
-            let sock = cur_sock.read().unwrap().clone();
-            let _ = sock.send_to(&frame, target);
+                route_packet(&env, pkt.bytes());
+            }
         })
         .expect("spawn tun thread");
 }
@@ -1088,7 +1326,7 @@ fn spawn_sampler(env: Arc<Env>) {
         .spawn(move || {
             let mut prev_rx = 0u64;
             let mut prev_tx = 0u64;
-            loop {
+            while !env.quitting() {
                 thread::sleep(Duration::from_secs(1));
                 let rx = env.stats.rx_bytes.load(Ordering::Relaxed);
                 let tx = env.stats.tx_bytes.load(Ordering::Relaxed);
@@ -1157,8 +1395,3 @@ pub fn run(
     }
     Ok(())
 }
-
-
-
-
-

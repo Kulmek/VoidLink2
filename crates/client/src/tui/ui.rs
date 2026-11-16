@@ -571,8 +571,10 @@ fn draw_popup(f: &mut Frame, app: &App, th: &Theme, popup: &Popup, area: Rect) {
         }
         Popup::FriendCard(c) => {
             // 5 строк identicon + 6 служебных + группы + кнопки + рамка.
-            let h = (c.groups.len().max(1) as u16 + 14).min(26);
-            let rect = centered(area, 56, h);
+            // Ширина — под friend code целиком (62 символа): обрезанный рамкой
+            // код при копировании давал «неверную длину».
+            let h = (c.groups.len().max(1) as u16 + 15).min(27);
+            let rect = centered(area, 68, h);
             app.hits.popup.set(rect);
             f.render_widget(Clear, rect);
             draw_friend_card(f, app, th, c, rect);
@@ -592,7 +594,7 @@ fn draw_popup(f: &mut Frame, app: &App, th: &Theme, popup: &Popup, area: Rect) {
         }
         Popup::Profile => {
             // 5 строк identicon + 9 строк данных + кнопки + рамка.
-            let rect = centered(area, 60, 17);
+            let rect = centered(area, 68, 18);
             app.hits.popup.set(rect);
             f.render_widget(Clear, rect);
             draw_profile(f, app, th, rect);
@@ -710,9 +712,12 @@ fn draw_friend_card(f: &mut Frame, app: &App, th: &Theme, c: &FriendCardPopup, a
         Span::styled(c.alias.clone(), th.base),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("pubkey: ", th.dim),
-        Span::styled(proto::hex_of(&c.pubkey), th.dim),
+        Span::styled("friend code:", th.dim),
     ]));
+    lines.push(Line::from(Span::styled(
+        proto::friend_code_of(&c.pubkey),
+        th.accent,
+    )));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled("группы друга:", th.title)));
     if c.loading {
@@ -752,7 +757,7 @@ fn draw_friend_card(f: &mut Frame, app: &App, th: &Theme, c: &FriendCardPopup, a
         &app.hits.popup_buttons,
         inner_row(area, buttons_at),
         &[
-            ("Копировать pubkey (c)", th.accent, key(KeyCode::Char('c'))),
+            ("Копировать код (c)", th.accent, key(KeyCode::Char('c'))),
             ("Закрыть (Esc)", th.dim, key(KeyCode::Esc)),
         ],
         2,
@@ -883,9 +888,10 @@ fn draw_profile(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
         Span::styled(app.my_status.clone(), th.dim),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("friend code: ", th.dim),
-        Span::styled(app.my_code.clone(), th.accent),
+        Span::styled("friend code:", th.dim),
     ]));
+    // Код — отдельной строкой целиком, чтобы его можно было выделить мышью.
+    lines.push(Line::from(Span::styled(app.my_code.clone(), th.accent)));
     lines.push(Line::from(vec![
         Span::styled("группы:  ", th.dim),
         Span::styled(

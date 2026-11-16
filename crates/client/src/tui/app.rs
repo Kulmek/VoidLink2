@@ -1168,8 +1168,8 @@ impl App {
             },
             Popup::FriendCard(card) => match key.code {
                 KeyCode::Char('c') => {
-                    copy_to_clipboard(&proto::hex_of(&card.pubkey));
-                    self.toast(MsgKind::Ok, "pubkey друга скопирован".into());
+                    copy_to_clipboard(&proto::friend_code_of(&card.pubkey));
+                    self.toast(MsgKind::Ok, "friend code друга скопирован".into());
                     self.stack.push(Popup::FriendCard(card));
                 }
                 _ => {}

@@ -30,6 +30,8 @@
 //! экран первичной настройки (tui::setup): имя, сервер, адаптер, dll.
 
 mod engine;
+#[cfg(test)]
+mod engine_e2e;
 mod store;
 mod tun;
 mod tui;
@@ -143,11 +145,10 @@ fn main() -> Result<()> {
         }
         "del-server" => {
             let tok = rest.first().context("usage: del-server <N|addr|label>")?;
-            let before = cfg.servers.len();
-            cfg.servers.retain(|s| s.addr != *tok && s.label != *tok && tok.parse::<usize>().map(|n| n.to_string() != *tok).unwrap_or(true));
-            if cfg.servers.len() == before {
-                bail!("сервер {tok:?} не найден");
-            }
+            // Раньше числовой токен сравнивался сам с собой и
+            // `del-server 1` удалял все серверы.
+            let idx = find_server(&cfg, tok).with_context(|| format!("сервер {tok:?} не найден"))?;
+            cfg.servers.remove(idx);
             save(&cfg)?;
             println!("удалено");
         }
@@ -402,16 +403,19 @@ fn parse_gid(v: Option<&String>) -> Result<u32> {
     v.parse::<u32>().context("gid должен быть числом")
 }
 
+/// Индекс сервера по токену: номер из `servers` (с 0), адрес или метка.
+fn find_server(cfg: &Config, tok: &str) -> Option<usize> {
+    if let Some(i) = cfg.servers.iter().position(|s| s.addr == tok || (!s.label.is_empty() && s.label == tok)) {
+        return Some(i);
+    }
+    tok.parse::<usize>().ok().filter(|n| *n < cfg.servers.len())
+}
+
 /// Выбор сервера: --server <N|addr|label> или первый в списке.
 fn pick_server(cfg: &Config, sel: Option<&str>) -> Result<(SocketAddr, [u8; 32])> {
     let entry = match sel {
-        Some(tok) => {
-            let n = tok.parse::<usize>().ok();
-            cfg.servers
-                .iter()
-                .find(|s| &s.addr == tok || &s.label == tok || n.is_some() && n.unwrap().to_string() == *tok)
-                .with_context(|| format!("сервер {tok:?} не найден"))?
-        }
+        // Раньше `--server N` всегда выбирал первый сервер.
+        Some(tok) => &cfg.servers[find_server(cfg, tok).with_context(|| format!("сервер {tok:?} не найден"))?],
         None => cfg.servers.first().context("нет серверов; добавь: add-server <addr> <code>")?,
     };
     let addr: SocketAddr = entry.addr.parse().context("bad server addr")?;
@@ -430,4 +434,27 @@ fn with_server<T>(
 ) -> Result<T> {
     let (server, pub_key) = pick_server(cfg, sel)?;
     f(server, pub_key, cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn srv(addr: &str, label: &str) -> StoredServer {
+        StoredServer { addr: addr.into(), pubkey: String::new(), label: label.into() }
+    }
+
+    #[test]
+    fn сервер_по_номеру_адресу_метке() {
+        let cfg = Config {
+            servers: vec![srv("1.1.1.1:5555", "home"), srv("2.2.2.2:5555", ""), srv("3.3.3.3:5555", "work")],
+            ..Config::default()
+        };
+        assert_eq!(find_server(&cfg, "1"), Some(1), "номер — индекс, а не «всегда первый»");
+        assert_eq!(find_server(&cfg, "2"), Some(2));
+        assert_eq!(find_server(&cfg, "3"), None);
+        assert_eq!(find_server(&cfg, "3.3.3.3:5555"), Some(2));
+        assert_eq!(find_server(&cfg, "home"), Some(0));
+        assert_eq!(find_server(&cfg, ""), None, "пустая метка не совпадает с сервером без метки");
+    }
 }

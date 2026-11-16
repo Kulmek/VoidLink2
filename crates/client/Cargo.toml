@@ -11,3 +11,7 @@ ratatui.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 wintun.workspace = true
+
+[dev-dependencies]
+# e2e-тесты движка: настоящий сервер в том же процессе.
+tunnel-server = { path = "../server" }
