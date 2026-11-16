@@ -17,10 +17,10 @@
 use anyhow::{ensure, Result};
 use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
-    ChaCha20Poly1305, Key, Nonce,
+    ChaCha20Poly1305, Nonce,
 };
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
-use rand::RngCore;
+use rand::Rng;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 pub const MAGIC: [u8; 4] = *b"TNL2";
@@ -86,8 +86,8 @@ impl Identity {
     pub fn generate() -> Self {
         let mut ed_seed = [0u8; 32];
         let mut x_seed = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut ed_seed);
-        rand::thread_rng().fill_bytes(&mut x_seed);
+        rand::rng().fill_bytes(&mut ed_seed);
+        rand::rng().fill_bytes(&mut x_seed);
         Self { ed_seed, x_seed }
     }
 
@@ -246,7 +246,7 @@ fn frame_header(typ: u8, body_len: usize) -> [u8; HDR_LEN] {
 }
 
 fn cipher(key: &SymKey) -> ChaCha20Poly1305 {
-    ChaCha20Poly1305::new(Key::from_slice(key))
+    ChaCha20Poly1305::new(key.into())
 }
 
 // ---------- управляющие фреймы ----------
@@ -254,9 +254,9 @@ fn cipher(key: &SymKey) -> ChaCha20Poly1305 {
 pub fn seal_ctrl(key: &SymKey, typ: u8, payload: &[u8]) -> Vec<u8> {
     let hdr = frame_header(typ, payload.len());
     let mut nonce = [0u8; NONCE_LEN];
-    rand::thread_rng().fill_bytes(&mut nonce);
+    rand::rng().fill_bytes(&mut nonce);
     let ct = cipher(key)
-        .encrypt(Nonce::from_slice(&nonce), Payload { msg: payload, aad: &hdr })
+        .encrypt(&Nonce::from(nonce), Payload { msg: payload, aad: &hdr })
         .expect("ctrl encrypt");
     let mut out = Vec::with_capacity(HDR_LEN + NONCE_LEN + ct.len());
     out.extend_from_slice(&hdr);
@@ -269,7 +269,7 @@ pub fn open_ctrl(key: &SymKey, typ: u8, body: &[u8]) -> Result<Vec<u8>> {
     ensure!(body.len() >= NONCE_LEN + TAG_LEN, "ctrl body too short");
     let (nonce, ct) = body.split_at(NONCE_LEN);
     cipher(key)
-        .decrypt(Nonce::from_slice(nonce), Payload { msg: ct, aad: &frame_header(typ, ct.len() - TAG_LEN) })
+        .decrypt(&Nonce::try_from(nonce).map_err(|_| anyhow::anyhow!("bad nonce len"))?, Payload { msg: ct, aad: &frame_header(typ, ct.len() - TAG_LEN) })
         .map_err(|_| anyhow::anyhow!("ctrl decrypt failed"))
 }
 
@@ -293,9 +293,9 @@ pub fn seal_group(key: &SymKey, typ: u8, gid: u32, src: u32, dst: u32, payload: 
     aad.extend_from_slice(&src.to_be_bytes());
     aad.extend_from_slice(&dst.to_be_bytes());
     let mut nonce = [0u8; NONCE_LEN];
-    rand::thread_rng().fill_bytes(&mut nonce);
+    rand::rng().fill_bytes(&mut nonce);
     let ct = cipher(key)
-        .encrypt(Nonce::from_slice(&nonce), Payload { msg: payload, aad: &aad })
+        .encrypt(&Nonce::from(nonce), Payload { msg: payload, aad: &aad })
         .expect("group encrypt");
     let mut out = aad; // открытая часть: frame header + group header
     out.extend_from_slice(&nonce);
@@ -312,7 +312,7 @@ pub fn open_group(key: &SymKey, datagram: &[u8]) -> Result<(u8, u32, u32, u32, V
     let mut aad = frame_header(typ, ct.len() - TAG_LEN + GRP_HDR_LEN).to_vec();
     aad.extend_from_slice(ghdr);
     let pt = cipher(key)
-        .decrypt(Nonce::from_slice(nonce), Payload { msg: ct, aad: &aad })
+        .decrypt(&Nonce::try_from(nonce).map_err(|_| anyhow::anyhow!("bad nonce len"))?, Payload { msg: ct, aad: &aad })
         .map_err(|_| anyhow::anyhow!("group decrypt failed"))?;
     let gid = u32::from_be_bytes(ghdr[..4].try_into().unwrap());
     let src = u32::from_be_bytes(ghdr[4..8].try_into().unwrap());
@@ -408,3 +408,56 @@ pub fn ip_str(ip: u32) -> String {
 }
 
 pub mod payloads;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_и_подписи() {
+        let a = Identity::generate();
+        let b = Identity::generate();
+        // Friend code туда-обратно.
+        let code = a.friend_code();
+        assert_eq!(Identity::parse_friend_code(&code).unwrap(), a.ed_pub());
+        // Подпись проверяется, чужая не проходит.
+        let msg = b"hello";
+        let sig = a.sign(msg);
+        Identity::verify(&a.ed_pub(), msg, &sig).unwrap();
+        assert!(Identity::verify(&b.ed_pub(), msg, &sig).is_err());
+        // Симметричный общий ключ: обе стороны выводят одно и то же.
+        assert_eq!(a.ctrl_key_with(&b.x_pub()), b.ctrl_key_with(&a.x_pub()));
+    }
+
+    #[test]
+    fn шифрование_ctrl_и_group_туда_обратно() {
+        let key = [42u8; 32];
+        // Ctrl: шифруется/расшифровывается, чужой AAD/ключ не открывает.
+        let frame = seal_ctrl(&key, ctrl::STATUS, b"payload");
+        let (typ, body) = split_frame(&frame).unwrap();
+        let p = open_ctrl(&key, typ, body).unwrap();
+        assert_eq!(typ, ctrl::STATUS);
+        assert_eq!(p, b"payload");
+        let other = seal_ctrl(&[7u8; 32], ctrl::STATUS, b"x");
+        let (typ2, body2) = split_frame(&other).unwrap();
+        assert!(open_ctrl(&key, typ2, body2).is_err());
+        // Tamper: битый ciphertext → ошибка.
+        let mut tampered = frame.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        let (_, tb) = split_frame(&tampered).unwrap();
+        assert!(open_ctrl(&key, ctrl::STATUS, tb).is_err());
+
+        // Group: заголовок открытый, payload шифруется, tamper ловится.
+        let g = seal_group(&key, 5, 7, 0x0A00_0002, 0x0A00_0003, b"data");
+        let (gid, src, dst) = parse_group_header(&g).unwrap();
+        assert_eq!((gid, src, dst), (7, 0x0A00_0002, 0x0A00_0003));
+        let (t, g2, s2, d2, p) = open_group(&key, &g).unwrap();
+        assert_eq!((t, g2, s2, d2), (5, 7, 0x0A00_0002, 0x0A00_0003));
+        assert_eq!(p, b"data");
+        let mut tg = g.clone();
+        let last = tg.len() - 1;
+        tg[last] ^= 1;
+        assert!(open_group(&key, &tg).is_err());
+    }
+}
