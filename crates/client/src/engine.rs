@@ -436,12 +436,12 @@ pub fn start(
     let my_pub = env.identity.ed_pub();
     let my_code = env.identity.friend_code();
 
-    // Первое подключение — синхронно.
+    // Первое подключение — синхронно. Событие Connected эмитится один раз —
+    // из engine_loop (иначе «подключено» дублируется в логе TUI).
     let cfg_snap = env.cfg.lock().unwrap().clone();
     let conn = CtrlConn::connect(&cfg_snap, server, &server_pub, &env.identity)?;
     *cur_sock.write().unwrap() = conn.sock.clone();
     env.meta.lock().unwrap().connected = true;
-    env.emit(Event::Connected(server));
 
     spawn_tun_thread(
         session.clone(),
@@ -606,6 +606,16 @@ fn session_loop(
                     last_list = now;
                     conn.send_ctrl(ctrl::LIST_GROUPS, &payloads::enc_gid(0));
                 }
+                continue;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                // Windows: send_to в мёртвый эндпоинт (NAT-punch офлайн-пиру,
+                // PING по устаревшему endpoint) даёт ICMP unreachable, и
+                // следующий recv_from возвращает WSAECONNRESET. Это не потеря
+                // связи с сервером — съедаем ошибку и продолжаем сессию.
+                // (Несколько reset'ов = несколько ошибок, каждая съедается
+                // своим recv_from.) Без этого сессия рвалась бы и клиент
+                // переподключался каждые NAT_EVERY.
                 continue;
             }
             Err(e) => {
