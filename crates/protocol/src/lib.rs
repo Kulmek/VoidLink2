@@ -158,7 +158,7 @@ pub fn friend_code_of(pubkey: &[u8; 32]) -> String {
             nbits -= 5;
             out.push(B32[((bits >> nbits) & 31) as usize] as char);
             emitted += 1;
-            if emitted % 8 == 0 && emitted < 52 {
+            if emitted.is_multiple_of(8) && emitted < 52 {
                 out.push('-');
             }
         }
@@ -207,7 +207,7 @@ pub fn hex_of(bytes: &[u8]) -> String {
 
 pub fn hex_to_bytes(s: &str) -> Result<Vec<u8>> {
     let s = s.trim().to_lowercase();
-    ensure!(s.len() % 2 == 0, "odd hex length");
+    ensure!(s.len().is_multiple_of(2), "odd hex length");
     Ok((0..s.len() / 2)
         .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16))
         .collect::<std::result::Result<Vec<u8>, _>>()?)
@@ -227,7 +227,7 @@ pub fn plain_frame(typ: u8, body: &[u8]) -> Vec<u8> {
 
 /// Разбирает общий заголовок. Возвращает (typ, body).
 pub fn split_frame(datagram: &[u8]) -> Result<(u8, &[u8])> {    ensure!(datagram.len() >= HDR_LEN, "frame too short");
-    ensure!(&datagram[..4] == &MAGIC, "bad magic");
+    ensure!(datagram[..4] == MAGIC, "bad magic");
     let typ = datagram[4];
     let len = u16::from_le_bytes([datagram[5], datagram[6]]) as usize;
     let body = &datagram[HDR_LEN..];
@@ -386,7 +386,6 @@ impl<'a> Reader<'a> {
 }
 
 /// IP-адреса — в network byte order (big-endian), как внутри IPv4-пакета.
-
 pub fn ipv4_dst(packet: &[u8]) -> Result<u32> {
     ensure!(packet.len() >= 20, "packet too short");
     ensure!(packet[0] >> 4 == 4, "not ipv4");

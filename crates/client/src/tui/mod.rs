@@ -6,6 +6,7 @@
 
 pub mod app;
 pub mod identicon;
+pub mod setup;
 pub mod theme;
 pub mod ui;
 
@@ -61,14 +62,14 @@ pub fn run(
     res
 }
 
-fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
+pub(crate) fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut out = std::io::stdout();
     execute!(out, EnterAlternateScreen)?;
     Ok(Terminal::new(CrosstermBackend::new(out))?)
 }
 
-fn restore_terminal(term: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+pub(crate) fn restore_terminal(term: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     disable_raw_mode()?;
     execute!(term.backend_mut(), LeaveAlternateScreen)?;
     term.show_cursor()?;
