@@ -50,6 +50,15 @@ const DIRECT_TIMEOUT: Duration = Duration::from_secs(12);
 /// LEAVE повторяется, пока сервер не подтвердит выход списком групп.
 const LEAVE_RETRY: Duration = Duration::from_secs(1);
 const LEAVE_GIVE_UP: Duration = Duration::from_secs(20);
+/// Окно INVITE_LIST, которого ждём (после HELLO или запрошенное
+/// LIST_INVITES), запрашивается снова, пока не придёт: потерянное окно
+/// иначе прятало бы приглашения до переподключения.
+const INVITE_SYNC_RETRY: Duration = Duration::from_secs(3);
+/// Старый сервер LIST_INVITES не знает и не отвечает — не спрашивать вечно.
+const INVITE_SYNC_GIVE_UP: Duration = Duration::from_secs(20);
+/// DECLINE_INVITE повторяется, пока сервер не подтвердит отказ окном списка.
+const DECLINE_RETRY: Duration = Duration::from_secs(1);
+const DECLINE_GIVE_UP: Duration = Duration::from_secs(20);
 const HISTORY_LEN: usize = 60;
 const NEW_GROUP_GRACE: Duration = Duration::from_secs(10);
 /// Таймаут чтения rx-потока (как часто он проверяет флаг выхода).
@@ -151,7 +160,21 @@ pub enum Event {
     PeerOffline { gid: u32, ip: u32, name: String },
     /// Установлен прямой p2p-канал с пиром.
     Direct { gid: u32, ip: u32, name: String },
-    Invite { gid: u32, group_name: String, from_name: String },
+    /// Приглашение в группу (в т.ч. повторная доставка неотвеченного после
+    /// HELLO — UI должен убирать дубликаты по gid).
+    Invite { gid: u32, group_name: String, from_pubkey: [u8; 32], from_name: String },
+    /// Приглашённый отклонил наше приглашение (мы — владелец группы).
+    InviteDeclined { gid: u32, group_name: String, by_pubkey: [u8; 32], by_name: String },
+    /// Приглашение больше недействительно: группу удалили до ответа.
+    InviteRevoked { gid: u32 },
+    /// Сервер прислал окно списка неотвеченных приглашений (после HELLO,
+    /// отказа, входа, отзыва BAN/KICK): приглашения с gid ≥ `from`, не больше
+    /// 16. Других gid в покрытом окне уже нет — UI снимает их окна.
+    /// `complete == false` — хвост не влез: окно достоверно только до
+    /// последнего gid в нём, следующее движок дочитывает сам
+    /// (LIST_INVITES). Каждое из `gids` перед этим пришло как
+    /// [`Event::Invite`].
+    InvitesSynced { gids: Vec<u32>, from: u32, complete: bool },
     FriendGroups { pubkey: [u8; 32], items: Vec<payloads::FriendGroup> },
     Error(String),
     Notice(String),
@@ -167,6 +190,8 @@ pub enum Cmd {
     Delete(u32),
     Rename(u32, String),
     Invite(u32, [u8; 32]),
+    /// Отклонить приглашение в группу.
+    DeclineInvite(u32),
     Kick(u32, [u8; 32]),
     Ban(u32, [u8; 32]),
     SetName(String),
@@ -361,6 +386,9 @@ pub struct CtrlConn {
     pub sock: Arc<UdpSocket>,
     pub ctrl_key: proto::SymKey,
     pub server: SocketAddr,
+    /// HELLO этого соединения — для повтора (сервер заново шлёт ответ на
+    /// HELLO, в т.ч. INVITE_LIST).
+    hello: Vec<u8>,
 }
 
 impl CtrlConn {
@@ -407,8 +435,57 @@ impl CtrlConn {
                 ctrl_key: identity.ctrl_key_with(&x_pub),
                 server,
                 sock,
+                hello,
             });
         }
+    }
+
+    /// Список неотвеченных приглашений, который сервер шлёт после HELLO:
+    /// (приглашения, список полный). PONG раньше списка — список потерян
+    /// (UDP, крупная фрагментированная датаграмма) или переставлен раньше
+    /// WELCOME, либо сервер старый: HELLO повторяется на том же сокете
+    /// (сервер пришлёт список заново). `None` — списка нет и после повторов.
+    pub fn invite_list(&self) -> Result<Option<payloads::InviteList>> {
+        self.send_ctrl(ctrl::CTRL_PING, &[]);
+        let (typ, p) = self.wait_any(&[ctrl::INVITE_LIST, ctrl::CTRL_PONG], Duration::from_secs(5))?;
+        if typ == ctrl::INVITE_LIST {
+            return Ok(Some(payloads::dec_invite_list(&p)?));
+        }
+        // Ответ на повторный HELLO ждём без PING: на другом потоке сервера
+        // PING обогнал бы более дорогой HELLO.
+        for _ in 0..2 {
+            let _ = self.sock.send_to(&self.hello, self.server);
+            match self.wait_for(ctrl::INVITE_LIST, Duration::from_secs(2)) {
+                Ok(p) => return Ok(Some(payloads::dec_invite_list(&p)?)),
+                Err(e) if e.to_string().starts_with("сервер:") => return Err(e),
+                Err(_) => {}
+            }
+        }
+        Ok(None)
+    }
+
+    /// Окно неотвеченных приглашений с gid ≥ `from` (LIST_INVITES, без
+    /// побочных эффектов). Запоздавшие окна с другим началом (ответ на
+    /// повторный HELLO или прошлый запрос) пропускаются; при потере —
+    /// повтор. `None` — ответа нет (старый сервер или потеря пакетов).
+    pub fn invite_page(&self, from: u32) -> Result<Option<payloads::InviteList>> {
+        for _ in 0..3 {
+            self.send_ctrl(ctrl::LIST_INVITES, &payloads::enc_gid(from));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+                match self.wait_for(ctrl::INVITE_LIST, left) {
+                    Ok(p) => {
+                        let l = payloads::dec_invite_list(&p)?;
+                        if l.from == from {
+                            return Ok(Some(l));
+                        }
+                    }
+                    Err(e) if e.to_string().starts_with("сервер:") => return Err(e),
+                    Err(_) => break,
+                }
+            }
+        }
+        Ok(None)
     }
 
     pub fn send_ctrl(&self, typ: u8, payload: &[u8]) {
@@ -419,12 +496,17 @@ impl CtrlConn {
 
     /// Ждёт фрейм конкретного типа; ERROR превращает в Err; прочее игнорируется.
     pub fn wait_for(&self, expect: u8, timeout: Duration) -> Result<Vec<u8>> {
+        self.wait_any(&[expect], timeout).map(|(_, p)| p)
+    }
+
+    /// Ждёт фрейм одного из типов `expect`: (тип, payload). ERROR → Err.
+    pub fn wait_any(&self, expect: &[u8], timeout: Duration) -> Result<(u8, Vec<u8>)> {
         let deadline = Instant::now() + timeout;
         self.sock.set_read_timeout(Some(Duration::from_millis(200))).ok();
         let mut buf = vec![0u8; 65_535];
         loop {
             if Instant::now() > deadline {
-                anyhow::bail!("таймаут ожидания {expect:#04x} от сервера");
+                anyhow::bail!("таймаут ожидания {expect:02x?} от сервера");
             }
             let (n, src) = match self.sock.recv_from(&mut buf) {
                 Ok(x) => x,
@@ -447,8 +529,8 @@ impl CtrlConn {
             if typ == ctrl::ERROR {
                 anyhow::bail!("сервер: {}", payloads::dec_error(&payload).unwrap_or_default());
             }
-            if typ == expect {
-                return Ok(payload);
+            if expect.contains(&typ) {
+                return Ok((typ, payload));
             }
         }
     }
@@ -659,6 +741,12 @@ struct State {
     backoff: Duration,
     /// Группы, из которых вышли, но сервер ещё не подтвердил: gid → начало.
     leaving: HashMap<u32, Instant>,
+    /// Ожидаемое окно приглашений: (from, с какого момента ждём).
+    invite_sync: Option<(u32, Instant)>,
+    last_invite_req: Instant,
+    /// Отклонённые приглашения, отказ ещё не подтверждён: gid → начало.
+    declining: HashMap<u32, Instant>,
+    last_decline: Instant,
     last_ping: Instant,
     last_list: Instant,
     last_rtt: Instant,
@@ -677,6 +765,10 @@ impl State {
             next_hello: now,
             backoff: Duration::from_secs(1),
             leaving: HashMap::new(),
+            invite_sync: None,
+            last_invite_req: now,
+            declining: HashMap::new(),
+            last_decline: now,
             last_ping: now,
             last_list: now,
             last_rtt: now,
@@ -702,6 +794,11 @@ fn first_connect(env: &Env, in_rx: &mpsc::Receiver<Input>, st: &mut State) -> Re
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut next = Instant::now();
     let mut early: Vec<Cmd> = Vec::new();
+    // Фреймы сервера, обогнавшие WELCOME (UDP не держит порядок): без
+    // канального ключа их не расшифровать — разобрать после подключения.
+    // Иначе терялись, например, приглашения, которые сервер шлёт сразу за
+    // WELCOME.
+    let mut early_frames: Vec<(u8, Vec<u8>)> = Vec::new();
     loop {
         let now = Instant::now();
         if now > deadline {
@@ -718,6 +815,9 @@ fn first_connect(env: &Env, in_rx: &mpsc::Receiver<Input>, st: &mut State) -> Re
                     .context("WELCOME: подпись не от того сервера (неверный код сервера?)")?;
                 st.ctrl_key = Some(env.identity.ctrl_key_with(&x_pub));
                 on_connected(env, st);
+                for (typ, body) in early_frames {
+                    on_server_frame(env, st, typ, &body);
+                }
                 // Команды, пришедшие до подключения, — после него.
                 for c in early {
                     do_cmd(env, st, c);
@@ -726,7 +826,11 @@ fn first_connect(env: &Env, in_rx: &mpsc::Receiver<Input>, st: &mut State) -> Re
             }
             Ok(Input::Cmd(Cmd::Quit)) => anyhow::bail!("остановлено"),
             Ok(Input::Cmd(c)) => early.push(c),
-            Ok(Input::Server { .. }) => {}
+            Ok(Input::Server { typ, body }) => {
+                if typ != ctrl::WELCOME && typ != ctrl::RESET && early_frames.len() < 64 {
+                    early_frames.push((typ, body));
+                }
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => anyhow::bail!("rx-поток остановлен"),
         }
@@ -759,6 +863,10 @@ fn on_connected(env: &Env, st: &mut State) {
     st.backoff = Duration::from_secs(1);
     st.last_ping = now;
     st.last_list = now;
+    // Сервер шлёт окно приглашений сразу за WELCOME — ждём его (см. tick).
+    st.invite_sync = Some((0, now));
+    st.last_invite_req = now;
+    st.last_decline = now;
     env.meta.lock().unwrap().connected = true;
     env.emit(Event::Connected(env.server));
 
@@ -773,6 +881,9 @@ fn on_connected(env: &Env, st: &mut State) {
     }
     for gid in st.leaving.keys() {
         st.send_ctrl(env, ctrl::LEAVE_GROUP, &payloads::enc_gid(*gid));
+    }
+    for gid in st.declining.keys() {
+        st.send_ctrl(env, ctrl::DECLINE_INVITE, &payloads::enc_gid(*gid));
     }
     st.send_ctrl(env, ctrl::LIST_GROUPS, &payloads::enc_gid(0));
 }
@@ -854,6 +965,24 @@ fn tick(env: &Env, st: &mut State, now: Instant) {
                 st.send_ctrl(env, ctrl::LEAVE_GROUP, &payloads::enc_gid(*gid));
             }
         }
+        if let Some((from, since)) = st.invite_sync
+            && now.duration_since(st.last_invite_req) >= INVITE_SYNC_RETRY
+        {
+            st.last_invite_req = now;
+            if now.duration_since(since) < INVITE_SYNC_GIVE_UP {
+                st.send_ctrl(env, ctrl::LIST_INVITES, &payloads::enc_gid(from));
+            } else {
+                st.invite_sync = None;
+            }
+        }
+        if !st.declining.is_empty() && now.duration_since(st.last_decline) >= DECLINE_RETRY {
+            st.last_decline = now;
+            st.declining
+                .retain(|_, started| now.duration_since(*started) < DECLINE_GIVE_UP);
+            for gid in st.declining.keys() {
+                st.send_ctrl(env, ctrl::DECLINE_INVITE, &payloads::enc_gid(*gid));
+            }
+        }
     }
     // P2P-таймеры работают и без сервера: прямые каналы живут сами.
     if now.duration_since(st.last_rtt) >= RTT_EVERY {
@@ -924,6 +1053,7 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
         ),
         Cmd::Join(gid) => {
             st.leaving.remove(&gid);
+            st.declining.remove(&gid);
             st.send_ctrl(env, ctrl::JOIN_GROUP, &payloads::enc_gid(gid))
         }
         Cmd::Delete(gid) => st.send_ctrl(env, ctrl::DELETE_GROUP, &payloads::enc_gid(gid)),
@@ -932,6 +1062,16 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
         }
         Cmd::Invite(gid, pk) => {
             st.send_ctrl(env, ctrl::INVITE, &payloads::enc_gid_target(gid, &pk))
+        }
+        // Повторяется, пока окно списка не подтвердит отказ (см. on_ctrl):
+        // потерянный DECLINE оставил бы приглашение на сервере, а владелец
+        // не узнал бы об отказе. Старый сервер тип не знает и молча
+        // игнорирует — это не ошибка, повторы кончатся по DECLINE_GIVE_UP.
+        Cmd::DeclineInvite(gid) => {
+            let now = Instant::now();
+            st.declining.insert(gid, now);
+            st.last_decline = now;
+            st.send_ctrl(env, ctrl::DECLINE_INVITE, &payloads::enc_gid(gid))
         }
         Cmd::Kick(gid, pk) => st.send_ctrl(env, ctrl::KICK, &payloads::enc_gid_target(gid, &pk)),
         Cmd::Ban(gid, pk) => st.send_ctrl(env, ctrl::BAN, &payloads::enc_gid_target(gid, &pk)),
@@ -969,15 +1109,52 @@ fn on_ctrl(env: &Env, st: &mut State, typ: u8, payload: &[u8]) {
         }
         ctrl::INVITE_RCVD => {
             if let Ok(inv) = payloads::dec_invite(payload) {
-                env.emit(Event::Invite {
-                    gid: inv.gid,
-                    group_name: inv.group_name.clone(),
-                    from_name: inv.from_name.clone(),
-                });
-                let in_autojoin = env.cfg.lock().unwrap().autojoin.contains(&inv.gid);
-                if in_autojoin {
-                    st.send_ctrl(env, ctrl::JOIN_GROUP, &payloads::enc_gid(inv.gid));
+                on_invite(env, st, inv);
+            }
+        }
+        ctrl::INVITE_LIST => {
+            if let Ok(list) = payloads::dec_invite_list(payload) {
+                // Неполное окно — дочитать следующее: сервер шлёт не больше
+                // 16 за раз (ответ не должен расти), а показать нужно все.
+                // gid растут, так что цепочка конечна.
+                let now = Instant::now();
+                let next = list.next_from();
+                if let Some(next) = next {
+                    st.send_ctrl(env, ctrl::LIST_INVITES, &payloads::enc_gid(next));
                 }
+                // Ждали окно с `want` — это его покрывает: ждём следующее
+                // (если есть). Окно не о том (ответ на отказ, вход) ожидание
+                // не снимает.
+                match st.invite_sync {
+                    Some((want, _)) if !list.covers(want) => {}
+                    _ => {
+                        st.invite_sync = next.map(|n| (n, now));
+                        st.last_invite_req = now;
+                    }
+                }
+                // Отказ подтверждён: окно покрывает gid, а приглашения в нём нет.
+                st.declining.retain(|gid, _| {
+                    !list.covers(*gid) || list.items.iter().any(|i| i.gid == *gid)
+                });
+                let (from, complete) = (list.from, list.complete);
+                let gids: Vec<u32> = list.items.iter().map(|i| i.gid).collect();
+                for inv in list.items {
+                    // Отказ ещё повторяется — список собран до него.
+                    if !st.declining.contains_key(&inv.gid) {
+                        on_invite(env, st, inv);
+                    }
+                }
+                env.emit(Event::InvitesSynced { gids, from, complete });
+            }
+        }
+        ctrl::INVITE_DECLINED => {
+            if let Ok(d) = payloads::dec_invite_declined(payload) {
+                env.emit(Event::InviteDeclined {
+                    gid: d.gid,
+                    group_name: d.group_name,
+                    by_pubkey: d.by_pubkey,
+                    by_name: d.by_name,
+                });
             }
         }
         ctrl::ERROR => {
@@ -992,6 +1169,22 @@ fn on_ctrl(env: &Env, st: &mut State, typ: u8, payload: &[u8]) {
             }
         }
         _ => {}
+    }
+}
+
+/// Приглашение (одиночное или из INVITE_LIST): событие UI; группа из
+/// автовхода — войти сразу.
+fn on_invite(env: &Env, st: &mut State, inv: payloads::InviteInfo) {
+    let gid = inv.gid;
+    env.emit(Event::Invite {
+        gid,
+        group_name: inv.group_name,
+        from_pubkey: inv.from_pubkey,
+        from_name: inv.from_name,
+    });
+    let in_autojoin = env.cfg.lock().unwrap().autojoin.contains(&gid);
+    if in_autojoin {
+        st.send_ctrl(env, ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
     }
 }
 
@@ -1047,9 +1240,13 @@ fn apply_group_state(env: &Env, st: &payloads::GroupState) {
     let my_pub = env.identity.ed_pub();
     if st.deleted {
         let removed = { env.groups.lock().unwrap().remove(&st.gid).map(|g| g.name) };
-        if let Some(name) = removed {
-            env.autojoin_remove(st.gid);
-            env.emit(Event::GroupDeleted { gid: st.gid, name });
+        match removed {
+            Some(name) => {
+                env.autojoin_remove(st.gid);
+                env.emit(Event::GroupDeleted { gid: st.gid, name });
+            }
+            // Не наша группа — сервер сообщает приглашённому, что группы нет.
+            None => env.emit(Event::InviteRevoked { gid: st.gid }),
         }
         return;
     }
@@ -1385,9 +1582,20 @@ pub fn run(
                 proto::ip_str(ip),
                 name
             ),
-            Event::Invite { gid, group_name, from_name } => eprintln!(
-                "[engine] приглашение: {from_name} приглашает в группу {group_name} (gid {gid})"
+            // Ответить на месте нельзя: CLI join/decline и TUI — свой HELLO
+            // той же identity, он вытесняет этот сеанс (а реконнект run —
+            // их), поэтому — только после остановки run.
+            Event::Invite { gid, group_name, from_name, .. } => eprintln!(
+                "[engine] приглашение: {from_name} приглашает в группу {group_name} (gid {gid}); \
+                 ответить — остановив run: командой join {gid} / decline {gid} или в TUI"
             ),
+            Event::InviteDeclined { gid, group_name, by_name, .. } => eprintln!(
+                "[engine] {by_name} отклонил приглашение в группу {group_name} (gid {gid})"
+            ),
+            Event::InviteRevoked { gid } => {
+                eprintln!("[engine] приглашение в группу {gid} больше недействительно")
+            }
+            Event::InvitesSynced { .. } => {}
             Event::FriendGroups { .. } => {}
             Event::Error(e) => eprintln!("[engine] {e}"),
             Event::Notice(n) => eprintln!("[engine] {n}"),

@@ -2,14 +2,15 @@
 //! движки на localhost. TUN заменён заглушкой, поэтому права администратора
 //! и Wintun не нужны.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tunnel_protocol as proto;
+use tunnel_protocol::ctrl;
 
 use crate::engine::{self, Cmd, Engine, Event, TunDev};
 use crate::store::Config;
@@ -40,6 +41,21 @@ struct Node {
 
 impl Node {
     fn start(name: &str, server: &tunnel_server::Server) -> Node {
+        Node::start_as(name, server, proto::Identity::generate())
+    }
+
+    /// Запуск с заданной identity (её pubkey известен заранее).
+    fn start_as(name: &str, server: &tunnel_server::Server, identity: proto::Identity) -> Node {
+        Node::start_via(name, local(server.addr), server.pubkey, identity)
+    }
+
+    /// Запуск через заданный адрес сервера (например, [`LossyProxy`]).
+    fn start_via(
+        name: &str,
+        addr: SocketAddr,
+        server_pub: [u8; 32],
+        identity: proto::Identity,
+    ) -> Node {
         let cfg = Config {
             name: name.into(),
             ..Config::default()
@@ -47,9 +63,9 @@ impl Node {
         let tun = Arc::new(TestTun::default());
         let eng = engine::start_with_tun(
             Arc::new(Mutex::new(cfg)),
-            local(server.addr),
-            server.pubkey,
-            proto::Identity::generate(),
+            addr,
+            server_pub,
+            identity,
             tun.clone(),
             Arc::new(|_| {}),
         )
@@ -151,6 +167,70 @@ fn ipv4(src: u32, dst: u32, data: &[u8]) -> Vec<u8> {
 
 const T: Duration = Duration::from_secs(10);
 
+/// Правило потерь посредника: (к серверу?, тип фрейма, сколько фреймов
+/// каждого типа клиент отправил, включая этот) → потерять.
+type DropRule = Box<dyn FnMut(bool, u8, &HashMap<u8, usize>) -> bool + Send>;
+
+/// UDP-посредник между одним клиентом и сервером: теряет фреймы по правилу
+/// (тип фрейма в заголовке открыт) и считает отправленное клиентом.
+struct LossyProxy {
+    addr: SocketAddr,
+    sent: Arc<Mutex<HashMap<u8, usize>>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl LossyProxy {
+    fn start(server: SocketAddr, mut drop_rule: DropRule) -> LossyProxy {
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        let addr = sock.local_addr().unwrap();
+        let sent = Arc::new(Mutex::new(HashMap::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (sent2, stop2) = (sent.clone(), stop.clone());
+        let thread = std::thread::spawn(move || {
+            let mut buf = vec![0u8; 65_535];
+            let mut client: Option<SocketAddr> = None;
+            while !stop2.load(Ordering::Relaxed) {
+                let Ok((n, src)) = sock.recv_from(&mut buf) else { continue };
+                let to_server = src != server;
+                if to_server {
+                    client = Some(src);
+                }
+                let Some(dst) = (if to_server { Some(server) } else { client }) else {
+                    continue;
+                };
+                let typ = proto::split_frame(&buf[..n]).map(|(t, _)| t).unwrap_or(0);
+                let lost = {
+                    let mut sent = sent2.lock().unwrap();
+                    if to_server {
+                        *sent.entry(typ).or_insert(0) += 1;
+                    }
+                    drop_rule(to_server, typ, &sent)
+                };
+                if !lost {
+                    let _ = sock.send_to(&buf[..n], dst);
+                }
+            }
+        });
+        LossyProxy { addr, sent, stop, thread: Some(thread) }
+    }
+
+    /// Сколько фреймов типа `typ` клиент отправил серверу.
+    fn sent(&self, typ: u8) -> usize {
+        self.sent.lock().unwrap().get(&typ).copied().unwrap_or(0)
+    }
+}
+
+impl Drop for LossyProxy {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
 #[test]
 fn e2e_группа_прямой_канал_без_спама_выход_кик_рестарт() {
     let dir = temp_dir("main");
@@ -233,6 +313,215 @@ fn e2e_группа_прямой_канал_без_спама_выход_кик_
     }
     drop(a);
     drop(b);
+    server.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn e2e_приглашение_офлайн_цели_и_отказ() {
+    let dir = temp_dir("invite");
+    let server = start_server(&dir, 0);
+    let mut a = Node::start("alpha", &server);
+    a.wait("A подключён", T, |e| matches!(e, Event::Connected(_)));
+    a.eng.cmds.send(Cmd::Create { name: "secret".into(), private: true }).unwrap();
+    let gid = match a.wait("A создал группу", T, |e| matches!(e, Event::GroupJoined { .. })) {
+        Event::GroupJoined { gid, .. } => gid,
+        _ => unreachable!(),
+    };
+
+    // B ещё не запущен: приглашение ждёт на сервере.
+    let b_id = proto::Identity::generate();
+    let b_pub = b_id.ed_pub();
+    a.eng.cmds.send(Cmd::Invite(gid, b_pub)).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+
+    // B подключается — приглашение приходит после HELLO, с pubkey владельца.
+    let mut b = Node::start_as("bravo", &server, b_id);
+    let a_pub = a.eng.my_pub;
+    b.wait("B получил приглашение", T, |e| {
+        matches!(e, Event::Invite { gid: g, from_pubkey, from_name, .. }
+            if *g == gid && *from_pubkey == a_pub && from_name == "alpha")
+    });
+    // Список полный — UI может снять всё, чего в нём нет.
+    b.wait("B: список приглашений сверен", T, |e| {
+        matches!(e, Event::InvitesSynced { gids, from: 0, complete: true } if gids == &vec![gid])
+    });
+
+    // Отказ — владелец узнаёт, кто и куда.
+    b.eng.cmds.send(Cmd::DeclineInvite(gid)).unwrap();
+    a.wait("A: приглашение отклонено", T, |e| {
+        matches!(e, Event::InviteDeclined { gid: g, by_pubkey, by_name, group_name }
+            if *g == gid && *by_pubkey == b_pub && by_name == "bravo" && group_name == "secret")
+    });
+    // Отказавшему сервер отвечает свежим списком — уже без этого gid.
+    b.wait("B: отказ подтверждён списком", T, |e| {
+        matches!(e, Event::InvitesSynced { gids, from: 0, complete: true } if gids.is_empty())
+    });
+    // После отказа в приватную группу не войти.
+    b.eng.cmds.send(Cmd::Join(gid)).unwrap();
+    b.wait("B: вход без приглашения отклонён", T, |e| {
+        matches!(e, Event::Error(t) if t.contains("приглашение"))
+    });
+    assert!(!b.has_group(gid));
+
+    drop(a);
+    drop(b);
+    server.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn e2e_больше_16_приглашений_движок_дочитывает_окнами() {
+    let dir = temp_dir("invite-pages");
+    let server = start_server(&dir, 0);
+    let mut a = Node::start("alpha", &server);
+    a.wait("A подключён", T, |e| matches!(e, Event::Connected(_)));
+    let b_id = proto::Identity::generate();
+    let b_pub = b_id.ed_pub();
+    let mut gids = HashSet::new();
+    for i in 0..20 {
+        a.eng.cmds.send(Cmd::Create { name: format!("g{i}"), private: true }).unwrap();
+        let gid = match a.wait("A создал группу", T, |e| matches!(e, Event::GroupJoined { .. })) {
+            Event::GroupJoined { gid, .. } => gid,
+            _ => unreachable!(),
+        };
+        a.eng.cmds.send(Cmd::Invite(gid, b_pub)).unwrap();
+        gids.insert(gid);
+    }
+    std::thread::sleep(Duration::from_millis(500));
+
+    // После HELLO сервер шлёт первые 16 — движок сам дочитывает остальное
+    // (LIST_INVITES), без ответа на приглашения.
+    let mut b = Node::start_as("bravo", &server, b_id.clone());
+    b.wait("B: последнее окно списка", T, |e| {
+        matches!(e, Event::InvitesSynced { from, complete: true, .. } if *from > 0)
+    });
+    let got: HashSet<u32> = b
+        .seen
+        .iter()
+        .filter_map(|e| match e {
+            Event::Invite { gid, .. } => Some(*gid),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(got, gids, "показаны все 20 приглашений");
+    drop(b);
+
+    // CLI (`decline`): окно после HELLO не покрывает gid дальше 16-го —
+    // окно с самого gid говорит, есть ли приглашение.
+    let mut sorted: Vec<u32> = gids.iter().copied().collect();
+    sorted.sort();
+    let conn =
+        engine::CtrlConn::connect(&Config::default(), local(server.addr), &server.pubkey, &b_id)
+            .unwrap();
+    let first = conn.invite_list().unwrap().expect("окно после HELLO");
+    assert_eq!(first.items.len(), 16);
+    assert!(!first.complete && !first.covers(sorted[19]) && !first.covers(250));
+    let page = conn.invite_page(sorted[19]).unwrap().expect("окно с gid");
+    assert!(page.covers(sorted[19]) && page.items.iter().any(|i| i.gid == sorted[19]));
+    let none = conn.invite_page(250).unwrap().expect("окно с gid");
+    assert!(none.covers(250) && none.items.is_empty(), "приглашения в 250 нет");
+
+    drop(a);
+    server.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn e2e_потерянные_окна_приглашений_движок_запрашивает_снова() {
+    let dir = temp_dir("invite-loss");
+    let server = start_server(&dir, 0);
+    let mut a = Node::start("alpha", &server);
+    a.wait("A подключён", T, |e| matches!(e, Event::Connected(_)));
+    let b_id = proto::Identity::generate();
+    let b_pub = b_id.ed_pub();
+    let mut gids = HashSet::new();
+    for i in 0..20 {
+        a.eng.cmds.send(Cmd::Create { name: format!("g{i}"), private: true }).unwrap();
+        let gid = match a.wait("A создал группу", T, |e| matches!(e, Event::GroupJoined { .. })) {
+            Event::GroupJoined { gid, .. } => gid,
+            _ => unreachable!(),
+        };
+        a.eng.cmds.send(Cmd::Invite(gid, b_pub)).unwrap();
+        gids.insert(gid);
+    }
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Теряется окно после HELLO (все INVITE_LIST, пока движок сам не
+    // спросил), затем запрос второй страницы (второй LIST_INVITES): без
+    // повторов B не увидел бы ни одного приглашения до реконнекта.
+    let proxy = LossyProxy::start(
+        local(server.addr),
+        Box::new(|to_server, typ, sent| {
+            let asked = sent.get(&ctrl::LIST_INVITES).copied().unwrap_or(0);
+            if to_server {
+                typ == ctrl::LIST_INVITES && asked == 2
+            } else {
+                typ == ctrl::INVITE_LIST && asked == 0
+            }
+        }),
+    );
+    let mut b = Node::start_via("bravo", proxy.addr, server.pubkey, b_id);
+    b.wait("B: последнее окно списка", Duration::from_secs(25), |e| {
+        matches!(e, Event::InvitesSynced { from, complete: true, .. } if *from > 0)
+    });
+    let got: HashSet<u32> = b
+        .seen
+        .iter()
+        .filter_map(|e| match e {
+            Event::Invite { gid, .. } => Some(*gid),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(got, gids, "показаны все 20 приглашений");
+    assert!(proxy.sent(ctrl::LIST_INVITES) >= 3, "окно и страница перезапрошены");
+
+    drop(a);
+    drop(b);
+    drop(proxy);
+    server.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn e2e_потерянный_отказ_от_приглашения_повторяется() {
+    let dir = temp_dir("decline-loss");
+    let server = start_server(&dir, 0);
+    let mut a = Node::start("alpha", &server);
+    a.wait("A подключён", T, |e| matches!(e, Event::Connected(_)));
+    a.eng.cmds.send(Cmd::Create { name: "secret".into(), private: true }).unwrap();
+    let gid = match a.wait("A создал группу", T, |e| matches!(e, Event::GroupJoined { .. })) {
+        Event::GroupJoined { gid, .. } => gid,
+        _ => unreachable!(),
+    };
+    let b_id = proto::Identity::generate();
+    let b_pub = b_id.ed_pub();
+    a.eng.cmds.send(Cmd::Invite(gid, b_pub)).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Первый DECLINE_INVITE теряется.
+    let proxy = LossyProxy::start(
+        local(server.addr),
+        Box::new(|to_server, typ, sent| {
+            to_server && typ == ctrl::DECLINE_INVITE && sent[&typ] == 1
+        }),
+    );
+    let mut b = Node::start_via("bravo", proxy.addr, server.pubkey, b_id);
+    b.wait("B получил приглашение", T, |e| matches!(e, Event::Invite { gid: g, .. } if *g == gid));
+    b.eng.cmds.send(Cmd::DeclineInvite(gid)).unwrap();
+    a.wait("A: приглашение отклонено (повтором)", T, |e| {
+        matches!(e, Event::InviteDeclined { gid: g, by_pubkey, .. } if *g == gid && *by_pubkey == b_pub)
+    });
+    b.wait("B: отказ подтверждён списком", T, |e| {
+        matches!(e, Event::InvitesSynced { gids, complete: true, .. } if !gids.contains(&gid))
+    });
+    // Подтверждённый отказ больше не повторяется.
+    std::thread::sleep(Duration::from_millis(2500));
+    assert_eq!(proxy.sent(ctrl::DECLINE_INVITE), 2, "один потерянный + один повтор");
+
+    drop(a);
+    drop(b);
+    drop(proxy);
     server.stop();
     let _ = std::fs::remove_dir_all(&dir);
 }

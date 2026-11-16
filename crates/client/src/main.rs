@@ -14,6 +14,8 @@
 //!   create <имя> [--private]    — создать группу (владелец = мы)
 //!   join <gid>                  — войти в группу
 //!   leave <gid>                 — выйти
+//!   invites                     — неотвеченные приглашения
+//!   decline <gid>               — отклонить приглашение
 //!   invite <gid> <peer>         — пригласить (владелец)
 //!   kick <gid> <peer>           — исключить (владелец)
 //!   ban <gid> <peer>            — забанить (владелец)
@@ -209,6 +211,86 @@ fn main() -> Result<()> {
                 Ok(())
             })?;
         }
+        "invites" => with_server(&cfg, server_sel.as_deref(), |server, pub_key, cfg2| {
+            // Сервер шлёт первое окно (до 16) неотвеченных приглашений сразу
+            // после HELLO (потерянное запрашивается повтором HELLO), остальные
+            // дочитываются окнами LIST_INVITES.
+            let conn = engine::CtrlConn::connect(cfg2, server, &pub_key, &identity)?;
+            let Some(mut list) = conn.invite_list()? else {
+                bail!("список приглашений не получен (старая версия сервера или потеря пакетов) — повторите");
+            };
+            let mut items = Vec::new();
+            let complete = loop {
+                let next = list.next_from();
+                items.append(&mut list.items);
+                match next {
+                    Some(from) => match conn.invite_page(from)? {
+                        Some(page) => list = page,
+                        None => break false,
+                    },
+                    None => break list.complete,
+                }
+            };
+            for inv in &items {
+                let from = cfg2
+                    .friends
+                    .iter()
+                    .find(|f| f.pubkey == proto::hex_of(&inv.from_pubkey))
+                    .map(|f| f.alias.clone())
+                    .unwrap_or_else(|| inv.from_name.clone());
+                println!("{:>4}  {:<20} от {from}", inv.gid, inv.group_name);
+            }
+            if items.is_empty() {
+                println!("(приглашений нет)");
+            } else {
+                if !complete {
+                    println!("… показаны не все (остальные не получены — потеря пакетов), повторите");
+                }
+                println!("принять: join <gid> · отклонить: decline <gid>");
+            }
+            Ok(())
+        })?,
+        "decline" => {
+            let gid = parse_gid(rest.first())?;
+            with_server(&cfg, server_sel.as_deref(), |server, pub_key, cfg2| {
+                let conn = engine::CtrlConn::connect(cfg2, server, &pub_key, &identity)?;
+                // Список после HELLO: его нет — старый сервер (0x0E он молча
+                // игнорирует, «отклонено» было бы неправдой).
+                let Some(mut list) = conn.invite_list()? else {
+                    bail!("список приглашений не получен (старая версия сервера или потеря пакетов) — отказ не отправлен");
+                };
+                // Окно после HELLO — первые 16 по gid; gid дальше него —
+                // окно с самого gid (иначе отказ от несуществующего
+                // приглашения «прошёл» бы: DECLINE идемпотентен).
+                if !list.covers(gid) {
+                    list = conn.invite_page(gid)?.context(
+                        "список приглашений не получен (потеря пакетов) — отказ не отправлен",
+                    )?;
+                }
+                if !list.items.iter().any(|i| i.gid == gid) {
+                    bail!("нет приглашения в группу {gid}");
+                }
+                // Сервер отвечает на DECLINE_INVITE свежим окном, покрывающим
+                // gid, — это и подтверждение: gid в нём нет. DECLINE
+                // идемпотентен, при потере (или запоздавшем старом списке) —
+                // повтор.
+                for _ in 0..3 {
+                    conn.send_ctrl(ctrl::DECLINE_INVITE, &payloads::enc_gid(gid));
+                    match conn.wait_for(ctrl::INVITE_LIST, std::time::Duration::from_secs(3)) {
+                        Ok(p) => {
+                            let l = payloads::dec_invite_list(&p)?;
+                            if l.covers(gid) && !l.items.iter().any(|i| i.gid == gid) {
+                                println!("приглашение в {gid} отклонено");
+                                return Ok(());
+                            }
+                        }
+                        Err(e) if e.to_string().starts_with("сервер:") => return Err(e),
+                        Err(_) => {}
+                    }
+                }
+                bail!("сервер не подтвердил отказ — повторите")
+            })?;
+        }
         "leave" => {
             let gid = parse_gid(rest.first())?;
             with_server(&cfg, server_sel.as_deref(), |server, pub_key, cfg2| {
@@ -378,6 +460,7 @@ global: --dir <path> --debug
   groups                      список групп
   create <имя> [--private]    создать группу
   join <gid> | leave <gid> | delete <gid>
+  invites | decline <gid>     приглашения: список / отклонить
   invite <gid> <peer> | kick <gid> <peer> | ban <gid> <peer>
   rename <gid> <имя>
   friend-groups <peer>
