@@ -60,6 +60,16 @@ const PER_IP_BURST: f64 = 20.0;
 const NAME_MAX_CHARS: usize = 32;
 const STATUS_MAX_CHARS: usize = 100;
 const GROUP_NAME_MAX_CHARS: usize = 48;
+/// Сколько приглашений максимум в одном INVITE_LIST (~200 байт на запись,
+/// до ~6 КБ). Адрес сессии ничем не подтверждён: HELLO принимается с любого
+/// `src`, а ctrl-ключ — static-static DH, его знает владелец identity и без
+/// ответа сервера. Значит, любой ответ на фрейм сессии может уйти на чужой
+/// (подделанный) адрес — поэтому окно ограничено и на HELLO, и на
+/// DECLINE_INVITE / LIST_INVITES / JOIN / KICK, а остальные клиент дочитывает
+/// окнами (LIST_INVITES с gid после последнего). ⏳ Проверка обратного
+/// адреса (cookie в WELCOME) — тогда и GROUP_LIST / GROUP_STATE, которые
+/// растут с числом групп и участников, перестанут быть усилителем.
+const INVITES_PER_LIST: usize = 16;
 
 // ---------- конфигурация и запуск ----------
 
@@ -430,6 +440,11 @@ fn load_state(store: &persist::Store) -> Result<(proto::Identity, u32, HashMap<u
                 );
             }
         }
+        // Старый сервер не снимал приглашение при входе в публичную группу и
+        // не отказывал в INVITE участнику: такие записи после кика/выхода
+        // всплыли бы окном приглашения (и пустили бы обратно в приватную).
+        let Group { members, banned, invites, .. } = &mut group;
+        invites.retain(|pk| !members.contains_key(pk) && !banned.contains(pk));
         groups.insert(g.id, group);
     }
     Ok((
@@ -708,6 +723,62 @@ fn group_summaries_for(s: &State, me: &[u8; 32]) -> Vec<GroupSummary> {
     out
 }
 
+/// Имя владельца группы для INVITE_RCVD: из сессии, если он онлайн, иначе
+/// из списка участников («…» после рестарта сервера — тогда короткий ключ).
+fn owner_name(s: &State, g: &Group) -> String {
+    if let Some((_, ses)) = s.session_of(&g.owner) {
+        return ses.name.clone();
+    }
+    match g.members.get(&g.owner) {
+        Some(m) if !m.name.is_empty() && m.name != "…" => m.name.clone(),
+        _ => short(&g.owner),
+    }
+}
+
+/// Все неотвеченные приглашения identity (группы, где она в `invites`, но
+/// ещё не участник). Сортировка по gid — стабильный порядок окон у клиента.
+fn pending_invites(s: &State, pk: &[u8; 32]) -> Vec<proto::payloads::InviteInfo> {
+    let mut out: Vec<proto::payloads::InviteInfo> = s
+        .groups
+        .values()
+        .filter(|g| g.invites.contains(pk) && !g.members.contains_key(pk) && !g.banned.contains(pk))
+        .map(|g| proto::payloads::InviteInfo {
+            gid: g.id,
+            group_name: g.name.clone(),
+            from_pubkey: g.owner,
+            from_name: owner_name(s, g),
+        })
+        .collect();
+    out.sort_by_key(|i| i.gid);
+    out
+}
+
+/// INVITE_LIST identity `ses` — окно неотвеченных приглашений с gid ≥
+/// `from`, не больше [`INVITES_PER_LIST`] (ответ не должен расти с числом
+/// приглашений — см. там же). Неполное окно помечается `complete == false`
+/// (обрезан хвост по gid), клиент дочитывает его LIST_INVITES.
+fn push_invite_list(s: &State, addr: SocketAddr, ses: &Session, out: &mut Outbox, from: u32) {
+    let mut items: Vec<_> = pending_invites(s, &ses.ed_pub)
+        .into_iter()
+        .filter(|i| i.gid >= from)
+        .collect();
+    let complete = items.len() <= INVITES_PER_LIST;
+    items.truncate(INVITES_PER_LIST);
+    let list = proto::payloads::InviteList { from, items, complete };
+    out.push((
+        addr,
+        ctrl_frame(&ses.ctrl_key, ctrl::INVITE_LIST, &proto::payloads::enc_invite_list(&list)),
+    ));
+}
+
+/// Начало окна INVITE_LIST, которое покрывает `gid`: с начала, если до него
+/// меньше [`INVITES_PER_LIST`] неотвеченных (первое окно — то, что клиент
+/// видит после HELLO), иначе с самого `gid`.
+fn invite_window(s: &State, pk: &[u8; 32], gid: u32) -> u32 {
+    let below = pending_invites(s, pk).iter().filter(|i| i.gid < gid).count();
+    if below < INVITES_PER_LIST { 0 } else { gid }
+}
+
 fn push_group_list(s: &State, addr: SocketAddr, ses: &Session, out: &mut Outbox) {
     let items = group_summaries_for(s, &ses.ed_pub);
     out.push((
@@ -771,6 +842,13 @@ fn handle_hello(sh: &Shared, src: SocketAddr, body: &[u8]) -> Result<()> {
         out.push((src, proto::plain_frame(ctrl::WELCOME, &sh.welcome)));
         let ses = s.sessions.get(&src).unwrap();
         push_group_list(&s, src, ses, &mut out);
+        // Неотвеченные приглашения — заново при каждом HELLO (и после
+        // переподключения): раньше приглашение офлайн-цели терялось, она
+        // узнавала о нём, только если была онлайн в момент INVITE. Один
+        // фрейм INVITE_LIST: старые клиенты его игнорируют (иначе — тост на
+        // каждый HELLO без возможности отказаться), новые по полному списку
+        // снимают приглашения, отозванные, пока они были офлайн.
+        push_invite_list(&s, src, ses, &mut out, 0);
         // Остальные участники групп узнают новый адрес и статус онлайн.
         for gid in gids {
             broadcast_group(&s, gid, &mut out);
@@ -817,6 +895,13 @@ fn handle_ctrl_frame(sh: &Shared, src: SocketAddr, typ: u8, body: &[u8]) {
             Ok(())
         }
         ctrl::FRIEND_GROUPS => friend_groups(sh, src, &ctrl_key, &ed_pub, &payload, &mut out),
+        // Без побочных эффектов — под блокировкой на чтение.
+        ctrl::LIST_INVITES => proto::payloads::dec_gid(&payload).map(|from| {
+            let s = sh.state.read().unwrap();
+            if let Some(ses) = s.sessions.get(&src) {
+                push_invite_list(&s, src, ses, &mut out, from);
+            }
+        }),
         _ => {
             let mut s = sh.state.write().unwrap();
             if s.sessions.contains_key(&src) {
@@ -931,17 +1016,43 @@ fn handle_mutation(
         }
         ctrl::JOIN_GROUP => {
             let gid = proto::payloads::dec_gid(payload)?;
-            let g = s.groups.get_mut(&gid).context("группа не найдена")?;
-            anyhow::ensure!(!g.banned.contains(ed_pub), "вы забанены в этой группе");
-            let is_member = g.members.contains_key(ed_pub);
-            if g.private && !is_member && g.owner != *ed_pub {
-                anyhow::ensure!(g.invites.contains(ed_pub), "группа приватная, нужно приглашение");
-                g.invites.remove(ed_pub);
+            let denied = match s.groups.get(&gid) {
+                None => Some("группа не найдена"),
+                Some(g) if g.banned.contains(ed_pub) => Some("вы забанены в этой группе"),
+                Some(g)
+                    if g.private
+                        && !g.members.contains_key(ed_pub)
+                        && g.owner != *ed_pub
+                        && !g.invites.contains(ed_pub) =>
+                {
+                    Some("группа приватная, нужно приглашение")
+                }
+                _ => None,
+            };
+            if let Some(e) = denied {
+                // Вход отклонён, и приглашения в gid нет: свежее окно со
+                // списком — клиент снимет мёртвое приглашение (отозвали,
+                // группу удалили, а наш GROUP_STATE потерялся), иначе
+                // «Принять» отказывало бы снова и снова. На «группа
+                // заполнена» — нет: приглашение остаётся, а движок по
+                // списку снова входил бы в группы автовхода.
+                let ses = s.sessions.get(&src).unwrap();
+                push_invite_list(s, src, ses, out, invite_window(s, ed_pub, gid));
+                anyhow::bail!(e);
             }
+            let g = s.groups.get_mut(&gid).unwrap();
+            let is_member = g.members.contains_key(ed_pub);
             let ip = match g.members.get(ed_pub) {
                 Some(m) => m.ip, // lease сохраняется
                 None => g.next_free_ip().context("группа заполнена")?,
             };
+            // Приглашение тратится только при успешном входе (раньше —
+            // до проверки на заполненность: отказ «группа заполнена» съедал
+            // приглашение). В публичную группу по приглашению — тоже снять.
+            let consumed = g.invites.remove(ed_pub);
+            if consumed {
+                sh.dirty.store(true, Ordering::Relaxed);
+            }
             let gname = g.name.clone();
             g.insert_member(
                 *ed_pub,
@@ -960,13 +1071,32 @@ fn handle_mutation(
             if !is_member {
                 broadcast_group_list(s, out);
             }
+            // Приглашение потрачено — свежий список с начала: подтверждение
+            // для клиента, и приглашения сверх обрезанного окна (после
+            // HELLO) показываются по мере ответов, сколько бы их ни
+            // осталось (их число падает и иначе — DELETE_GROUP). Не на
+            // каждый JOIN: участник приглашений не тратит, а движок по
+            // списку заново входит в группы автовхода — повторный JOIN уже
+            // ничего не тратит, цикла нет.
+            if consumed {
+                let ses = s.sessions.get(&src).unwrap();
+                push_invite_list(s, src, ses, out, 0);
+            }
         }
         ctrl::LEAVE_GROUP => {
             let gid = proto::payloads::dec_gid(payload)?;
             let left = s
                 .groups
                 .get_mut(&gid)
-                .map(|g| g.remove_member(ed_pub))
+                .map(|g| {
+                    let left = g.remove_member(ed_pub);
+                    if left {
+                        // Устаревшее приглашение (данные старого сервера) не
+                        // должно всплыть после выхода.
+                        g.invites.remove(ed_pub);
+                    }
+                    left
+                })
                 .unwrap_or(false);
             if left {
                 sh.dirty.store(true, Ordering::Relaxed);
@@ -985,6 +1115,8 @@ fn handle_mutation(
             let g = s.groups.get_mut(&gid).context("группа не найдена")?;
             anyhow::ensure!(g.owner == *ed_pub, "приглашать может только владелец");
             anyhow::ensure!(!g.banned.contains(&target), "цель забанена");
+            // Участнику окно приглашения ни к чему (и владельцу самому себе).
+            anyhow::ensure!(!g.members.contains_key(&target), "уже участник группы");
             g.invites.insert(target);
             let invite = proto::payloads::InviteInfo {
                 gid,
@@ -1001,15 +1133,52 @@ fn handle_mutation(
                 ));
             }
         }
+        ctrl::DECLINE_INVITE => {
+            let gid = proto::payloads::dec_gid(payload)?;
+            // Идемпотентно: группы или приглашения уже нет — не ошибка
+            // (повтор, ответ с другого устройства, группа удалена).
+            if let Some(g) = s.groups.get_mut(&gid)
+                && g.invites.remove(ed_pub)
+            {
+                let note = proto::payloads::InviteDeclined {
+                    gid,
+                    group_name: g.name.clone(),
+                    by_pubkey: *ed_pub,
+                    by_name: uname.clone(),
+                };
+                let owner = g.owner;
+                sh.dirty.store(true, Ordering::Relaxed);
+                sh.log(format!("decline: {uname} ✗ {gid} \"{}\"", note.group_name));
+                if let Some((addr, ses)) = s.session_of(&owner) {
+                    out.push((
+                        addr,
+                        ctrl_frame(
+                            &ses.ctrl_key,
+                            ctrl::INVITE_DECLINED,
+                            &proto::payloads::enc_invite_declined(&note),
+                        ),
+                    ));
+                }
+            }
+            // Отказавшемуся — всегда свежее окно, покрывающее gid:
+            // подтверждение отказа (CLI `decline`) и приглашения сверх
+            // обрезанного окна после HELLO (иначе они не показались бы до
+            // переподключения).
+            let ses = s.sessions.get(&src).unwrap();
+            push_invite_list(s, src, ses, out, invite_window(s, ed_pub, gid));
+        }
         ctrl::KICK | ctrl::BAN => {
             let (gid, target) = proto::payloads::dec_gid_target(payload)?;
             let g = s.groups.get_mut(&gid).context("группа не найдена")?;
             anyhow::ensure!(g.owner == *ed_pub, "может только владелец");
             anyhow::ensure!(target != g.owner, "нельзя исключить владельца");
             let kicked = g.remove_member(&target);
+            // Приглашение снимают и KICK, и BAN: кикнутому не всплывёт окно
+            // старого приглашения, а KICK приглашённого (не участника) —
+            // отзыв приглашения.
+            let uninvited = g.invites.remove(&target);
             if typ == ctrl::BAN {
                 g.banned.insert(target);
-                g.invites.remove(&target);
             }
             let msg = if typ == ctrl::BAN { "забанен в" } else { "кикнут из" };
             let gname = g.name.clone();
@@ -1017,6 +1186,13 @@ fn handle_mutation(
             sh.log(format!("{msg} {gid}: {}", short(&target)));
             if kicked && let Some((addr, ses)) = s.session_of(&target) {
                 push_error(out, addr, &ses.ctrl_key, &format!("вас {msg} группу \"{gname}\""));
+            }
+            // Приглашённому онлайн — свежее окно, покрывающее gid (при >16
+            // приглашениях первое окно могло бы его не покрыть): клиент
+            // закроет окно отозванного приглашения (иначе «Принять» → «вы
+            // забанены»).
+            if uninvited && let Some((addr, ses)) = s.session_of(&target) {
+                push_invite_list(s, addr, ses, out, invite_window(s, &target, gid));
             }
             broadcast_group(s, gid, out);
             broadcast_group_list(s, out);
@@ -1051,7 +1227,11 @@ fn handle_mutation(
                 members: vec![],
             };
             let frame = proto::payloads::enc_group_state(&st);
-            for pk in removed.members.keys() {
+            // Приглашённым онлайн — тоже: клиент закроет окно приглашения в
+            // удалённую группу (старые клиенты такой GROUP_STATE игнорируют).
+            let notify: HashSet<&[u8; 32]> =
+                removed.members.keys().chain(removed.invites.iter()).collect();
+            for pk in notify {
                 if let Some((addr, ses)) = s.session_of(pk) {
                     out.push((addr, ctrl_frame(&ses.ctrl_key, ctrl::GROUP_STATE, &frame)));
                 }
@@ -1123,13 +1303,18 @@ mod tests {
         sock: UdpSocket,
         key: proto::SymKey,
         srv: SocketAddr,
+        pk: [u8; 32],
     }
 
     impl Raw {
         fn connect(srv: SocketAddr, name: &str) -> Raw {
+            Raw::connect_as(srv, name, &proto::Identity::generate())
+        }
+
+        /// Подключение заданной identity (для переподключения той же личности).
+        fn connect_as(srv: SocketAddr, name: &str, id: &proto::Identity) -> Raw {
             let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
             sock.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
-            let id = proto::Identity::generate();
             let sig = id.sign(&payloads::hello_sign_bytes(
                 &id.ed_pub(),
                 &id.x_pub(),
@@ -1147,7 +1332,7 @@ mod tests {
                 if typ == ctrl::WELCOME {
                     let (x_pub, _sig) = payloads::dec_welcome(body).unwrap();
                     let key = id.ctrl_key_with(&x_pub);
-                    return Raw { sock, key, srv };
+                    return Raw { sock, key, srv, pk: id.ed_pub() };
                 }
             }
             panic!("нет WELCOME");
@@ -1172,6 +1357,26 @@ mod tests {
                 return proto::open_ctrl(&self.key, typ, body).unwrap();
             }
             panic!("не дождались фрейма {want:#04x}");
+        }
+
+        /// Типы управляющих фреймов, пришедших до фрейма `want`, и его payload.
+        fn until(&self, want: u8) -> (Vec<u8>, Vec<u8>) {
+            let end = Instant::now() + Duration::from_secs(5);
+            let mut buf = [0u8; 65_535];
+            let mut seen = Vec::new();
+            while Instant::now() < end {
+                let Ok((n, _)) = self.sock.recv_from(&mut buf) else { continue };
+                let Ok((typ, body)) = proto::split_frame(&buf[..n]) else { continue };
+                if (proto::grp::DATA..=proto::grp::KEEPALIVE).contains(&typ) {
+                    continue;
+                }
+                let Ok(p) = proto::open_ctrl(&self.key, typ, body) else { continue };
+                if typ == want {
+                    return (seen, p);
+                }
+                seen.push(typ);
+            }
+            panic!("не дождались фрейма {want:#04x}; пришли {seen:02x?}");
         }
 
         /// Ждёт групповой фрейм; None — ничего не пришло за `wait`.
@@ -1256,6 +1461,308 @@ mod tests {
         assert_eq!(again.code, code, "identity сервера сохранилась");
         assert!(again.shared.state.read().unwrap().groups.contains_key(&gid));
         again.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn test_server(tag: &str) -> (Server, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("voidlink-srv-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let server = Server::start(Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            data_dir: dir.clone(),
+            workers: 2,
+            quiet: true,
+        })
+        .unwrap();
+        (server, dir)
+    }
+
+    #[test]
+    fn отказ_снимает_приглашение_и_уведомляет_владельца() {
+        let (server, dir) = test_server("decline");
+        let srv = server.addr;
+        let a = Raw::connect(srv, "alpha");
+        a.send(ctrl::CREATE_GROUP, &payloads::enc_create_group("secret", true));
+        let gid = payloads::dec_group_state(&a.expect(ctrl::GROUP_STATE)).unwrap().gid;
+
+        // Пригласить участника (себя) — ошибка, окна приглашения не будет.
+        a.send(ctrl::INVITE, &payloads::enc_gid_target(gid, &a.pk));
+        let err = payloads::dec_error(&a.expect(ctrl::ERROR)).unwrap();
+        assert!(err.contains("участник"), "{err}");
+
+        let b = Raw::connect(srv, "bravo");
+        a.send(ctrl::INVITE, &payloads::enc_gid_target(gid, &b.pk));
+        let inv = payloads::dec_invite(&b.expect(ctrl::INVITE_RCVD)).unwrap();
+        assert_eq!((inv.gid, inv.from_pubkey, inv.from_name.as_str()), (gid, a.pk, "alpha"));
+
+        // Отказ: владелец получает уведомление, приглашение снято.
+        b.send(ctrl::DECLINE_INVITE, &payloads::enc_gid(gid));
+        let d = payloads::dec_invite_declined(&a.expect(ctrl::INVITE_DECLINED)).unwrap();
+        assert_eq!(
+            (d.gid, d.group_name.as_str(), d.by_pubkey, d.by_name.as_str()),
+            (gid, "secret", b.pk, "bravo")
+        );
+        assert!(!server.shared.state.read().unwrap().groups[&gid].invites.contains(&b.pk));
+
+        // Войти в приватную группу после отказа нельзя.
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
+        let err = payloads::dec_error(&b.expect(ctrl::ERROR)).unwrap();
+        assert!(err.contains("приглашение"), "{err}");
+
+        // Повторный отказ и отказ в несуществующую группу — без ошибки и
+        // без повторного уведомления владельцу.
+        b.send(ctrl::DECLINE_INVITE, &payloads::enc_gid(gid));
+        b.send(ctrl::DECLINE_INVITE, &payloads::enc_gid(250));
+        b.send(ctrl::CTRL_PING, &[]);
+        let (seen, _) = b.until(ctrl::CTRL_PONG);
+        assert!(!seen.contains(&ctrl::ERROR), "ошибка на повторный отказ: {seen:02x?}");
+        a.send(ctrl::CTRL_PING, &[]);
+        let (seen, _) = a.until(ctrl::CTRL_PONG);
+        assert!(!seen.contains(&ctrl::INVITE_DECLINED), "повторное уведомление: {seen:02x?}");
+
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn приглашение_офлайн_цели_доставляется_после_hello() {
+        let (server, dir) = test_server("pending");
+        let srv = server.addr;
+        let a = Raw::connect(srv, "alpha");
+        a.send(ctrl::CREATE_GROUP, &payloads::enc_create_group("secret", true));
+        let gid = payloads::dec_group_state(&a.expect(ctrl::GROUP_STATE)).unwrap().gid;
+
+        // B офлайн: приглашение принимается без ошибки и ждёт на сервере.
+        let b_id = proto::Identity::generate();
+        a.send(ctrl::INVITE, &payloads::enc_gid_target(gid, &b_id.ed_pub()));
+        a.send(ctrl::CTRL_PING, &[]);
+        let (seen, _) = a.until(ctrl::CTRL_PONG);
+        assert!(!seen.contains(&ctrl::ERROR), "{seen:02x?}");
+
+        // B подключается — получает приглашение сразу после HELLO, одним
+        // полным списком.
+        let b = Raw::connect_as(srv, "bravo", &b_id);
+        let payloads::InviteList { items: list, complete, .. } =
+            payloads::dec_invite_list(&b.expect(ctrl::INVITE_LIST)).unwrap();
+        assert!(complete);
+        assert_eq!(list.len(), 1);
+        let inv = &list[0];
+        assert_eq!((inv.gid, inv.group_name.as_str()), (gid, "secret"));
+        assert_eq!((inv.from_pubkey, inv.from_name.as_str()), (a.pk, "alpha"));
+
+        // Переподключение (новый адрес) — то же приглашение снова.
+        let b = Raw::connect_as(srv, "bravo", &b_id);
+        let payloads::InviteList { items: list, .. } =
+            payloads::dec_invite_list(&b.expect(ctrl::INVITE_LIST)).unwrap();
+        assert_eq!(list.iter().map(|i| i.gid).collect::<Vec<_>>(), vec![gid]);
+
+        // Вход тратит приглашение: после следующего HELLO список пуст.
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
+        assert_eq!(payloads::dec_group_state(&b.expect(ctrl::GROUP_STATE)).unwrap().gid, gid);
+        let b = Raw::connect_as(srv, "bravo", &b_id);
+        let payloads::InviteList { items: list, complete, .. } =
+            payloads::dec_invite_list(&b.expect(ctrl::INVITE_LIST)).unwrap();
+        assert!(complete && list.is_empty(), "приглашение участнику: {list:?}");
+        b.send(ctrl::CTRL_PING, &[]);
+        let (seen, _) = b.until(ctrl::CTRL_PONG);
+        assert!(!seen.contains(&ctrl::INVITE_RCVD), "приглашение участнику: {seen:02x?}");
+
+        // Удаление группы — приглашённые онлайн узнают об этом.
+        a.send(ctrl::CREATE_GROUP, &payloads::enc_create_group("other", true));
+        let gid2 = payloads::dec_group_state(&a.expect(ctrl::GROUP_STATE)).unwrap().gid;
+        let c = Raw::connect(srv, "charlie");
+        a.send(ctrl::INVITE, &payloads::enc_gid_target(gid2, &c.pk));
+        c.expect(ctrl::INVITE_RCVD);
+        a.send(ctrl::DELETE_GROUP, &payloads::enc_gid(gid2));
+        let st = payloads::dec_group_state(&c.expect(ctrl::GROUP_STATE)).unwrap();
+        assert!(st.deleted && st.gid == gid2);
+
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn бан_и_кик_отзывают_приглашение_у_онлайн_цели() {
+        let (server, dir) = test_server("revoke");
+        let srv = server.addr;
+        let a = Raw::connect(srv, "alpha");
+        a.send(ctrl::CREATE_GROUP, &payloads::enc_create_group("secret", true));
+        let gid = payloads::dec_group_state(&a.expect(ctrl::GROUP_STATE)).unwrap().gid;
+        a.send(ctrl::CREATE_GROUP, &payloads::enc_create_group("other", true));
+        let gid2 = payloads::dec_group_state(&a.expect(ctrl::GROUP_STATE)).unwrap().gid;
+
+        let c = Raw::connect(srv, "charlie");
+        c.expect(ctrl::INVITE_LIST);
+        for g in [gid, gid2] {
+            a.send(ctrl::INVITE, &payloads::enc_gid_target(g, &c.pk));
+            c.expect(ctrl::INVITE_RCVD);
+        }
+        // BAN приглашённого (не участника): ему — полный список без gid.
+        a.send(ctrl::BAN, &payloads::enc_gid_target(gid, &c.pk));
+        let payloads::InviteList { items: list, complete, .. } =
+            payloads::dec_invite_list(&c.expect(ctrl::INVITE_LIST)).unwrap();
+        assert!(complete);
+        assert_eq!(list.iter().map(|i| i.gid).collect::<Vec<_>>(), vec![gid2]);
+        // KICK приглашённого — отзыв приглашения, тоже с уведомлением.
+        a.send(ctrl::KICK, &payloads::enc_gid_target(gid2, &c.pk));
+        let payloads::InviteList { items: list, complete, .. } =
+            payloads::dec_invite_list(&c.expect(ctrl::INVITE_LIST)).unwrap();
+        assert!(complete && list.is_empty(), "{list:?}");
+        assert!(!server.shared.state.read().unwrap().groups[&gid2].invites.contains(&c.pk));
+
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Владелец A создаёт `n` приватных групп и приглашает офлайн-identity;
+    /// возвращает отсортированные gid.
+    fn many_invites(a: &Raw, n: usize, target: &[u8; 32]) -> Vec<u32> {
+        let mut gids = Vec::new();
+        for i in 0..n {
+            a.send(ctrl::CREATE_GROUP, &payloads::enc_create_group(&format!("g{i}"), true));
+            gids.push(payloads::dec_group_state(&a.expect(ctrl::GROUP_STATE)).unwrap().gid);
+        }
+        gids.sort();
+        for g in &gids {
+            a.send(ctrl::INVITE, &payloads::enc_gid_target(*g, target));
+        }
+        a.send(ctrl::CTRL_PING, &[]);
+        let (seen, _) = a.until(ctrl::CTRL_PONG);
+        assert!(!seen.contains(&ctrl::ERROR), "{seen:02x?}");
+        gids
+    }
+
+    /// (from, gid-ы окна, complete) из INVITE_LIST.
+    fn window(p: Vec<u8>) -> (u32, Vec<u32>, bool) {
+        let l = payloads::dec_invite_list(&p).unwrap();
+        (l.from, l.items.iter().map(|i| i.gid).collect(), l.complete)
+    }
+
+    #[test]
+    fn больше_16_приглашений_приходят_окнами_не_больше_16() {
+        let (server, dir) = test_server("many");
+        let srv = server.addr;
+        let a = Raw::connect(srv, "alpha");
+        let b_id = proto::Identity::generate();
+        let gids = many_invites(&a, 20, &b_id.ed_pub());
+
+        // После HELLO — первые 16 по gid, окно неполное.
+        let b = Raw::connect_as(srv, "bravo", &b_id);
+        assert_eq!(window(b.expect(ctrl::INVITE_LIST)), (0, gids[..16].to_vec(), false));
+        // LIST_INVITES дочитывает следующее окно, ничего не меняя.
+        let next = gids[15] + 1;
+        b.send(ctrl::LIST_INVITES, &payloads::enc_gid(next));
+        assert_eq!(window(b.expect(ctrl::INVITE_LIST)), (next, gids[16..].to_vec(), true));
+        assert!(server.shared.state.read().unwrap().groups[&gids[16]].invites.contains(&b.pk));
+        // Отказ — в ответ окно с начала, тоже не больше 16 (адрес сессии не
+        // подтверждён — ответ не растёт с числом приглашений): видно 17-е.
+        b.send(ctrl::DECLINE_INVITE, &payloads::enc_gid(gids[0]));
+        assert_eq!(window(b.expect(ctrl::INVITE_LIST)), (0, gids[1..17].to_vec(), false));
+        // Вход по приглашению — тоже.
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gids[1]));
+        assert_eq!(window(b.expect(ctrl::INVITE_LIST)), (0, gids[2..18].to_vec(), false));
+        // BAN по последнему gid: окно с него самого (первое его не покрыло
+        // бы) — отозванное приглашение попадает в сверку клиента.
+        a.send(ctrl::BAN, &payloads::enc_gid_target(gids[19], &b.pk));
+        assert_eq!(window(b.expect(ctrl::INVITE_LIST)), (gids[19], vec![], true));
+        // Отказ от gid без приглашения дальше первого окна — окно с него:
+        // CLI видит, что приглашения не было.
+        b.send(ctrl::DECLINE_INVITE, &payloads::enc_gid(gids[19]));
+        assert_eq!(window(b.expect(ctrl::INVITE_LIST)), (gids[19], vec![], true));
+
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn вход_после_удаления_группы_показывает_17_е_приглашение() {
+        let (server, dir) = test_server("many-del");
+        let srv = server.addr;
+        let a = Raw::connect(srv, "alpha");
+        let b_id = proto::Identity::generate();
+        let gids = many_invites(&a, 17, &b_id.ed_pub());
+
+        let b = Raw::connect_as(srv, "bravo", &b_id);
+        assert_eq!(window(b.expect(ctrl::INVITE_LIST)), (0, gids[..16].to_vec(), false));
+        // Группу из окна удалили: неотвеченных стало 16, списка не было.
+        a.send(ctrl::DELETE_GROUP, &payloads::enc_gid(gids[1]));
+        assert!(payloads::dec_group_state(&b.expect(ctrl::GROUP_STATE)).unwrap().deleted);
+        // Вход тратит приглашение — список приходит, хотя неотвеченных
+        // меньше 16, и в нём 17-е.
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gids[0]));
+        assert_eq!(window(b.expect(ctrl::INVITE_LIST)), (0, gids[2..].to_vec(), true));
+        // Повторный JOIN участника приглашений не тратит — списка нет.
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gids[0]));
+        b.send(ctrl::CTRL_PING, &[]);
+        let (seen, _) = b.until(ctrl::CTRL_PONG);
+        assert!(!seen.contains(&ctrl::INVITE_LIST), "{seen:02x?}");
+
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn отклонённый_вход_присылает_свежий_список() {
+        let (server, dir) = test_server("join-denied");
+        let srv = server.addr;
+        let a = Raw::connect(srv, "alpha");
+        a.send(ctrl::CREATE_GROUP, &payloads::enc_create_group("secret", true));
+        let gid = payloads::dec_group_state(&a.expect(ctrl::GROUP_STATE)).unwrap().gid;
+        a.send(ctrl::CREATE_GROUP, &payloads::enc_create_group("other", true));
+        let gid2 = payloads::dec_group_state(&a.expect(ctrl::GROUP_STATE)).unwrap().gid;
+        let b = Raw::connect(srv, "bravo");
+        b.expect(ctrl::INVITE_LIST);
+        for g in [gid, gid2] {
+            a.send(ctrl::INVITE, &payloads::enc_gid_target(g, &b.pk));
+            b.expect(ctrl::INVITE_RCVD);
+        }
+        // Приглашение отозвано (KICK), клиент о нём не узнал — «Принять»:
+        // ERROR и список без gid, клиент снимет мёртвое приглашение.
+        a.send(ctrl::KICK, &payloads::enc_gid_target(gid, &b.pk));
+        b.expect(ctrl::INVITE_LIST);
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
+        let (seen, p) = b.until(ctrl::INVITE_LIST);
+        assert!(!seen.contains(&ctrl::GROUP_STATE), "{seen:02x?}");
+        assert_eq!(window(p), (0, vec![gid2], true));
+        let err = payloads::dec_error(&b.expect(ctrl::ERROR)).unwrap();
+        assert!(err.contains("приглашение"), "{err}");
+        // Группу удалили (GROUP_STATE мог потеряться) — то же.
+        a.send(ctrl::DELETE_GROUP, &payloads::enc_gid(gid2));
+        b.expect(ctrl::GROUP_STATE);
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid2));
+        assert_eq!(window(b.expect(ctrl::INVITE_LIST)), (0, vec![], true));
+
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn устаревшие_приглашения_участников_чистятся_при_загрузке() {
+        let dir = std::env::temp_dir().join(format!("voidlink-srv-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = persist::Store::new(&dir);
+        let (member, banned, invited) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let mut g = empty_group(5);
+        g.owner = [9; 32];
+        g.insert_member(
+            member,
+            Member { ip: gid_subnet_base(5) + HOST_MIN, name: "b".into(), status: String::new() },
+        );
+        g.banned.insert(banned);
+        // Так оставлял старый сервер: приглашение участнику и забаненному.
+        g.invites.extend([member, banned, invited]);
+        let s = State {
+            identity: proto::Identity::generate(),
+            sessions: HashMap::new(),
+            by_pub: HashMap::new(),
+            groups: HashMap::from([(5, g)]),
+            next_gid: 6,
+        };
+        store.save(&snapshot(&s)).unwrap();
+
+        let (_, _, groups) = load_state(&store).unwrap();
+        assert_eq!(groups[&5].invites, HashSet::from([invited]));
+        assert!(groups[&5].members.contains_key(&member));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

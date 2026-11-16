@@ -260,7 +260,7 @@ pub fn dec_group_list(p: &[u8]) -> Result<Vec<GroupSummary>> {
 }
 
 /// INVITE_RCVD: приглашение в группу.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InviteInfo {
     pub gid: u32,
     pub group_name: String,
@@ -268,22 +268,111 @@ pub struct InviteInfo {
     pub from_name: String,
 }
 
-pub fn enc_invite(i: &InviteInfo) -> Vec<u8> {
-    let mut v = Vec::new();
-    put_u32(&mut v, i.gid);
-    put_str(&mut v, &i.group_name);
-    put_pub(&mut v, &i.from_pubkey);
-    put_str(&mut v, &i.from_name);
-    v
+fn put_invite(v: &mut Vec<u8>, i: &InviteInfo) {
+    put_u32(v, i.gid);
+    put_str(v, &i.group_name);
+    put_pub(v, &i.from_pubkey);
+    put_str(v, &i.from_name);
 }
 
-pub fn dec_invite(p: &[u8]) -> Result<InviteInfo> {
-    let mut r = Reader::new(p);
+fn read_invite(r: &mut Reader) -> Result<InviteInfo> {
     Ok(InviteInfo {
         gid: r.u32()?,
         group_name: r.str()?,
         from_pubkey: r.pub_key()?,
         from_name: r.str()?,
+    })
+}
+
+pub fn enc_invite(i: &InviteInfo) -> Vec<u8> {
+    let mut v = Vec::new();
+    put_invite(&mut v, i);
+    v
+}
+
+pub fn dec_invite(p: &[u8]) -> Result<InviteInfo> {
+    read_invite(&mut Reader::new(p))
+}
+
+/// INVITE_LIST — окно неотвеченных приглашений: те, у кого gid ≥ `from`,
+/// по возрастанию gid (сервер шлёт не больше 16 за раз). `complete` — после
+/// последнего в окне неотвеченных больше нет.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InviteList {
+    pub from: u32,
+    pub items: Vec<InviteInfo>,
+    pub complete: bool,
+}
+
+impl InviteList {
+    /// Достоверен ли список для `gid`: окно покрывает gid от `from` до
+    /// последнего в нём (полное — и дальше). Нет `gid` в покрытом окне —
+    /// приглашения в него на сервере нет.
+    pub fn covers(&self, gid: u32) -> bool {
+        gid >= self.from && (self.complete || self.items.last().is_some_and(|l| l.gid >= gid))
+    }
+
+    /// Начало следующего окна (список неполный), иначе `None`.
+    pub fn next_from(&self) -> Option<u32> {
+        if self.complete {
+            return None;
+        }
+        self.items.last().and_then(|l| l.gid.checked_add(1))
+    }
+}
+
+/// INVITE_LIST: from(u32) | complete(bool) | n(u8) | n × (раскладка
+/// INVITE_RCVD). Больше 255 записей не кодируется.
+pub fn enc_invite_list(l: &InviteList) -> Vec<u8> {
+    let items = &l.items[..l.items.len().min(255)];
+    let mut v = Vec::new();
+    put_u32(&mut v, l.from);
+    put_bool(&mut v, l.complete && items.len() == l.items.len());
+    v.push(items.len() as u8);
+    for i in items {
+        put_invite(&mut v, i);
+    }
+    v
+}
+
+pub fn dec_invite_list(p: &[u8]) -> Result<InviteList> {
+    let mut r = Reader::new(p);
+    let from = r.u32()?;
+    let complete = r.boolean()?;
+    let n = r.u8()? as usize;
+    let mut items = Vec::with_capacity(n);
+    for _ in 0..n {
+        items.push(read_invite(&mut r)?);
+    }
+    Ok(InviteList { from, items, complete })
+}
+
+/// INVITE_DECLINED: кто и в какую группу отклонил приглашение.
+/// Раскладка как у INVITE_RCVD: gid(4) | group_name(str) | by_pubkey(32) | by_name(str).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InviteDeclined {
+    pub gid: u32,
+    pub group_name: String,
+    pub by_pubkey: [u8; 32],
+    pub by_name: String,
+}
+
+pub fn enc_invite_declined(d: &InviteDeclined) -> Vec<u8> {
+    let mut v = Vec::new();
+    put_u32(&mut v, d.gid);
+    put_str(&mut v, &d.group_name);
+    put_pub(&mut v, &d.by_pubkey);
+    put_str(&mut v, &d.by_name);
+    v
+}
+
+pub fn dec_invite_declined(p: &[u8]) -> Result<InviteDeclined> {
+    let mut r = Reader::new(p);
+    Ok(InviteDeclined {
+        gid: r.u32()?,
+        group_name: r.str()?,
+        by_pubkey: r.pub_key()?,
+        by_name: r.str()?,
     })
 }
 
@@ -342,4 +431,98 @@ pub fn enc_ping(nonce: u64) -> Vec<u8> {
 pub fn dec_ping(p: &[u8]) -> Result<u64> {
     ensure!(p.len() == 8, "bad ping payload");
     Ok(u64::from_be_bytes(p.try_into().unwrap()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn приглашение_и_отказ_туда_обратно() {
+        let inv = InviteInfo {
+            gid: 42,
+            group_name: "секретная".into(),
+            from_pubkey: [3; 32],
+            from_name: "alpha".into(),
+        };
+        let got = dec_invite(&enc_invite(&inv)).unwrap();
+        assert_eq!(
+            (got.gid, got.group_name, got.from_pubkey, got.from_name),
+            (42, "секретная".to_string(), [3; 32], "alpha".to_string())
+        );
+
+        let d = InviteDeclined {
+            gid: 7,
+            group_name: "игра".into(),
+            by_pubkey: [9; 32],
+            by_name: "bravo".into(),
+        };
+        assert_eq!(dec_invite_declined(&enc_invite_declined(&d)).unwrap(), d);
+        // Обрезанный payload — ошибка, а не паника.
+        let enc = enc_invite_declined(&d);
+        assert!(dec_invite_declined(&enc[..enc.len() - 1]).is_err());
+        assert!(dec_invite_declined(&[]).is_err());
+    }
+
+    #[test]
+    fn список_приглашений_туда_обратно() {
+        let mk = |gid| InviteInfo {
+            gid,
+            group_name: format!("г{gid}"),
+            from_pubkey: [gid as u8; 32],
+            from_name: "alpha".into(),
+        };
+        let l = InviteList { from: 0, items: vec![mk(1), mk(7)], complete: true };
+        let got = dec_invite_list(&enc_invite_list(&l)).unwrap();
+        assert_eq!(got, l);
+        assert_eq!(got.items[1].group_name, "г7");
+        let empty = InviteList { from: 5, items: vec![], complete: false };
+        assert_eq!(dec_invite_list(&enc_invite_list(&empty)).unwrap(), empty);
+        // Обрезанный payload — ошибка, а не паника.
+        let enc = enc_invite_list(&l);
+        assert!(dec_invite_list(&enc[..enc.len() - 1]).is_err());
+        assert!(dec_invite_list(&[]).is_err());
+    }
+
+    #[test]
+    fn окно_списка_приглашений_покрывает_от_from_до_последнего() {
+        let mk = |gid| InviteInfo {
+            gid,
+            group_name: String::new(),
+            from_pubkey: [0; 32],
+            from_name: String::new(),
+        };
+        let part = InviteList { from: 10, items: vec![mk(12), mk(20)], complete: false };
+        assert!(!part.covers(9), "до from — не известно");
+        assert!(part.covers(10) && part.covers(15) && part.covers(20));
+        assert!(!part.covers(21), "после последнего в неполном — не известно");
+        assert_eq!(part.next_from(), Some(21));
+        let full = InviteList { complete: true, ..part.clone() };
+        assert!(full.covers(300) && !full.covers(9));
+        assert_eq!(full.next_from(), None);
+        let none = InviteList { from: 0, items: vec![], complete: true };
+        assert!(none.covers(0) && none.covers(u32::MAX));
+        let last = InviteList { from: 0, items: vec![mk(u32::MAX)], complete: false };
+        assert_eq!(last.next_from(), None, "без переполнения");
+    }
+
+    #[test]
+    fn отказ_от_приглашения_кодируется_как_gid() {
+        assert_eq!(dec_gid(&enc_gid(200)).unwrap(), 200);
+        // Коды новых фреймов не пересекаются с существующими.
+        use crate::ctrl::*;
+        let all = [
+            HELLO, CREATE_GROUP, LIST_GROUPS, JOIN_GROUP, LEAVE_GROUP, INVITE, KICK, BAN,
+            RENAME_GROUP, DELETE_GROUP, STATUS, CTRL_PING, FRIEND_GROUPS, DECLINE_INVITE, LIST_INVITES,
+            WELCOME,
+            GROUP_STATE, GROUP_LIST, GROUP_UPDATE, INVITE_RCVD, ERROR, INVITE_DECLINED, INVITE_LIST,
+            CTRL_PONG, FRIEND_GROUPS_RESP, RESET,
+        ];
+        let uniq: std::collections::HashSet<u8> = all.iter().copied().collect();
+        assert_eq!(uniq.len(), all.len());
+        assert!(!(crate::grp::DATA..=crate::grp::KEEPALIVE).contains(&DECLINE_INVITE));
+        assert!(!(crate::grp::DATA..=crate::grp::KEEPALIVE).contains(&INVITE_DECLINED));
+        assert!(!(crate::grp::DATA..=crate::grp::KEEPALIVE).contains(&INVITE_LIST));
+        assert!(!(crate::grp::DATA..=crate::grp::KEEPALIVE).contains(&LIST_INVITES));
+    }
 }

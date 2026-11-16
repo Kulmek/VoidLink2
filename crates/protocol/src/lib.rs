@@ -46,6 +46,14 @@ pub mod ctrl {
     pub const STATUS: u8 = 0x0B;
     pub const CTRL_PING: u8 = 0x0C;
     pub const FRIEND_GROUPS: u8 = 0x0D;
+    /// Клиент → сервер: отклонить приглашение. Payload — gid (`enc_gid`).
+    /// Идемпотентно: нет приглашения — нет ошибки. Старые серверы тип не
+    /// знают и молча игнорируют (приглашение остаётся висеть).
+    pub const DECLINE_INVITE: u8 = 0x0E;
+    /// Клиент → сервер: окно неотвеченных приглашений с gid ≥ payload
+    /// (`enc_gid`), ответ — `INVITE_LIST`. Без побочных эффектов: так
+    /// дочитывается неполный список. Старые серверы тип игнорируют.
+    pub const LIST_INVITES: u8 = 0x0F;
 
     pub const WELCOME: u8 = 0x81;
     pub const GROUP_STATE: u8 = 0x82;
@@ -53,6 +61,18 @@ pub mod ctrl {
     pub const GROUP_UPDATE: u8 = 0x84;
     pub const INVITE_RCVD: u8 = 0x85;
     pub const ERROR: u8 = 0x86;
+    /// Сервер → владельцу группы: приглашённый отклонил приглашение.
+    /// Payload — `enc_invite_declined`. Старые клиенты тип игнорируют.
+    pub const INVITE_DECLINED: u8 = 0x87;
+    /// Сервер → клиенту: окно неотвеченных приглашений одним фреймом
+    /// (`enc_invite_list`, не больше 16 за раз). Сразу после HELLO, в ответ
+    /// на DECLINE_INVITE / LIST_INVITES, после JOIN, потратившего
+    /// приглашение или отклонённого (группы нет, бан, нет приглашения), и
+    /// после BAN/KICK, снявшего приглашение. Чего нет в покрытом окне
+    /// (`InviteList::covers`), на сервере уже недействительно — клиент
+    /// снимает такие окна; неполное окно дочитывается LIST_INVITES.
+    /// Старые клиенты тип игнорируют (и не получают повторов на каждый HELLO).
+    pub const INVITE_LIST: u8 = 0x88;
     pub const CTRL_PONG: u8 = 0x8C;
     pub const FRIEND_GROUPS_RESP: u8 = 0x8D;
     /// Сервер → клиент, **открытым текстом**, пустое тело: «сессии с этого
