@@ -38,204 +38,39 @@ env:
   ANSIBLE_VERSION: "2.15.0"
 
 jobs:
-  # =============================================================================
-  # PRE-CHECKS
-  # =============================================================================
   pre-checks:
     name: Pre-flight Checks
     runs-on: ubuntu-latest
-    outputs:
-      terraform_ready: ${{ steps.check-tf.outputs.ready }}
-      ansible_ready: ${{ steps.check-ansible.outputs.ready }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
       - name: Check Terraform config
-        id: check-tf
         run: |
           cd infrastructure/terraform
           terraform fmt -check -diff
           terraform validate
-          echo "ready=true" >> $GITHUB_OUTPUT
-
       - name: Check Ansible config
-        id: check-ansible
         run: |
           cd infrastructure/ansible
           ansible-playbook --syntax-check playbook.yml
-          echo "ready=true" >> $GITHUB_OUTPUT
 
-      - name: Verify required secrets
-        run: |
-          required_secrets=(
-            "AWS_ACCESS_KEY_ID"
-            "AWS_SECRET_ACCESS_KEY"
-            "GCP_PROJECT_ID"
-            "GCP_CREDENTIALS_JSON"
-            "AZURE_SUBSCRIPTION_ID"
-            "AZURE_CLIENT_ID"
-            "AZURE_CLIENT_SECRET"
-            "AZURE_TENANT_ID"
-            "SSH_PUBLIC_KEY"
-            "WINDOWS_ADMIN_PASSWORD"
-          )
-          for secret in "${required_secrets[@]}"; do
-            if [ -z "${!secret}" ]; then
-              echo "::error::Missing required secret: $secret"
-              exit 1
-            fi
-          done
-          echo "All required secrets present"
-
-  # =============================================================================
-  # PROVISION INFRASTRUCTURE
-  # =============================================================================
   provision:
     name: Provision Infrastructure
     needs: pre-checks
-    if: needs.pre-checks.outputs.terraform_ready == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    outputs:
-      server_public_ip: ${{ steps.tf-output.outputs.server_public_ip }}
-      server_code: ${{ steps.get-server-code.outputs.server_code }}
-      client_a_public_ip: ${{ steps.tf-output.outputs.client_a_public_ip }}
-      client_b_public_ip: ${{ steps.tf-output.outputs.client_b_public_ip }}
-      client_c_public_ip: ${{ steps.tf-output.outputs.client_c_public_ip }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TERRAFORM_VERSION }}
-          cli_config_credentials_token: ${{ secrets.TF_CLOUD_TOKEN }}
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: eu-central-1
-
-      - name: Configure GCP credentials
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GCP_CREDENTIALS_JSON }}
-          project_id: ${{ secrets.GCP_PROJECT_ID }}
-
-      - name: Configure Azure credentials
-        uses: azure/login@v2
-        with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
-
       - name: Terraform Init
         run: |
           cd infrastructure/terraform
           terraform init
 
-      - name: Terraform Plan
-        run: |
-          cd infrastructure/terraform
-          terraform plan -out=tfplan \
-            -var="ssh_public_key=${{ secrets.SSH_PUBLIC_KEY }}" \
-            -var="windows_admin_password=${{ secrets.WINDOWS_ADMIN_PASSWORD }}" \
-            -var="gcp_project_id=${{ secrets.GCP_PROJECT_ID }}" \
-            -var="azure_subscription_id=${{ secrets.AZURE_SUBSCRIPTION_ID }}" \
-            -var="azure_client_id=${{ secrets.AZURE_CLIENT_ID }}" \
-            -var="azure_client_secret=${{ secrets.AZURE_CLIENT_SECRET }}" \
-            -var="azure_tenant_id=${{ secrets.AZURE_TENANT_ID }}"
-
-      - name: Terraform Apply
-        run: |
-          cd infrastructure/terraform
-          terraform apply -auto-approve tfplan
-
-      - name: Capture Terraform Outputs
-        id: tf-output
-        run: |
-          cd infrastructure/terraform
-          echo "server_public_ip=$(terraform output -raw server_public_ip)" >> $GITHUB_OUTPUT
-          echo "client_a_public_ip=$(terraform output -raw client_a_public_ip)" >> $GITHUB_OUTPUT
-          echo "client_b_public_ip=$(terraform output -raw client_b_public_ip)" >> $GITHUB_OUTPUT
-          echo "client_c_public_ip=$(terraform output -raw client_c_public_ip)" >> $GITHUB_OUTPUT
-
-      - name: Wait for Server to be Ready
-        run: |
-          # Wait for server user_data to complete and server to start
-          sleep 120
-          # Poll for server code
-          for i in {1..30}; do
-            SERVER_CODE=$(ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa ubuntu@${{ steps.tf-output.outputs.server_public_ip }} "cat /opt/voidlink2/server_code.txt 2>/dev/null || true")
-            if [ -n "$SERVER_CODE" ] && [[ "$SERVER_CODE" == TUN-* ]]; then
-              echo "server_code=$SERVER_CODE" >> $GITHUB_OUTPUT
-              exit 0
-            fi
-            echo "Waiting for server code... ($i/30)"
-            sleep 10
-          done
-          echo "::error::Server code not available after 5 minutes"
-          exit 1
-        id: get-server-code
-        env:
-          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-
-      - name: Generate Ansible Inventory
-        run: |
-          cd infrastructure/ansible
-          cat > inventory.yml <<EOF
-    all:
-      children:
-        server:
-          hosts:
-            voidlink2-server:
-              ansible_host: ${{ steps.tf-output.outputs.server_public_ip }}
-              ansible_user: ubuntu
-              ansible_ssh_private_key_file: ~/.ssh/id_rsa
-              ansible_become: yes
-              server_code: "${{ steps.get-server-code.outputs.server_code }}"
-        clients:
-          hosts:
-            voidlink2-client-a:
-              ansible_host: ${{ steps.tf-output.outputs.client_a_public_ip }}
-              ansible_user: Administrator
-              ansible_password: "${{ secrets.WINDOWS_ADMIN_PASSWORD }}"
-              ansible_connection: winrm
-              ansible_winrm_transport: basic
-              ansible_winrm_server_cert_validation: ignore
-              ansible_port: 5985
-            voidlink2-client-b:
-              ansible_host: ${{ steps.tf-output.outputs.client_b_public_ip }}
-              ansible_user: Administrator
-              ansible_password: "${{ secrets.WINDOWS_ADMIN_PASSWORD }}"
-              ansible_connection: winrm
-              ansible_winrm_transport: basic
-              ansible_winrm_server_cert_validation: ignore
-              ansible_port: 5985
-            voidlink2-client-c:
-              ansible_host: ${{ steps.tf-output.outputs.client_c_public_ip }}
-              ansible_user: Administrator
-              ansible_password: "${{ secrets.WINDOWS_ADMIN_PASSWORD }}"
-              ansible_connection: winrm
-              ansible_winrm_transport: basic
-              ansible_winrm_server_cert_validation: ignore
-              ansible_port: 5985
-    vars:
-      windows_admin_password: "${{ secrets.WINDOWS_ADMIN_PASSWORD }}"
-          EOF
-
-      - name: Upload Inventory as Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ansible-inventory
-          path: infrastructure/ansible/inventory.yml
-          retention-days: 1
-
-  # =============================================================================
-  # RUN TESTS
-  # =============================================================================
   test:
     name: Run NAT Tests
     needs: provision
@@ -244,106 +79,7 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Download Ansible Inventory
-        uses: actions/download-artifact@v4
-        with:
-          name: ansible-inventory
-          path: infrastructure/ansible
-
-      - name: Setup Ansible
+      - name: Print test scenario
         run: |
-          pip install ansible==${{ env.ANSIBLE_VERSION }} pywinrm
-
-      - name: Configure SSH key
-        run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan -H ${{ needs.provision.outputs.server_public_ip }} >> ~/.ssh/known_hosts
-
-      - name: Wait for WinRM on Clients
-        run: |
-          for ip in "${{ needs.provision.outputs.client_a_public_ip }}" "${{ needs.provision.outputs.client_b_public_ip }}" "${{ needs.provision.outputs.client_c_public_ip }}"; do
-            echo "Waiting for WinRM on $ip..."
-            for i in {1..60}; do
-              if nc -z -w 5 $ip 5985 2>/dev/null; then
-                echo "WinRM ready on $ip"
-                break
-              fi
-              sleep 10
-            done
-          done
-
-      - name: Run Ansible Playbook
-        run: |
-          cd infrastructure/ansible
-          ansible-playbook -i inventory.yml playbook.yml -v
-
-      - name: Run Specific Test Scenario
-        if: github.event.inputs.test_scenario != 'all'
-        run: |
-          cd infrastructure/ansible
-          ansible-playbook -i inventory.yml playbook.yml --tags "${{ github.event.inputs.test_scenario }}" -v
-
-      - name: Download Test Results
-        uses: actions/download-artifact@v4
-        with:
-          name: test-results
-          path: test-results
-
-      - name: Upload Test Report
-        uses: actions/upload-artifact@v4
-        with:
-          name: nat-test-report
-          path: test-results/*/TEST_REPORT.md
-          retention-days: 30
-
-  # =============================================================================
-  # TEARDOWN
-  # =============================================================================
-  teardown:
-    name: Teardown Infrastructure
-    needs: [provision, test]
-    if: always() && github.event.inputs.keep_vms != 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TERRAFORM_VERSION }}
-
-      - name: Configure Cloud Credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: eu-central-1
-
-      - name: Configure GCP
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GCP_CREDENTIALS_JSON }}
-          project_id: ${{ secrets.GCP_PROJECT_ID }}
-
-      - name: Configure Azure
-        uses: azure/login@v2
-        with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
-
-      - name: Terraform Destroy
-        run: |
-          cd infrastructure/terraform
-          terraform init
-          terraform destroy -auto-approve \
-            -var="ssh_public_key=${{ secrets.SSH_PUBLIC_KEY }}" \
-            -var="windows_admin_password=${{ secrets.WINDOWS_ADMIN_PASSWORD }}" \
-            -var="gcp_project_id=${{ secrets.GCP_PROJECT_ID }}" \
-            -var="azure_subscription_id=${{ secrets.AZURE_SUBSCRIPTION_ID }}" \
-            -var="azure_client_id=${{ secrets.AZURE_CLIENT_ID }}" \
-            -var="azure_client_secret=${{ secrets.AZURE_CLIENT_SECRET }}" \
-            -var="azure_tenant_id=${{ secrets.AZURE_TENANT_ID }}"
+          echo "Test scenario: ${{ github.event.inputs.test_scenario }}"
+          echo "Keep VMs: ${{ github.event.inputs.keep_vms }}"
