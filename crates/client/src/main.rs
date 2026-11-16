@@ -90,7 +90,7 @@ fn main() -> Result<()> {
         println!("создана новая identity: {}", id.friend_code());
     }
 
-    let cmd = args.first().cloned().unwrap_or_else(|| "help".into());
+    let cmd = args.first().cloned().unwrap_or_else(|| "tui".into());
     let rest: Vec<String> = args[1.min(args.len())..].to_vec();
     let rest: &[String] = &rest;
 
