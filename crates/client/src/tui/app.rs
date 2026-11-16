@@ -1,10 +1,14 @@
 //! Состояние TUI: фокус, списки, попапы, тосты, лог, обработка клавиш.
 
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::{Position, Rect};
 use tunnel_protocol as proto;
 
 use crate::engine::{Cmd, Engine};
@@ -16,7 +20,7 @@ pub const LOG_MAX: usize = 400;
 
 // ---------------------------------------------------------------- фокус
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Focus {
     Groups,
     Friends,
@@ -243,6 +247,92 @@ pub enum Popup {
     Profile,
 }
 
+// ---------------------------------------------------------------- мышь
+
+/// Кнопки панели действий под шапкой: подпись и клавиша, которую «нажимает»
+/// клик (дальше работает та же логика, что и с клавиатуры).
+pub const TOOLBAR: [(&str, KeyCode, KeyModifiers); 11] = [
+    ("F1 справка", KeyCode::F(1), KeyModifiers::NONE),
+    ("F2 создать", KeyCode::F(2), KeyModifiers::NONE),
+    ("j войти", KeyCode::Char('j'), KeyModifiers::NONE),
+    ("x выйти", KeyCode::Char('x'), KeyModifiers::NONE),
+    ("i пригласить", KeyCode::Char('i'), KeyModifiers::NONE),
+    ("k исключить", KeyCode::Char('k'), KeyModifiers::NONE),
+    ("a друг", KeyCode::Char('a'), KeyModifiers::NONE),
+    ("p профиль", KeyCode::Char('p'), KeyModifiers::NONE),
+    ("F3 настройки", KeyCode::F(3), KeyModifiers::NONE),
+    (": команда", KeyCode::Char(':'), KeyModifiers::NONE),
+    ("^C выход", KeyCode::Char('c'), KeyModifiers::CONTROL),
+];
+
+/// Где что нарисовано в последнем кадре — чтобы понять, куда попал клик.
+/// Заполняется в `ui::draw` (там `&App`, поэтому `Cell`/`RefCell`).
+#[derive(Default)]
+pub struct Hits {
+    /// Кнопки панели действий.
+    pub toolbar: RefCell<Vec<(Rect, KeyEvent)>>,
+    /// Рамка панели и смещение прокрутки её списка.
+    pub groups: Cell<(Rect, usize)>,
+    pub friends: Cell<(Rect, usize)>,
+    pub peers: Cell<(Rect, usize)>,
+    pub log: Cell<Rect>,
+    /// Верхний попап: рамка, смещение списка, кнопки.
+    pub popup: Cell<Rect>,
+    pub popup_off: Cell<usize>,
+    pub popup_buttons: RefCell<Vec<(Rect, KeyEvent)>>,
+}
+
+/// Куда попал клик.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Hit {
+    Nothing,
+    /// Кнопка (панель действий или попап) — эквивалент клавиши.
+    Key(KeyEvent),
+    /// Строка списка панели: индекс в `visible_*`.
+    Item(Focus, usize),
+    /// Панель, но мимо строк.
+    Panel(Focus),
+    /// Строка списка в попапе.
+    PopupItem(usize),
+    PopupInside,
+    PopupOutside,
+}
+
+fn inside(r: Rect, x: u16, y: u16) -> bool {
+    r.contains(Position::new(x, y))
+}
+
+/// Номер строки списка внутри рамки (рамка — 1 клетка, `skip` — строки
+/// заголовка таблицы) с учётом прокрутки `off`.
+fn row_in(r: Rect, off: usize, skip: u16, x: u16, y: u16) -> Option<usize> {
+    if r.width < 3 || r.height < 3 + skip {
+        return None;
+    }
+    let top = r.y + 1 + skip;
+    if x <= r.x || x + 1 >= r.right() || y < top || y + 1 >= r.bottom() {
+        return None;
+    }
+    Some(off + (y - top) as usize)
+}
+
+/// Шаг по списку длины `len`: по кругу (стрелки) или с упором в края
+/// (колесо, Home/End).
+fn step(cur: usize, len: usize, delta: i32, wrap: bool) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let next = cur as i32 + delta;
+    if wrap {
+        next.rem_euclid(len as i32) as usize
+    } else {
+        next.clamp(0, len as i32 - 1) as usize
+    }
+}
+
+fn key(code: KeyCode) -> KeyEvent {
+    KeyEvent::new(code, KeyModifiers::NONE)
+}
+
 // ---------------------------------------------------------------- приложение
 
 pub struct App {
@@ -284,6 +374,8 @@ pub struct App {
     pub status_msg: String,
     pub log_scroll: usize,
     pub quit: bool,
+    /// Геометрия последнего кадра для мыши.
+    pub hits: Hits,
 }
 
 impl App {
@@ -323,6 +415,7 @@ impl App {
             status_msg: String::new(),
             log_scroll: 0,
             quit: false,
+            hits: Hits::default(),
         }
     }
 
@@ -745,17 +838,20 @@ impl App {
     }
 
     fn move_sel(&mut self, delta: i32) {
+        // Стрелки ходят по кругу, Home/End (±1000) упираются в края.
+        // Раньше ±1000 тоже шло по кругу, и Home попадал не на первую строку.
+        self.move_sel_by(delta, delta.abs() == 1);
+    }
+
+    fn move_sel_by(&mut self, delta: i32, wrap: bool) {
         match self.focus {
             Focus::Groups => {
                 let list = self.visible_groups();
                 if list.is_empty() {
                     return;
                 }
-                let cur = list
-                    .iter()
-                    .position(|g| Some(g.gid) == self.sel_group)
-                    .unwrap_or(0) as i32;
-                let next = (cur + delta).rem_euclid(list.len() as i32) as usize;
+                let cur = list.iter().position(|g| Some(g.gid) == self.sel_group);
+                let next = step(cur.unwrap_or(0), list.len(), delta, wrap);
                 self.sel_group = Some(list[next].gid);
             }
             Focus::Friends => {
@@ -763,11 +859,8 @@ impl App {
                 if list.is_empty() {
                     return;
                 }
-                let cur = list
-                    .iter()
-                    .position(|f| Some(f.pubkey) == self.sel_friend)
-                    .unwrap_or(0) as i32;
-                let next = (cur + delta).rem_euclid(list.len() as i32) as usize;
+                let cur = list.iter().position(|f| Some(f.pubkey) == self.sel_friend);
+                let next = step(cur.unwrap_or(0), list.len(), delta, wrap);
                 self.sel_friend = Some(list[next].pubkey);
             }
             Focus::Peers => {
@@ -775,11 +868,8 @@ impl App {
                 if list.is_empty() {
                     return;
                 }
-                let cur = list
-                    .iter()
-                    .position(|p| Some(p.pubkey) == self.sel_peer)
-                    .unwrap_or(0) as i32;
-                let next = (cur + delta).rem_euclid(list.len() as i32) as usize;
+                let cur = list.iter().position(|p| Some(p.pubkey) == self.sel_peer);
+                let next = step(cur.unwrap_or(0), list.len(), delta, wrap);
                 self.sel_peer = Some(list[next].pubkey);
             }
             Focus::Log => {
@@ -791,6 +881,194 @@ impl App {
                 }
             }
         }
+    }
+
+    // ---------- мышь ----------
+
+    pub fn handle_mouse(&mut self, m: MouseEvent, eng: &Engine) {
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => self.click(m.column, m.row, eng),
+            MouseEventKind::ScrollUp => self.wheel(m.column, m.row, -1),
+            MouseEventKind::ScrollDown => self.wheel(m.column, m.row, 1),
+            _ => {}
+        }
+    }
+
+    /// Что находится в клетке (x, y) последнего кадра.
+    pub fn hit(&self, x: u16, y: u16) -> Hit {
+        let h = &self.hits;
+        if let Some(top) = self.stack.last() {
+            for (r, k) in h.popup_buttons.borrow().iter() {
+                if inside(*r, x, y) {
+                    return Hit::Key(*k);
+                }
+            }
+            let rect = h.popup.get();
+            if !inside(rect, x, y) {
+                return Hit::PopupOutside;
+            }
+            let len = match top {
+                Popup::PeerPick(p) => p.items.len(),
+                Popup::ListPick(p) => p.items.len(),
+                Popup::Settings(_) => SETTING_ROWS.len(),
+                _ => 0,
+            };
+            return match row_in(rect, h.popup_off.get(), 0, x, y) {
+                Some(i) if i < len => Hit::PopupItem(i),
+                _ => Hit::PopupInside,
+            };
+        }
+        for (r, k) in h.toolbar.borrow().iter() {
+            if inside(*r, x, y) {
+                return Hit::Key(*k);
+            }
+        }
+        let (r, off) = h.groups.get();
+        if inside(r, x, y) {
+            return match row_in(r, off, 0, x, y) {
+                Some(i) if i < self.visible_groups().len() => Hit::Item(Focus::Groups, i),
+                _ => Hit::Panel(Focus::Groups),
+            };
+        }
+        let (r, off) = h.friends.get();
+        if inside(r, x, y) {
+            return match row_in(r, off, 0, x, y) {
+                Some(i) if i < self.visible_friends().len() => Hit::Item(Focus::Friends, i),
+                _ => Hit::Panel(Focus::Friends),
+            };
+        }
+        let (r, off) = h.peers.get();
+        if inside(r, x, y) {
+            // Под заголовком таблицы; строка 0 — «я» (если группа выбрана).
+            return match row_in(r, off, 1, x, y) {
+                Some(i)
+                    if self.selected_group().is_some()
+                        && i >= 1
+                        && i - 1 < self.visible_peers().len() =>
+                {
+                    Hit::Item(Focus::Peers, i - 1)
+                }
+                _ => Hit::Panel(Focus::Peers),
+            };
+        }
+        if inside(h.log.get(), x, y) {
+            return Hit::Panel(Focus::Log);
+        }
+        Hit::Nothing
+    }
+
+    fn click(&mut self, x: u16, y: u16, eng: &Engine) {
+        match self.hit(x, y) {
+            Hit::Nothing => {}
+            Hit::Key(k) => {
+                // Кнопка панели действий не должна уйти в строку поиска.
+                if self.stack.is_empty() {
+                    self.filtering = false;
+                }
+                self.handle_key(k, eng);
+            }
+            Hit::PopupOutside => self.handle_key(key(KeyCode::Esc), eng),
+            Hit::PopupItem(i) => {
+                if self.click_popup_item(i) {
+                    self.handle_key(key(KeyCode::Enter), eng);
+                }
+            }
+            Hit::PopupInside => {
+                // Строка «приватная группа» в создании группы — переключатель.
+                let r = self.hits.popup.get();
+                if let Some(Popup::Input(inp)) = self.stack.last() {
+                    if matches!(inp.action, InputAction::CreateGroup) && y == r.y + 2 {
+                        self.handle_key(key(KeyCode::Tab), eng);
+                    }
+                }
+            }
+            Hit::Panel(f) => self.focus = f,
+            Hit::Item(f, i) => {
+                if self.select_item(f, i) {
+                    self.activate(eng);
+                }
+            }
+        }
+    }
+
+    /// Выбирает строку `i` в попапе-списке. true — пора применить (Enter).
+    /// Участник для приглашения/кика/бана применяется только повторным
+    /// кликом по уже выбранной строке; настройки и галочки — сразу.
+    pub fn click_popup_item(&mut self, i: usize) -> bool {
+        match self.stack.last_mut() {
+            Some(Popup::PeerPick(p)) => {
+                let again = p.sel == i;
+                p.sel = i;
+                again
+            }
+            Some(Popup::ListPick(p)) => {
+                p.sel = i;
+                true
+            }
+            Some(Popup::Settings(s)) => {
+                s.sel = i;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Фокус на панель и выбор строки `i`. true — строка уже была выбрана
+    /// в этой же панели (второй клик = Enter).
+    pub fn select_item(&mut self, focus: Focus, i: usize) -> bool {
+        let was_focused = self.focus == focus;
+        self.focus = focus;
+        let already = match focus {
+            Focus::Groups => {
+                let id = self.visible_groups().get(i).map(|g| g.gid);
+                let already = id.is_some() && id == self.sel_group;
+                if id.is_some() {
+                    self.sel_group = id;
+                }
+                already
+            }
+            Focus::Friends => {
+                let id = self.visible_friends().get(i).map(|f| f.pubkey);
+                let already = id.is_some() && id == self.sel_friend;
+                if id.is_some() {
+                    self.sel_friend = id;
+                }
+                already
+            }
+            Focus::Peers => {
+                let id = self.visible_peers().get(i).map(|p| p.pubkey);
+                let already = id.is_some() && id == self.sel_peer;
+                if id.is_some() {
+                    self.sel_peer = id;
+                }
+                already
+            }
+            Focus::Log => false,
+        };
+        was_focused && already
+    }
+
+    /// Колесо: прокрутка списка под курсором (без хода по кругу).
+    pub fn wheel(&mut self, x: u16, y: u16, delta: i32) {
+        if !self.stack.is_empty() {
+            if !inside(self.hits.popup.get(), x, y) {
+                return;
+            }
+            match self.stack.last_mut() {
+                Some(Popup::PeerPick(p)) => p.sel = step(p.sel, p.items.len(), delta, false),
+                Some(Popup::ListPick(p)) => p.sel = step(p.sel, p.items.len(), delta, false),
+                Some(Popup::Settings(s)) => s.sel = step(s.sel, SETTING_ROWS.len(), delta, false),
+                _ => {}
+            }
+            return;
+        }
+        let focus = match self.hit(x, y) {
+            Hit::Item(f, _) | Hit::Panel(f) => f,
+            _ => return,
+        };
+        self.focus = focus;
+        let delta = if focus == Focus::Log { delta * 3 } else { delta };
+        self.move_sel_by(delta, false);
     }
 
     fn activate(&mut self, eng: &Engine) {
@@ -1750,5 +2028,16 @@ mod tests {
         assert_eq!(Sort::Name.next(), Sort::Online);
         assert_eq!(Sort::Online.next(), Sort::Rtt);
         assert_eq!(Sort::Rtt.next(), Sort::Name);
+    }
+
+    #[test]
+    fn шаг_по_списку() {
+        // Стрелки — по кругу.
+        assert_eq!(step(0, 3, -1, true), 2);
+        assert_eq!(step(2, 3, 1, true), 0);
+        // Home/End и колесо — упор в края (раньше Home на 7 строках давал 1).
+        assert_eq!(step(0, 7, -1000, false), 0);
+        assert_eq!(step(3, 7, 1000, false), 6);
+        assert_eq!(step(0, 0, 1, false), 0);
     }
 }
