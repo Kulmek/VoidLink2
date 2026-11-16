@@ -1,5 +1,8 @@
 //! Отрисовка TUI: шапка, списки, таблица участников, лог, статус-бар, попапы.
 
+use std::cell::RefCell;
+
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -13,7 +16,7 @@ use tunnel_protocol as proto;
 
 use crate::tui::app::{
     App, ConfirmPopup, Focus, FriendCardPopup, InputPopup, ListPickPopup, MsgKind, PeerPickPopup,
-    Popup, SettingsPopup, SETTING_ROWS,
+    Popup, SettingsPopup, SETTING_ROWS, TOOLBAR,
 };
 use crate::tui::identicon::Identicon;
 use crate::tui::theme::Theme;
@@ -22,8 +25,15 @@ pub fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
     let th = Theme::of(app.theme_kind);
 
+    // Геометрия для мыши собирается заново каждый кадр.
+    app.hits.toolbar.borrow_mut().clear();
+    app.hits.popup_buttons.borrow_mut().clear();
+    app.hits.popup.set(Rect::default());
+    app.hits.popup_off.set(0);
+
     let chunks = Layout::vertical([
         Constraint::Length(3),
+        Constraint::Length(1),
         Constraint::Min(8),
         Constraint::Length(8),
         Constraint::Length(1),
@@ -31,9 +41,10 @@ pub fn draw(f: &mut Frame, app: &App) {
     .split(area);
 
     draw_header(f, app, &th, chunks[0]);
-    draw_body(f, app, &th, chunks[1]);
-    draw_log(f, app, &th, chunks[2]);
-    draw_status(f, app, &th, chunks[3]);
+    draw_toolbar(f, app, &th, chunks[1]);
+    draw_body(f, app, &th, chunks[2]);
+    draw_log(f, app, &th, chunks[3]);
+    draw_status(f, app, &th, chunks[4]);
 
     if let Some(popup) = app.stack.last() {
         draw_popup(f, app, &th, popup, area);
@@ -83,6 +94,64 @@ fn draw_header(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
         ));
     let p = Paragraph::new(Line::from(spans)).block(block);
     f.render_widget(p, area);
+}
+
+// ---------------------------------------------------------------- панель действий
+
+/// Кнопки-клавиши под шапкой: клик по ним = нажатие клавиши.
+fn draw_toolbar(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
+    let items: Vec<(&str, Style, KeyEvent)> = TOOLBAR
+        .iter()
+        .map(|(label, code, mods)| (*label, th.dim, KeyEvent::new(*code, *mods)))
+        .collect();
+    let row = Rect {
+        x: area.x + 1,
+        width: area.width.saturating_sub(1),
+        ..area
+    };
+    draw_buttons(f, &app.hits.toolbar, row, &items, 1);
+}
+
+/// Строка кнопок-«чипов»: рисует их и запоминает в `hits`, куда кликать.
+/// Кнопки, которые не влезли по ширине, не рисуются.
+fn draw_buttons(
+    f: &mut Frame,
+    hits: &RefCell<Vec<(Rect, KeyEvent)>>,
+    row: Rect,
+    items: &[(&str, Style, KeyEvent)],
+    gap: u16,
+) {
+    if row.width == 0 || row.height == 0 {
+        return;
+    }
+    let mut hits = hits.borrow_mut();
+    let mut spans = Vec::new();
+    let mut x = row.x;
+    for (label, style, key) in items {
+        let chip = Span::styled(format!(" {label} "), style.add_modifier(Modifier::REVERSED));
+        let w = chip.width() as u16;
+        if x + w > row.right() {
+            break;
+        }
+        hits.push((Rect::new(x, row.y, w, 1), *key));
+        spans.push(chip);
+        spans.push(Span::raw(" ".repeat(gap as usize)));
+        x += w + gap;
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), Rect { height: 1, ..row });
+}
+
+/// Строка внутри рамки попапа (`n` — номер строки от верхней границы).
+fn inner_row(rect: Rect, n: u16) -> Rect {
+    let y = rect.y + 1 + n;
+    if rect.width < 3 || y + 1 >= rect.bottom() {
+        return Rect::default();
+    }
+    Rect::new(rect.x + 1, y, rect.width - 2, 1)
+}
+
+fn key(code: KeyCode) -> KeyEvent {
+    KeyEvent::new(code, KeyModifiers::NONE)
 }
 
 // ---------------------------------------------------------------- тело
@@ -165,6 +234,7 @@ fn draw_groups(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
         .highlight_style(th.selected)
         .highlight_symbol("▌ ");
     f.render_stateful_widget(list, area, &mut state);
+    app.hits.groups.set((area, state.offset()));
 }
 
 fn draw_friends(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
@@ -208,6 +278,7 @@ fn draw_friends(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
         .highlight_style(th.selected)
         .highlight_symbol("▌ ");
     f.render_stateful_widget(list, area, &mut state);
+    app.hits.friends.set((area, state.offset()));
 }
 
 fn draw_peers(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
@@ -313,6 +384,7 @@ fn draw_peers(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
         state.select(Some(sel + 1));
     }
     f.render_stateful_widget(table, area, &mut state);
+    app.hits.peers.set((area, state.offset()));
 }
 
 // ---------------------------------------------------------------- лог
@@ -322,7 +394,7 @@ fn draw_log(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
         th,
         " Лог ".to_string(),
         app.focus == Focus::Log,
-        Some("PgUp/PgDn — прокрутка".to_string()),
+        Some("PgUp/PgDn или колесо — прокрутка".to_string()),
     );
     let inner_height = area.height.saturating_sub(2) as usize;
     let total = app.log.len();
@@ -347,6 +419,7 @@ fn draw_log(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
 
     let p = Paragraph::new(lines).block(block);
     f.render_widget(p, area);
+    app.hits.log.set(area);
 }
 
 // ---------------------------------------------------------------- статус
@@ -462,57 +535,72 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 fn draw_popup(f: &mut Frame, app: &App, th: &Theme, popup: &Popup, area: Rect) {
     match popup {
         Popup::Help => {
-            let rect = centered(area, 66, 26);
+            let lines = help_lines(th);
+            let rect = centered(area, 72, lines.len() as u16 + 2);
+            app.hits.popup.set(rect);
             f.render_widget(Clear, rect);
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_style(th.accent)
-                .title(" Справка (F1) ");
-            let p = Paragraph::new(help_lines(th)).block(block);
+                .title(" Справка (F1) ")
+                .title_bottom(Line::from(Span::styled(
+                    " Esc или клик мимо окна — закрыть ",
+                    th.dim,
+                )));
+            let p = Paragraph::new(lines).block(block);
             f.render_widget(p, rect);
         }
         Popup::Input(inp) => {
             let rect = centered(area, 70, 7);
+            app.hits.popup.set(rect);
             f.render_widget(Clear, rect);
             draw_input(f, app, th, inp, rect);
         }
         Popup::Confirm(c) => {
             let rect = centered(area, 60, 7);
+            app.hits.popup.set(rect);
             f.render_widget(Clear, rect);
-            draw_confirm(f, th, c, rect);
+            draw_confirm(f, app, th, c, rect);
         }
         Popup::PeerPick(p) => {
             let h = (p.items.len() as u16 + 4).min(20).max(8);
-            let rect = centered(area, 56, h);
+            let rect = centered(area, 60, h);
+            app.hits.popup.set(rect);
             f.render_widget(Clear, rect);
-            draw_peer_pick(f, th, p, rect);
+            app.hits.popup_off.set(draw_peer_pick(f, th, p, rect));
         }
         Popup::FriendCard(c) => {
-            let h = (c.groups.len() as u16 + 9).min(20);
+            // 5 строк identicon + 6 служебных + группы + кнопки + рамка.
+            let h = (c.groups.len().max(1) as u16 + 14).min(26);
             let rect = centered(area, 56, h);
+            app.hits.popup.set(rect);
             f.render_widget(Clear, rect);
             draw_friend_card(f, app, th, c, rect);
         }
         Popup::ListPick(p) => {
             let h = (p.items.len() as u16 + 4).min(20).max(8);
             let rect = centered(area, 56, h);
+            app.hits.popup.set(rect);
             f.render_widget(Clear, rect);
-            draw_list_pick(f, th, p, rect);
+            app.hits.popup_off.set(draw_list_pick(f, th, p, rect));
         }
         Popup::Settings(s) => {
             let rect = centered(area, 60, 12);
+            app.hits.popup.set(rect);
             f.render_widget(Clear, rect);
-            draw_settings(f, app, th, s, rect);
+            app.hits.popup_off.set(draw_settings(f, app, th, s, rect));
         }
         Popup::Profile => {
-            let rect = centered(area, 60, 14);
+            // 5 строк identicon + 9 строк данных + кнопки + рамка.
+            let rect = centered(area, 60, 17);
+            app.hits.popup.set(rect);
             f.render_widget(Clear, rect);
             draw_profile(f, app, th, rect);
         }
     }
 }
 
-fn draw_input(f: &mut Frame, _app: &App, th: &Theme, inp: &InputPopup, area: Rect) {
+fn draw_input(f: &mut Frame, app: &App, th: &Theme, inp: &InputPopup, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(th.accent)
@@ -531,38 +619,52 @@ fn draw_input(f: &mut Frame, _app: &App, th: &Theme, inp: &InputPopup, area: Rec
         lines.push(Line::from(Span::styled(
             format!(
                 "приватная группа: {}",
-                if inp.private { "да" } else { "нет (Tab — переключить)" }
+                if inp.private { "да (Tab или клик — переключить)" } else { "нет (Tab или клик — переключить)" }
             ),
             th.dim,
         )));
     }
     let p = Paragraph::new(lines).block(block);
     f.render_widget(p, area);
+    draw_buttons(
+        f,
+        &app.hits.popup_buttons,
+        inner_row(area, 3),
+        &[
+            ("OK (Enter)", th.ok, key(KeyCode::Enter)),
+            ("Отмена (Esc)", th.dim, key(KeyCode::Esc)),
+        ],
+        2,
+    );
 }
 
-fn draw_confirm(f: &mut Frame, th: &Theme, c: &ConfirmPopup, area: Rect) {
+fn draw_confirm(f: &mut Frame, app: &App, th: &Theme, c: &ConfirmPopup, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(th.warn)
         .title(format!(" {} ", c.title));
-    let lines = vec![
-        Line::from(c.message.clone()),
-        Line::from(Span::styled(
-            "y — подтвердить · n/Esc — отмена",
-            th.dim,
-        )),
-    ];
-    let p = Paragraph::new(lines).block(block);
+    let p = Paragraph::new(Line::from(c.message.clone())).block(block);
     f.render_widget(p, area);
+    draw_buttons(
+        f,
+        &app.hits.popup_buttons,
+        inner_row(area, 2),
+        &[
+            ("Да (y)", th.warn, key(KeyCode::Char('y'))),
+            ("Отмена (Esc)", th.dim, key(KeyCode::Esc)),
+        ],
+        2,
+    );
 }
 
-fn draw_peer_pick(f: &mut Frame, th: &Theme, p: &PeerPickPopup, area: Rect) {
+/// Возвращает смещение прокрутки списка (для мыши).
+fn draw_peer_pick(f: &mut Frame, th: &Theme, p: &PeerPickPopup, area: Rect) -> usize {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(th.accent)
         .title(format!(" {} ", p.title))
         .title_bottom(Line::from(Span::styled(
-            "↑↓ — выбор · Enter — применить · Esc — отмена",
+            "клик — выбор, ещё клик/Enter — применить · Esc — отмена",
             th.dim,
         )));
     let items: Vec<ListItem> = p
@@ -588,9 +690,10 @@ fn draw_peer_pick(f: &mut Frame, th: &Theme, p: &PeerPickPopup, area: Rect) {
         .highlight_style(th.selected)
         .highlight_symbol("▌ ");
     f.render_stateful_widget(list, area, &mut state);
+    state.offset()
 }
 
-fn draw_friend_card(f: &mut Frame, _app: &App, th: &Theme, c: &FriendCardPopup, area: Rect) {
+fn draw_friend_card(f: &mut Frame, app: &App, th: &Theme, c: &FriendCardPopup, area: Rect) {
     let id = Identicon::from_pubkey(&c.pubkey);
     let mut lines: Vec<Line> = Vec::new();
     for r in 0..5 {
@@ -636,10 +739,7 @@ fn draw_friend_card(f: &mut Frame, _app: &App, th: &Theme, c: &FriendCardPopup, 
         }
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "c — скопировать pubkey · Esc — закрыть",
-        th.dim,
-    )));
+    let buttons_at = lines.len() as u16;
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -647,13 +747,27 @@ fn draw_friend_card(f: &mut Frame, _app: &App, th: &Theme, c: &FriendCardPopup, 
         .title(format!(" Друг: {} ", c.alias));
     let p = Paragraph::new(lines).block(block);
     f.render_widget(p, area);
+    draw_buttons(
+        f,
+        &app.hits.popup_buttons,
+        inner_row(area, buttons_at),
+        &[
+            ("Копировать pubkey (c)", th.accent, key(KeyCode::Char('c'))),
+            ("Закрыть (Esc)", th.dim, key(KeyCode::Esc)),
+        ],
+        2,
+    );
 }
 
-fn draw_list_pick(f: &mut Frame, th: &Theme, p: &ListPickPopup, area: Rect) {
+fn draw_list_pick(f: &mut Frame, th: &Theme, p: &ListPickPopup, area: Rect) -> usize {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(th.accent)
-        .title(format!(" {} ", p.title));
+        .title(format!(" {} ", p.title))
+        .title_bottom(Line::from(Span::styled(
+            "Enter или клик — выбрать · Esc — закрыть",
+            th.dim,
+        )));
     let items: Vec<ListItem> = p
         .items
         .iter()
@@ -676,9 +790,10 @@ fn draw_list_pick(f: &mut Frame, th: &Theme, p: &ListPickPopup, area: Rect) {
         .highlight_style(th.selected)
         .highlight_symbol("▌ ");
     f.render_stateful_widget(list, area, &mut state);
+    state.offset()
 }
 
-fn draw_settings(f: &mut Frame, app: &App, th: &Theme, s: &SettingsPopup, area: Rect) {
+fn draw_settings(f: &mut Frame, app: &App, th: &Theme, s: &SettingsPopup, area: Rect) -> usize {
     let rows: Vec<(String, String)> = vec![
         (
             "имя".to_string(),
@@ -734,7 +849,7 @@ fn draw_settings(f: &mut Frame, app: &App, th: &Theme, s: &SettingsPopup, area: 
         .border_style(th.accent)
         .title(" Настройки ")
         .title_bottom(Line::from(Span::styled(
-            "↑↓ — строка · Enter — изменить · Esc — закрыть",
+            "Enter или клик — изменить · Esc — закрыть",
             th.dim,
         )));
     let mut state = ListState::default();
@@ -744,6 +859,7 @@ fn draw_settings(f: &mut Frame, app: &App, th: &Theme, s: &SettingsPopup, area: 
         .highlight_style(th.selected)
         .highlight_symbol("▌ ");
     f.render_stateful_widget(list, area, &mut state);
+    state.offset()
 }
 
 fn draw_profile(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
@@ -799,10 +915,7 @@ fn draw_profile(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
         ),
     ]));
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "c — скопировать friend code · Esc — закрыть",
-        th.dim,
-    )));
+    let buttons_at = lines.len() as u16;
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -810,6 +923,16 @@ fn draw_profile(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
         .title(" Профиль ");
     let p = Paragraph::new(lines).block(block);
     f.render_widget(p, area);
+    draw_buttons(
+        f,
+        &app.hits.popup_buttons,
+        inner_row(area, buttons_at),
+        &[
+            ("Копировать friend code (c)", th.accent, key(KeyCode::Char('c'))),
+            ("Закрыть (Esc)", th.dim, key(KeyCode::Esc)),
+        ],
+        2,
+    );
 }
 
 // ---------------------------------------------------------------- справка
@@ -862,6 +985,16 @@ fn help_lines(th: &Theme) -> Vec<Line<'static>> {
         kv(":", "командная строка (:help — список)"),
         kv("PgUp / PgDn", "прокрутка лога"),
         kv("Ctrl-C", "выход (или :quit)"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Мышь",
+            th.title.add_modifier(Modifier::BOLD),
+        )),
+        kv("клик", "фокус и выбор строки; второй клик — как Enter"),
+        kv("колесо", "прокрутка списка или лога под курсором"),
+        kv("кнопки", "панель под шапкой и кнопки в окнах = клавиши"),
+        kv("мимо окна", "закрыть окно (как Esc)"),
+        kv("Shift+мышь", "выделить текст средствами терминала"),
     ]
 }
 
@@ -1052,5 +1185,139 @@ mod tests {
     fn печать_экрана() {
         let text = render(&demo_app(), 140, 36);
         println!("{text}");
+    }
+
+    // ---------- мышь ----------
+
+    use crate::tui::app::{ConfirmAction, Hit};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    /// Рисует кадр (это заполняет `app.hits`) и возвращает экран построчно,
+    /// по одному символу на клетку.
+    fn frame(app: &App, w: u16, h: u16) -> Vec<Vec<char>> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Координаты первого вхождения `text` правее `min_x`.
+    fn find(screen: &[Vec<char>], text: &str, min_x: usize) -> (u16, u16) {
+        let pat: Vec<char> = text.chars().collect();
+        for (y, row) in screen.iter().enumerate() {
+            for x in min_x..row.len().saturating_sub(pat.len() - 1) {
+                if row[x..x + pat.len()] == pat[..] {
+                    return (x as u16, y as u16);
+                }
+            }
+        }
+        panic!("на экране нет «{text}»");
+    }
+
+    fn k(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn мышь_попадание_в_панели_и_кнопки() {
+        let app = demo_app();
+        let s = frame(&app, 140, 40);
+
+        let (x, y) = find(&s, "secret", 0);
+        assert_eq!(app.hit(x, y), Hit::Item(Focus::Groups, 1));
+        let (x, y) = find(&s, "● gamers", 0);
+        assert_eq!(app.hit(x, y), Hit::Item(Focus::Groups, 0));
+
+        // «bravo» есть и в друзьях (слева), и в таблице участников (справа).
+        let (x, y) = find(&s, "● bravo", 0);
+        assert_eq!(app.hit(x, y), Hit::Item(Focus::Friends, 0));
+        let (x, y) = find(&s, "bravo", 40);
+        assert_eq!(app.hit(x, y), Hit::Item(Focus::Peers, 0));
+        // Строка «я» и заголовок таблицы — мимо участников.
+        let (x, y) = find(&s, "alpha (я)", 40);
+        assert_eq!(app.hit(x, y), Hit::Panel(Focus::Peers));
+
+        let (x, y) = find(&s, "F3 настройки", 0);
+        assert_eq!(app.hit(x, y), Hit::Key(k(KeyCode::F(3))));
+        let (x, y) = find(&s, "^C выход", 0);
+        assert_eq!(
+            app.hit(x + 1, y),
+            Hit::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        );
+
+        let (x, y) = find(&s, "Лог", 0);
+        assert_eq!(app.hit(x, y + 1), Hit::Panel(Focus::Log));
+        // Шапка — не кликабельна.
+        assert_eq!(app.hit(1, 1), Hit::Nothing);
+    }
+
+    #[test]
+    fn мышь_клик_выбирает_второй_применяет() {
+        let mut app = demo_app();
+        let _ = frame(&app, 140, 40);
+        // Фокус на группах, выбрана группа 1: клик по группе 2 только выбирает.
+        assert!(!app.select_item(Focus::Groups, 1));
+        assert_eq!(app.sel_group, Some(2));
+        // Повторный клик по той же строке — «Enter».
+        assert!(app.select_item(Focus::Groups, 1));
+        // Клик в другой панели сначала переводит фокус.
+        assert!(!app.select_item(Focus::Friends, 0));
+        assert_eq!(app.focus, Focus::Friends);
+        assert!(app.select_item(Focus::Friends, 0));
+    }
+
+    #[test]
+    fn мышь_колесо_без_хода_по_кругу() {
+        let mut app = demo_app();
+        let s = frame(&app, 140, 40);
+        let (x, y) = find(&s, "● gamers", 0);
+        app.wheel(x, y, -1);
+        assert_eq!(app.sel_group, Some(1), "вверх с первой строки — стоим");
+        app.wheel(x, y, 1);
+        assert_eq!(app.sel_group, Some(2));
+        app.wheel(x, y, 1);
+        assert_eq!(app.sel_group, Some(2), "вниз с последней — стоим");
+    }
+
+    #[test]
+    fn мышь_попапы() {
+        let mut app = demo_app();
+        app.stack.push(Popup::Confirm(ConfirmPopup {
+            title: "Удалить группу".into(),
+            message: "Точно?".into(),
+            action: ConfirmAction::DeleteGroup(1),
+        }));
+        let s = frame(&app, 140, 40);
+        let (x, y) = find(&s, "Да (y)", 0);
+        assert_eq!(app.hit(x, y), Hit::Key(k(KeyCode::Char('y'))));
+        let (x, y) = find(&s, "Отмена (Esc)", 0);
+        assert_eq!(app.hit(x, y), Hit::Key(k(KeyCode::Esc)));
+        let (x, y) = find(&s, "Точно?", 0);
+        assert_eq!(app.hit(x, y), Hit::PopupInside);
+        assert_eq!(app.hit(0, 0), Hit::PopupOutside);
+
+        let mut app = demo_app();
+        app.stack.push(Popup::Settings(SettingsPopup { sel: 0 }));
+        let s = frame(&app, 140, 40);
+        let (x, y) = find(&s, "тема", 0);
+        assert_eq!(app.hit(x, y), Hit::PopupItem(4));
+        // Клик по строке настроек применяется сразу.
+        assert!(app.click_popup_item(4));
+        match app.stack.last() {
+            Some(Popup::Settings(s)) => assert_eq!(s.sel, 4),
+            _ => panic!("нет попапа настроек"),
+        }
+
+        let mut app = demo_app();
+        app.stack.push(Popup::Profile);
+        let s = frame(&app, 140, 40);
+        let (x, y) = find(&s, "Копировать friend code", 0);
+        assert_eq!(app.hit(x, y), Hit::Key(k(KeyCode::Char('c'))));
     }
 }
