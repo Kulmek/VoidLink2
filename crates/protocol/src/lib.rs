@@ -55,6 +55,10 @@ pub mod ctrl {
     pub const ERROR: u8 = 0x86;
     pub const CTRL_PONG: u8 = 0x8C;
     pub const FRIEND_GROUPS_RESP: u8 = 0x8D;
+    /// Сервер → клиент, **открытым текстом**, пустое тело: «сессии с этого
+    /// адреса нет» (сервер перезапущен или сессия истекла). Клиент сразу
+    /// шлёт HELLO, не дожидаясь таймаута. Старые клиенты фрейм игнорируют.
+    pub const RESET: u8 = 0x8E;
 }
 
 /// Типы фреймов внутри группы.
@@ -65,9 +69,10 @@ pub mod grp {
     pub const PING: u8 = 0x22;
     /// Ответ: payload = та же метка.
     pub const PONG: u8 = 0x23;
-    /// Пробивание NAT: без payload.
+    /// Пробивание NAT: без payload. Ответ на PUNCH — KEEPALIVE, **не** PUNCH:
+    /// иначе два клиента бесконечно отражают PUNCH друг другу.
     pub const PUNCH: u8 = 0x24;
-    /// Поддержание NAT-маппинга и liveness: без payload.
+    /// Поддержание NAT-маппинга и liveness: без payload. На него не отвечают.
     pub const KEEPALIVE: u8 = 0x25;
 }
 
@@ -170,16 +175,49 @@ pub fn friend_code_of(pubkey: &[u8; 32]) -> String {
     out
 }
 
+/// Длина friend code без префикса и разделителей (256 бит / 5 бит, вверх).
+pub const FRIEND_CODE_CHARS: usize = 52;
+
+/// Нормализация символа friend code: Crockford-алиасы (O→0, I/L→1) и
+/// кириллические двойники латиницы (набор или копирование в русской
+/// раскладке). Проверка алфавита — дальше.
+fn normalize_code_char(c: char) -> char {
+    match c {
+        'А' | 'а' => 'A',
+        'В' | 'в' => 'B',
+        'Е' | 'е' => 'E',
+        'К' | 'к' => 'K',
+        'М' | 'м' => 'M',
+        'Н' | 'н' => 'H',
+        'О' | 'о' => '0',
+        'Р' | 'р' => 'P',
+        'С' | 'с' => 'C',
+        'Т' | 'т' => 'T',
+        'Х' | 'х' => 'X',
+        _ => match c.to_ascii_uppercase() {
+            'O' => '0',
+            'I' | 'L' => '1',
+            other => other,
+        },
+    }
+}
+
+/// Разбор friend code. Терпим к тому, что приходит из буфера обмена и
+/// мессенджеров: регистр, пробелы, переводы строк, дефисы и любые другие
+/// разделители (в т.ч. рамка TUI `│`), отсутствие префикса `TUN-`.
 pub fn parse_friend_code(code: &str) -> Result<[u8; 32]> {
     let cleaned: String = code
-        .to_ascii_uppercase()
         .chars()
-        .filter(|c| *c != '-' && *c != ' ')
+        .map(normalize_code_char)
+        .filter(|c| c.is_ascii_alphanumeric())
         .collect();
-    let body = cleaned
-        .strip_prefix("TUN")
-        .ok_or_else(|| anyhow::anyhow!("friend code должен начинаться с TUN"))?;
-    ensure!(body.len() == 52, "friend code неверной длины");
+    // В алфавите Crockford нет «U», поэтому «TUN» в начале — всегда префикс.
+    let body = cleaned.strip_prefix("TUN").unwrap_or(&cleaned);
+    ensure!(
+        body.len() == FRIEND_CODE_CHARS,
+        "friend code: нужно {FRIEND_CODE_CHARS} символов после TUN-, получено {} — код скопирован не целиком?",
+        body.len()
+    );
     let mut acc: u64 = 0;
     let mut nbits = 0;
     let mut out = [0u8; 32];
@@ -191,7 +229,7 @@ pub fn parse_friend_code(code: &str) -> Result<[u8; 32]> {
             .ok_or_else(|| anyhow::anyhow!("неверный символ {c:?} в friend code"))? as u64;
         acc = (acc << 5) | v;
         nbits += 5;
-        if nbits >= 8 {
+        if nbits >= 8 && oi < 32 {
             nbits -= 8;
             out[oi] = (acc >> nbits) as u8;
             oi += 1;
@@ -322,11 +360,25 @@ pub fn open_group(key: &SymKey, datagram: &[u8]) -> Result<(u8, u32, u32, u32, V
 
 // ---------- кодирование payload'ов (общие хелперы) ----------
 
+/// Строка с префиксом длины (1 байт). Длиннее 255 байт — обрезается по
+/// границе символа (раньше был assert, и длинное имя/статус кириллицей
+/// — 2 байта на букву — роняло поток движка).
 pub fn put_str(buf: &mut Vec<u8>, s: &str) {
-    let b = s.as_bytes();
-    assert!(b.len() < 256, "string too long");
-    buf.push(b.len() as u8);
-    buf.extend_from_slice(b);
+    let s = truncate_bytes(s, 255);
+    buf.push(s.len() as u8);
+    buf.extend_from_slice(s.as_bytes());
+}
+
+/// Префикс строки не длиннее `max` байт, не разрезая UTF-8 символ.
+pub fn truncate_bytes(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 pub fn put_pub(buf: &mut Vec<u8>, p: &[u8; 32]) {
@@ -427,6 +479,55 @@ mod tests {
         assert!(Identity::verify(&b.ed_pub(), msg, &sig).is_err());
         // Симметричный общий ключ: обе стороны выводят одно и то же.
         assert_eq!(a.ctrl_key_with(&b.x_pub()), b.ctrl_key_with(&a.x_pub()));
+    }
+
+    #[test]
+    fn friend_code_терпим_к_копированию() {
+        let a = Identity::generate();
+        let pk = a.ed_pub();
+        let code = a.friend_code();
+        assert_eq!(code.len(), 4 + FRIEND_CODE_CHARS + 6, "TUN- + 52 символа + 6 дефисов");
+        // Перевод строки и пробелы из буфера обмена, нижний регистр.
+        assert_eq!(parse_friend_code(&format!("  {code}\r\n")).unwrap(), pk);
+        assert_eq!(parse_friend_code(&code.to_lowercase()).unwrap(), pk);
+        // Без префикса и без дефисов.
+        let bare: String = code[4..].chars().filter(|c| *c != '-').collect();
+        assert_eq!(parse_friend_code(&bare).unwrap(), pk);
+        // Рамка TUI и перенос посередине.
+        let (l, r) = code.split_at(30);
+        assert_eq!(parse_friend_code(&format!("│{l}\n{r}│")).unwrap(), pk);
+        // Кириллические двойники латиницы в теле кода.
+        let cyr: String = code
+            .chars()
+            .enumerate()
+            .map(|(i, c)| match c {
+                'A' if i > 3 => 'А',
+                'B' if i > 3 => 'В',
+                'E' if i > 3 => 'Е',
+                'K' if i > 3 => 'К',
+                'M' if i > 3 => 'М',
+                'H' if i > 3 => 'Н',
+                'P' if i > 3 => 'Р',
+                'C' if i > 3 => 'С',
+                'T' if i > 3 => 'Т',
+                'X' if i > 3 => 'Х',
+                other => other,
+            })
+            .collect();
+        assert_eq!(parse_friend_code(&cyr).unwrap(), pk);
+        // Обрезанный код — понятная ошибка с длиной.
+        let err = parse_friend_code(&code[..40]).unwrap_err().to_string();
+        assert!(err.contains("получено"), "{err}");
+    }
+
+    #[test]
+    fn длинная_строка_обрезается_а_не_паникует() {
+        let long = "ж".repeat(200); // 400 байт
+        let mut buf = Vec::new();
+        put_str(&mut buf, &long);
+        assert_eq!(buf[0] as usize, buf.len() - 1);
+        let mut r = Reader::new(&buf);
+        assert_eq!(r.str().unwrap(), "ж".repeat(127));
     }
 
     #[test]

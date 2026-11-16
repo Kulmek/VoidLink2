@@ -37,22 +37,33 @@ impl Store {
         Self { path: dir.join("server.json") }
     }
 
-    pub fn load(&self) -> Option<Persisted> {
-        let raw = std::fs::read(&self.path).ok()?;
-        match serde_json::from_slice(&raw) {
-            Ok(p) => Some(p),
-            Err(e) => {
-                eprintln!("[server] не удалось прочитать {}: {e}", self.path.display());
-                None
-            }
-        }
+    /// `Ok(None)` — файла нет (первый запуск). Битый файл — ошибка: раньше
+    /// сервер молча создавал новую identity и затирал файл, после чего все
+    /// клиенты (они пиннят ключ сервера) переставали подключаться.
+    pub fn load(&self) -> anyhow::Result<Option<Persisted>> {
+        let raw = match std::fs::read(&self.path) {
+            Ok(r) => r,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => anyhow::bail!("не прочитать {}: {e}", self.path.display()),
+        };
+        serde_json::from_slice(&raw).map(Some).map_err(|e| {
+            anyhow::anyhow!(
+                "{} повреждён ({e}); почини или убери файл (новая identity сервера = новый код для всех клиентов)",
+                self.path.display()
+            )
+        })
     }
 
     /// Атомарная запись: tmp + rename.
     pub fn save(&self, data: &Persisted) -> std::io::Result<()> {
         let tmp = self.path.with_extension("json.tmp");
         let json = serde_json::to_vec_pretty(data)?;
-        std::fs::write(&tmp, json)?;
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&json)?;
+            f.sync_all()?;
+        }
         std::fs::rename(&tmp, &self.path)?;
         Ok(())
     }
