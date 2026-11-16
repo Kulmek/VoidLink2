@@ -1,7 +1,7 @@
 //! Состояние TUI: фокус, списки, попапы, тосты, лог, обработка клавиш.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
@@ -16,6 +16,19 @@ use crate::store::{self, Config, StoredFriend, StoredServer};
 use crate::tui::theme::ThemeKind;
 
 pub const TOAST_TTL: Duration = Duration::from_secs(5);
+/// Окно приглашения первые мгновения не принимает «Принять»/«Отклонить»:
+/// оно появляется само, и Enter или клик, адресованные основному экрану,
+/// не должны случайно ответить за пользователя. Esc («Позже») — сразу.
+pub const INVITE_GUARD: Duration = Duration::from_millis(400);
+/// Сверка со списком сервера не снимает приглашение, пришедшее только что:
+/// список мог быть собран раньше него (другой поток сервера, перестановка
+/// UDP) — свежее приглашение было бы снято как «недействительное».
+pub const INVITE_SYNC_GRACE: Duration = Duration::from_secs(2);
+/// Отклонённое приглашение какое-то время не показывается снова: список,
+/// собранный сервером до нашего DECLINE (ответ на прошлый отказ, медленная
+/// связь или перестановка UDP), принёс бы его обратно свежим окном — а
+/// сверка из-за [`INVITE_SYNC_GRACE`] его бы не сняла.
+pub const INVITE_DECLINE_MEMORY: Duration = Duration::from_secs(5);
 pub const LOG_MAX: usize = 400;
 
 // ---------------------------------------------------------------- фокус
@@ -236,6 +249,27 @@ pub struct SettingsPopup {
     pub sel: usize,
 }
 
+/// Входящее приглашение в группу (окно «Принять / Отклонить / Позже»).
+#[derive(Clone, Debug)]
+pub struct InvitePopup {
+    pub gid: u32,
+    pub group_name: String,
+    pub from_name: String,
+    pub from_pubkey: [u8; 32],
+    pub received_at: Instant,
+    /// Когда окно показано (None — ещё в очереди); см. [`INVITE_GUARD`].
+    pub shown_at: Option<Instant>,
+}
+
+/// Ответ на приглашение.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InviteAnswer {
+    Accept,
+    Decline,
+    /// Закрыть без ответа: приглашение остаётся на сервере, вернуться — «o».
+    Later,
+}
+
 pub enum Popup {
     Help,
     Input(InputPopup),
@@ -245,6 +279,7 @@ pub enum Popup {
     ListPick(ListPickPopup),
     Settings(SettingsPopup),
     Profile,
+    Invite(InvitePopup),
 }
 
 // ---------------------------------------------------------------- мышь
@@ -276,10 +311,14 @@ pub struct Hits {
     pub friends: Cell<(Rect, usize)>,
     pub peers: Cell<(Rect, usize)>,
     pub log: Cell<Rect>,
+    /// Вкладки фокуса в статус-баре: клик = перейти в панель.
+    pub tabs: RefCell<Vec<(Rect, Focus)>>,
     /// Верхний попап: рамка, смещение списка, кнопки.
     pub popup: Cell<Rect>,
     pub popup_off: Cell<usize>,
     pub popup_buttons: RefCell<Vec<(Rect, KeyEvent)>>,
+    /// Тосты — поверх всего, в том числе кнопок попапа: клик по ним мимо.
+    pub toasts: Cell<Rect>,
 }
 
 /// Куда попал клик.
@@ -333,6 +372,11 @@ fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
 
+/// Окно приглашения появилось только что (см. [`INVITE_GUARD`]).
+fn invite_guarded(inv: &InvitePopup) -> bool {
+    inv.shown_at.is_some_and(|t| t.elapsed() < INVITE_GUARD)
+}
+
 // ---------------------------------------------------------------- приложение
 
 pub struct App {
@@ -376,6 +420,12 @@ pub struct App {
     pub quit: bool,
     /// Геометрия последнего кадра для мыши.
     pub hits: Hits,
+    /// Приглашения, ждущие показа (окно — по одному, когда стек попапов пуст).
+    pub invites: VecDeque<InvitePopup>,
+    /// Отложенные («Позже») приглашения: показать снова — «o» или `:invites`.
+    pub later_invites: Vec<InvitePopup>,
+    /// Только что отклонённые (gid, когда) — см. [`INVITE_DECLINE_MEMORY`].
+    pub declined: Vec<(u32, Instant)>,
 }
 
 impl App {
@@ -416,6 +466,9 @@ impl App {
             log_scroll: 0,
             quit: false,
             hits: Hits::default(),
+            invites: VecDeque::new(),
+            later_invites: Vec::new(),
+            declined: Vec::new(),
         }
     }
 
@@ -424,6 +477,7 @@ impl App {
     /// Забирает свежее состояние движка, события, чистит тосты.
     pub fn sync(&mut self, eng: &Engine) {
         self.drain_events(eng);
+        self.pump_invites();
 
         {
             let meta = eng.meta.lock().unwrap();
@@ -502,9 +556,11 @@ impl App {
 
         {
             let live = eng.groups.lock().unwrap();
+            // «В сети» — только если друг онлайн хотя бы в одной общей группе:
+            // офлайн-участник держит lease и остаётся в списке участников.
             let known: HashSet<[u8; 32]> = live
                 .values()
-                .flat_map(|g| g.members.values().map(|p| p.pubkey))
+                .flat_map(|g| g.members.values().filter(|p| p.online).map(|p| p.pubkey))
                 .collect();
             let cfg = eng.cfg.lock().unwrap();
             let mut friends: Vec<FriendView> = Vec::new();
@@ -600,6 +656,8 @@ impl App {
                     self.toast(MsgKind::Error, r);
                 }
                 E::GroupJoined { gid, name, my_ip } => {
+                    // Вошли (по приглашению или иначе) — окно больше не нужно.
+                    self.drop_invite(gid);
                     let msg = format!(
                         "вошли в группу {gid} «{name}» (мой IP {})",
                         proto::ip_str(my_ip)
@@ -613,6 +671,7 @@ impl App {
                     self.toast(MsgKind::Info, msg);
                 }
                 E::GroupDeleted { gid, name } => {
+                    self.drop_invite(gid);
                     let msg = format!("группа {gid} «{name}» удалена");
                     self.log(MsgKind::Warn, msg.clone());
                     self.toast(MsgKind::Warn, msg);
@@ -642,35 +701,48 @@ impl App {
                     self.log(MsgKind::Ok, msg.clone());
                     self.toast(MsgKind::Ok, msg);
                 }
-                E::Invite { gid, group_name, from_name } => {
-                    let msg = format!("приглашение в «{group_name}» ({gid}) от {from_name}");
+                E::Invite { gid, group_name, from_pubkey, from_name } => {
+                    // Уже в группе или в автовходе (движок войдёт сам) — окно
+                    // не показываем: сервер повторяет приглашения после HELLO.
+                    let skip = eng.groups.lock().unwrap().contains_key(&gid)
+                        || eng.cfg.lock().unwrap().autojoin.contains(&gid);
+                    let inv = InvitePopup {
+                        gid,
+                        group_name,
+                        from_name,
+                        from_pubkey,
+                        received_at: Instant::now(),
+                        shown_at: None,
+                    };
+                    self.on_invite(inv, skip);
+                }
+                E::InviteDeclined { gid, group_name, by_pubkey, by_name } => {
+                    let who = self.friend_alias(&by_pubkey).unwrap_or(by_name);
+                    let msg = format!("{who} отклонил приглашение в «{group_name}» ({gid})");
                     self.log(MsgKind::Warn, msg.clone());
                     self.toast(MsgKind::Warn, msg);
                 }
-                E::FriendGroups { pubkey, items } => {
-                    let alias = self
-                        .friends
-                        .iter()
-                        .find(|f| f.pubkey == pubkey)
-                        .map(|f| f.alias.clone())
-                        .unwrap_or_else(|| proto::hex_of(&pubkey));
-                    let mut updated = false;
-                    if let Some(Popup::FriendCard(card)) = self.stack.last_mut() {
-                        if card.pubkey == pubkey {
-                            card.groups = items.clone();
-                            card.loading = false;
-                            updated = true;
-                        }
-                    }
-                    if !updated {
-                        self.stack.push(Popup::FriendCard(FriendCardPopup {
-                            alias,
-                            pubkey,
-                            groups: items,
-                            loading: false,
-                        }));
+                E::InviteRevoked { gid } => {
+                    if self.has_invite(gid) {
+                        self.drop_invite(gid);
+                        let msg = format!("приглашение в группу {gid} отменено: группа удалена");
+                        self.log(MsgKind::Info, msg.clone());
+                        self.toast(MsgKind::Info, msg);
                     }
                 }
+                // Неполное окно движок дочитывает сам (LIST_INVITES).
+                E::InvitesSynced { gids, from, complete } => {
+                    for (gid, name) in self.sync_invites(&gids, from, complete) {
+                        // Вошли сами (JOIN тратит приглашение) — не тостить.
+                        if eng.groups.lock().unwrap().contains_key(&gid) {
+                            continue;
+                        }
+                        let msg = format!("приглашение в «{name}» ({gid}) больше недействительно");
+                        self.log(MsgKind::Info, msg.clone());
+                        self.toast(MsgKind::Info, msg);
+                    }
+                }
+                E::FriendGroups { pubkey, items } => self.on_friend_groups(pubkey, items),
                 E::Error(e) => {
                     self.log(MsgKind::Error, e.clone());
                     self.toast(MsgKind::Error, e);
@@ -680,6 +752,285 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Ответ сервера на FRIEND_GROUPS: заполнить открытую карточку друга
+    /// (или открыть новую).
+    pub fn on_friend_groups(&mut self, pubkey: [u8; 32], items: Vec<proto::payloads::FriendGroup>) {
+        let alias = self
+            .friends
+            .iter()
+            .find(|f| f.pubkey == pubkey)
+            .map(|f| f.alias.clone())
+            .unwrap_or_else(|| proto::hex_of(&pubkey));
+        let mut updated = false;
+        if let Some(Popup::FriendCard(card)) = self.stack.last_mut()
+            && card.pubkey == pubkey
+        {
+            card.groups = items.clone();
+            card.loading = false;
+            updated = true;
+        }
+        // Запоздавший ответ (карточку уже закрыли) поверх окна приглашения не
+        // кладём: после закрытия карточки окно вернулось бы без защиты от
+        // случайного нажатия.
+        let over_invite = matches!(self.stack.last(), Some(Popup::Invite(_)));
+        if !updated && !over_invite {
+            self.stack.push(Popup::FriendCard(FriendCardPopup {
+                alias,
+                pubkey,
+                groups: items,
+                loading: false,
+            }));
+        }
+    }
+
+    // ---------- приглашения ----------
+
+    /// Алиас друга по pubkey.
+    pub fn friend_alias(&self, pk: &[u8; 32]) -> Option<String> {
+        self.friends
+            .iter()
+            .find(|f| f.pubkey == *pk)
+            .map(|f| f.alias.clone())
+    }
+
+    /// Кто пригласил: алиас друга, иначе имя, которое прислал сервер.
+    pub fn invite_from_label(&self, inv: &InvitePopup) -> String {
+        match self.friend_alias(&inv.from_pubkey) {
+            Some(alias) if alias != inv.from_name && !inv.from_name.is_empty() => {
+                format!("{alias} ({})", inv.from_name)
+            }
+            Some(alias) => alias,
+            None => inv.from_name.clone(),
+        }
+    }
+
+    /// Есть ли приглашение в `gid` — на экране, в очереди или отложенное.
+    pub fn has_invite(&self, gid: u32) -> bool {
+        self.invites.iter().any(|i| i.gid == gid)
+            || self.later_invites.iter().any(|i| i.gid == gid)
+            || self
+                .stack
+                .iter()
+                .any(|p| matches!(p, Popup::Invite(i) if i.gid == gid))
+    }
+
+    /// Пришло приглашение. `skip` — уже в группе / автовход: только лог.
+    /// Повтор того же gid (сервер шлёт неотвеченные после каждого HELLO)
+    /// обновляет данные, но второго окна не открывает; отложенное остаётся
+    /// отложенным.
+    pub fn on_invite(&mut self, inv: InvitePopup, skip: bool) {
+        if self.recently_declined(inv.gid) {
+            // Запоздавший список, собранный до нашего отказа.
+            return;
+        }
+        let from = self.invite_from_label(&inv);
+        let msg = format!("приглашение в «{}» ({}) от {from}", inv.group_name, inv.gid);
+        if skip {
+            self.log(MsgKind::Info, msg);
+            return;
+        }
+        let gid = inv.gid;
+        let update = |x: &mut InvitePopup| {
+            x.group_name = inv.group_name.clone();
+            x.from_name = inv.from_name.clone();
+            x.from_pubkey = inv.from_pubkey;
+        };
+        let mut known = false;
+        for p in self.stack.iter_mut() {
+            if let Popup::Invite(x) = p
+                && x.gid == gid
+            {
+                update(x);
+                known = true;
+            }
+        }
+        for x in self.invites.iter_mut().chain(self.later_invites.iter_mut()) {
+            if x.gid == gid {
+                update(x);
+                known = true;
+            }
+        }
+        if known {
+            return;
+        }
+        self.log(MsgKind::Warn, msg.clone());
+        self.toast(MsgKind::Warn, msg);
+        self.invites.push_back(inv);
+        self.pump_invites();
+    }
+
+    /// Отказ отправлен — запомнить gid (см. [`INVITE_DECLINE_MEMORY`]).
+    pub fn note_declined(&mut self, gid: u32) {
+        self.declined.retain(|(g, t)| *g != gid && t.elapsed() < INVITE_DECLINE_MEMORY);
+        self.declined.push((gid, Instant::now()));
+    }
+
+    fn recently_declined(&self, gid: u32) -> bool {
+        self.declined
+            .iter()
+            .any(|(g, t)| *g == gid && t.elapsed() < INVITE_DECLINE_MEMORY)
+    }
+
+    /// Убрать приглашение в `gid` отовсюду (вошли в группу, группа удалена).
+    pub fn drop_invite(&mut self, gid: u32) {
+        self.invites.retain(|i| i.gid != gid);
+        self.later_invites.retain(|i| i.gid != gid);
+        self.stack
+            .retain(|p| !matches!(p, Popup::Invite(i) if i.gid == gid));
+        self.pump_invites();
+    }
+
+    /// Сервер прислал окно списка неотвеченных приглашений (gid ≥ `from`):
+    /// всё, чего в нём нет (группу удалили, приглашение отозвали или на него
+    /// ответили с другого клиента, пока мы были офлайн; вход отклонён), снять.
+    /// Окно достоверно от `from`; неполное (`complete == false`, обрезан
+    /// хвост) — только до последнего gid в нём. Пришедшие за
+    /// [`INVITE_SYNC_GRACE`] до сверки не трогаются. Возвращает снятые (gid,
+    /// имя группы).
+    pub fn sync_invites(&mut self, gids: &[u32], from: u32, complete: bool) -> Vec<(u32, String)> {
+        let upto = if complete {
+            u32::MAX
+        } else {
+            gids.iter().copied().max().unwrap_or(0)
+        };
+        let mut stale: Vec<(u32, String)> = Vec::new();
+        let held = self
+            .stack
+            .iter()
+            .filter_map(|p| match p {
+                Popup::Invite(i) => Some(i),
+                _ => None,
+            })
+            .chain(self.invites.iter())
+            .chain(self.later_invites.iter());
+        for i in held {
+            if (from..=upto).contains(&i.gid)
+                && !gids.contains(&i.gid)
+                && i.received_at.elapsed() >= INVITE_SYNC_GRACE
+                && !stale.iter().any(|(g, _)| *g == i.gid)
+            {
+                stale.push((i.gid, i.group_name.clone()));
+            }
+        }
+        for (gid, _) in &stale {
+            self.drop_invite(*gid);
+        }
+        stale
+    }
+
+    /// Показать следующее приглашение, если стек попапов пуст.
+    ///
+    /// Поверх другого окна приглашение не кладём: пользователь мог как раз
+    /// набирать имя группы или friend code, и его «y»/«n»/Enter ушли бы в
+    /// окно приглашения — приняли или отклонили бы его вслепую. Поэтому оно
+    /// ждёт в очереди (тост и строка лога видны сразу), а окна показываются
+    /// по одному, а не стопкой. То же — пока открыта строка поиска «/»:
+    /// это ввод текста без попапа.
+    pub fn pump_invites(&mut self) {
+        if !self.stack.is_empty() || self.filtering {
+            return;
+        }
+        if let Some(mut inv) = self.invites.pop_front() {
+            inv.shown_at = Some(Instant::now());
+            self.stack.push(Popup::Invite(inv));
+        }
+    }
+
+    /// Вернуть отложенные приглашения в очередь показа («o», `:invites`).
+    pub fn reopen_invites(&mut self) {
+        if self.later_invites.is_empty() && self.invites.is_empty() {
+            self.toast(MsgKind::Info, "нет неотвеченных приглашений".into());
+            return;
+        }
+        for inv in self.later_invites.drain(..).rev() {
+            self.invites.push_front(inv);
+        }
+        self.pump_invites();
+    }
+
+    /// Клавиша в окне приглашения. Возвращает команду движку (если есть).
+    /// Enter / y — принять, n — отклонить, Esc / l — позже (русская
+    /// раскладка: т — отклонить, д — позже). «н» на месте «y» не принимает:
+    /// по-русски она читается как «нет» ([Д/н]), а принять — самое
+    /// весомое действие (вход в VPN группы, IP виден участникам); на неё —
+    /// только подсказка. Прочие клавиши окно не закрывают.
+    pub fn invite_key(&mut self, inv: InvitePopup, key: KeyEvent) -> Option<Cmd> {
+        // Ctrl-C и прочие сочетания с Ctrl закрывают окно как «Позже» — ни
+        // одно сочетание не принимает и не отклоняет приглашение.
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            if key.code == KeyCode::Char('c') {
+                // Ctrl-C откладывает и всю очередь: иначе следующее окно
+                // всплывало бы сразу, и для выхода пришлось бы жать Ctrl-C
+                // по разу на каждое приглашение.
+                let queued: Vec<InvitePopup> = self.invites.drain(..).collect();
+                let cmd = self.answer_invite(inv, InviteAnswer::Later);
+                self.later_invites.extend(queued);
+                return cmd;
+            }
+            return self.answer_invite(inv, InviteAnswer::Later);
+        }
+        let ans = match key.code {
+            KeyCode::Enter | KeyCode::Char('y' | 'Y') => InviteAnswer::Accept,
+            KeyCode::Char('n' | 'N' | 'т' | 'Т') => InviteAnswer::Decline,
+            KeyCode::Esc | KeyCode::Char('l' | 'L' | 'д' | 'Д') => InviteAnswer::Later,
+            KeyCode::Char('н' | 'Н') => {
+                self.status_msg =
+                    "«н» не отвечает: принять — Enter/y, отклонить — n (т), позже — Esc".into();
+                self.stack.push(Popup::Invite(inv));
+                return None;
+            }
+            _ => {
+                self.stack.push(Popup::Invite(inv));
+                return None;
+            }
+        };
+        self.answer_invite(inv, ans)
+    }
+
+    /// Ответ на приглашение (окно уже снято со стека).
+    pub fn answer_invite(&mut self, inv: InvitePopup, ans: InviteAnswer) -> Option<Cmd> {
+        if ans != InviteAnswer::Later && invite_guarded(&inv) {
+            // Окно только что появилось — нажатие было не ему.
+            self.stack.push(Popup::Invite(inv));
+            return None;
+        }
+        let (gid, name) = (inv.gid, inv.group_name.clone());
+        let cmd = match ans {
+            InviteAnswer::Later => {
+                self.later_invites.push(inv);
+                self.status_msg = "приглашение отложено — «o», чтобы ответить".into();
+                None
+            }
+            _ if !self.connected => {
+                // Команда не дойдёт до сервера — не терять приглашение.
+                self.later_invites.push(inv);
+                self.toast(
+                    MsgKind::Error,
+                    "нет связи с сервером — ответ не отправлен, приглашение отложено".into(),
+                );
+                None
+            }
+            InviteAnswer::Accept => {
+                // Снимется по GroupJoined. JOIN может не пройти: «группа
+                // заполнена» — сервер приглашение сохраняет, к нему можно
+                // вернуться через «o»; группы нет или приглашение отозвано —
+                // сервер вместе с ошибкой шлёт свежий список, сверка снимет.
+                self.later_invites.push(inv);
+                self.toast(MsgKind::Info, format!("входим в группу {gid} «{name}»"));
+                Some(Cmd::Join(gid))
+            }
+            InviteAnswer::Decline => {
+                self.note_declined(gid);
+                let msg = format!("приглашение в «{name}» ({gid}) отклонено");
+                self.log(MsgKind::Info, msg.clone());
+                self.toast(MsgKind::Info, msg);
+                Some(Cmd::DeclineInvite(gid))
+            }
+        };
+        self.pump_invites();
+        cmd
     }
 
     pub fn expire_toasts(&mut self) {
@@ -799,6 +1150,7 @@ impl App {
             KeyCode::Char('d') => self.open_del_friend(),
             KeyCode::Char('c') => self.copy_context(),
             KeyCode::Char('p') => self.stack.push(Popup::Profile),
+            KeyCode::Char('o') => self.reopen_invites(),
             KeyCode::Char('s') => {
                 self.sort = self.sort.next();
                 self.status_msg = format!("сортировка: {}", self.sort.label());
@@ -897,6 +1249,11 @@ impl App {
     /// Что находится в клетке (x, y) последнего кадра.
     pub fn hit(&self, x: u16, y: u16) -> Hit {
         let h = &self.hits;
+        // Тост закрывает то, что под ним (например, «Отклонить» в окне
+        // приглашения): невидимая кнопка не должна нажиматься.
+        if inside(h.toasts.get(), x, y) {
+            return Hit::Nothing;
+        }
         if let Some(top) = self.stack.last() {
             for (r, k) in h.popup_buttons.borrow().iter() {
                 if inside(*r, x, y) {
@@ -921,6 +1278,11 @@ impl App {
         for (r, k) in h.toolbar.borrow().iter() {
             if inside(*r, x, y) {
                 return Hit::Key(*k);
+            }
+        }
+        for (r, f) in h.tabs.borrow().iter() {
+            if inside(*r, x, y) {
+                return Hit::Panel(*f);
             }
         }
         let (r, off) = h.groups.get();
@@ -967,7 +1329,17 @@ impl App {
                 }
                 self.handle_key(k, eng);
             }
-            Hit::PopupOutside => self.handle_key(key(KeyCode::Esc), eng),
+            Hit::PopupOutside => {
+                // Мимо окна приглашения — «Позже» (никогда не «Отклонить»), а
+                // в первые мгновения после появления окна — ничего: клик
+                // предназначался основному экрану.
+                if let Some(Popup::Invite(inv)) = self.stack.last()
+                    && invite_guarded(inv)
+                {
+                    return;
+                }
+                self.handle_key(key(KeyCode::Esc), eng)
+            }
             Hit::PopupItem(i) => {
                 if self.click_popup_item(i) {
                     self.handle_key(key(KeyCode::Enter), eng);
@@ -1255,7 +1627,14 @@ impl App {
                     self.stack.push(Popup::Profile);
                 }
             }
+            Popup::Invite(inv) => {
+                if let Some(cmd) = self.invite_key(inv, key) {
+                    let _ = eng.cmds.send(cmd);
+                }
+            }
         }
+        // Закрыли окно — следующее приглашение из очереди.
+        self.pump_invites();
     }
 
     fn input_key(&mut self, mut inp: InputPopup, key: KeyEvent, eng: &Engine) {
@@ -1682,6 +2061,15 @@ impl App {
             Command::Join(gid) => {
                 let _ = eng.cmds.send(Cmd::Join(gid));
             }
+            Command::Decline(gid) => {
+                if !self.connected {
+                    return Err(anyhow!("нет связи с сервером — отказ не отправлен"));
+                }
+                let _ = eng.cmds.send(Cmd::DeclineInvite(gid));
+                self.note_declined(gid);
+                self.drop_invite(gid);
+            }
+            Command::Invites => self.reopen_invites(),
             Command::Leave(gid) => {
                 let _ = eng.cmds.send(Cmd::Leave(gid));
             }
@@ -1770,6 +2158,10 @@ impl App {
 pub enum Command {
     Help,
     Join(u32),
+    /// Отклонить приглашение.
+    Decline(u32),
+    /// Показать отложенные приглашения.
+    Invites,
     Leave(u32),
     Create { name: String, private: bool },
     Rename(u32, String),
@@ -1801,6 +2193,8 @@ pub fn parse_command(line: &str) -> Result<Command> {
         "" => Command::Help,
         "help" | "?" => Command::Help,
         "join" => Command::Join(gid_of(0)?),
+        "decline" => Command::Decline(gid_of(0)?),
+        "invites" => Command::Invites,
         "leave" => Command::Leave(gid_of(0)?),
         "create" => {
             let private = rest.iter().any(|a| *a == "--private");
@@ -2039,5 +2433,368 @@ mod tests {
         assert_eq!(step(0, 7, -1000, false), 0);
         assert_eq!(step(3, 7, 1000, false), 6);
         assert_eq!(step(0, 0, 1, false), 0);
+    }
+
+    // ---------- приглашения ----------
+
+    fn inv(gid: u32) -> InvitePopup {
+        InvitePopup {
+            gid,
+            group_name: format!("g{gid}"),
+            from_name: "bravo-srv".into(),
+            from_pubkey: [2; 32],
+            // Пришло давно: сверка со списком сервера его не щадит.
+            received_at: Instant::now()
+                .checked_sub(INVITE_SYNC_GRACE * 2)
+                .unwrap_or_else(Instant::now),
+            shown_at: None,
+        }
+    }
+
+    /// Онлайн-приложение с выключенной защитой от случайного нажатия.
+    fn online() -> App {
+        let mut a = app();
+        a.connected = true;
+        a
+    }
+
+    fn shown_gid(a: &App) -> Option<u32> {
+        match a.stack.last() {
+            Some(Popup::Invite(i)) => Some(i.gid),
+            _ => None,
+        }
+    }
+
+    /// Нажатие в окне приглашения — как `handle_popup_key`, без движка.
+    /// Защита первых мгновений снимается (её проверяет отдельный тест).
+    fn press(a: &mut App, code: KeyCode) -> Option<Cmd> {
+        let Some(Popup::Invite(mut i)) = a.stack.pop() else {
+            panic!("нет окна приглашения");
+        };
+        i.shown_at = None;
+        let cmd = a.invite_key(i, key(code));
+        a.pump_invites();
+        cmd
+    }
+
+    #[test]
+    fn приглашение_открывает_окно_принять_шлёт_join() {
+        let mut a = online();
+        a.on_invite(inv(5), false);
+        assert_eq!(shown_gid(&a), Some(5));
+        assert!(a.toasts.iter().any(|t| t.text.contains("g5")), "тост остаётся");
+        assert!(a.log.iter().any(|l| l.text.contains("g5")), "строка лога остаётся");
+        // Посторонняя клавиша окно не закрывает и ничего не шлёт.
+        assert!(press(&mut a, KeyCode::Char('z')).is_none());
+        assert_eq!(shown_gid(&a), Some(5));
+        assert!(matches!(press(&mut a, KeyCode::Enter), Some(Cmd::Join(5))));
+        assert!(a.stack.is_empty());
+        // До GroupJoined приглашение хранится: JOIN может не пройти
+        // («группа заполнена»), к нему можно вернуться через «o».
+        assert!(a.has_invite(5));
+        a.reopen_invites();
+        assert_eq!(shown_gid(&a), Some(5));
+        a.drop_invite(5); // GroupJoined
+        assert!(a.stack.is_empty() && !a.has_invite(5));
+
+        a.on_invite(inv(6), false);
+        assert!(matches!(press(&mut a, KeyCode::Char('y')), Some(Cmd::Join(6))));
+        // Русская раскладка: «н» на месте «y», но читается как «нет» —
+        // не принимает (и не отклоняет), окно остаётся, видна подсказка.
+        a.on_invite(inv(7), false);
+        assert!(press(&mut a, KeyCode::Char('н')).is_none());
+        assert!(press(&mut a, KeyCode::Char('Н')).is_none());
+        assert_eq!(shown_gid(&a), Some(7));
+        assert!(a.status_msg.contains("Enter/y"));
+        assert!(matches!(press(&mut a, KeyCode::Enter), Some(Cmd::Join(7))));
+    }
+
+    #[test]
+    fn приглашение_отклонить_шлёт_decline() {
+        let mut a = online();
+        a.on_invite(inv(3), false);
+        assert!(matches!(press(&mut a, KeyCode::Char('n')), Some(Cmd::DeclineInvite(3))));
+        assert!(a.stack.is_empty() && !a.has_invite(3));
+        a.on_invite(inv(4), false);
+        assert!(matches!(press(&mut a, KeyCode::Char('т')), Some(Cmd::DeclineInvite(4))));
+    }
+
+    #[test]
+    fn приглашение_esc_откладывает_ничего_не_шлёт() {
+        let mut a = online();
+        a.on_invite(inv(8), false);
+        assert!(press(&mut a, KeyCode::Esc).is_none());
+        assert!(a.stack.is_empty());
+        assert_eq!(a.later_invites.len(), 1, "приглашение не потеряно");
+        // Повторная доставка (после HELLO) отложенное не открывает.
+        a.on_invite(inv(8), false);
+        assert!(a.stack.is_empty());
+        assert_eq!(a.later_invites.len(), 1);
+        // «o» — вернуться к отложенным.
+        a.reopen_invites();
+        assert_eq!(shown_gid(&a), Some(8));
+        assert!(a.later_invites.is_empty());
+        assert!(matches!(press(&mut a, KeyCode::Enter), Some(Cmd::Join(8))));
+    }
+
+    #[test]
+    fn приглашения_в_очереди_по_одному_без_дубликатов() {
+        let mut a = online();
+        a.on_invite(inv(1), false);
+        a.on_invite(inv(2), false);
+        a.on_invite(inv(1), false);
+        a.on_invite(inv(2), false);
+        assert_eq!(a.stack.len(), 1, "окна не складываются стопкой");
+        assert_eq!(shown_gid(&a), Some(1));
+        assert_eq!(a.invites.len(), 1);
+        // Дубликат обновляет данные, но не добавляет окно.
+        let mut renamed = inv(2);
+        renamed.group_name = "новое имя".into();
+        a.on_invite(renamed, false);
+        assert_eq!(a.invites.len(), 1);
+        assert_eq!(a.invites[0].group_name, "новое имя");
+        // Ответ на первое — сразу показывается второе.
+        assert!(matches!(press(&mut a, KeyCode::Char('n')), Some(Cmd::DeclineInvite(1))));
+        assert_eq!(shown_gid(&a), Some(2));
+        assert!(matches!(press(&mut a, KeyCode::Enter), Some(Cmd::Join(2))));
+        assert!(a.stack.is_empty() && a.invites.is_empty());
+    }
+
+    #[test]
+    fn приглашение_не_перекрывает_открытое_окно() {
+        let mut a = online();
+        a.open_create_group();
+        a.on_invite(inv(9), false);
+        assert!(matches!(a.stack.last(), Some(Popup::Input(_))), "ввод пользователя не тронут");
+        assert_eq!(a.stack.len(), 1);
+        assert_eq!(a.invites.len(), 1);
+        // Окно ввода закрыли — приглашение показывается.
+        a.stack.pop();
+        a.pump_invites();
+        assert_eq!(shown_gid(&a), Some(9));
+    }
+
+    #[test]
+    fn приглашение_не_всплывает_в_строке_поиска() {
+        let mut a = online();
+        a.filtering = true;
+        a.on_invite(inv(9), false);
+        assert!(a.stack.is_empty(), "буквы фильтра ушли бы в окно приглашения");
+        assert_eq!(a.invites.len(), 1);
+        a.pump_invites();
+        assert!(a.stack.is_empty());
+        // Поиск закрыт — приглашение показывается.
+        a.filtering = false;
+        a.pump_invites();
+        assert_eq!(shown_gid(&a), Some(9));
+    }
+
+    #[test]
+    fn ctrl_c_откладывает_всю_очередь_приглашений() {
+        let mut a = online();
+        for g in [1, 2, 3] {
+            a.on_invite(inv(g), false);
+        }
+        let Some(Popup::Invite(i)) = a.stack.pop() else { panic!() };
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(a.invite_key(i, ctrl_c).is_none());
+        a.pump_invites();
+        assert!(a.stack.is_empty(), "следующий Ctrl-C должен выйти, а не открыть окно");
+        assert!(a.invites.is_empty());
+        let later: Vec<u32> = a.later_invites.iter().map(|i| i.gid).collect();
+        assert_eq!(later, vec![1, 2, 3], "ничего не потеряно, порядок тот же");
+    }
+
+    #[test]
+    fn полный_список_с_сервера_снимает_устаревшие_приглашения() {
+        let mut a = online();
+        for g in [1, 2, 3] {
+            a.on_invite(inv(g), false);
+        }
+        let _ = press(&mut a, KeyCode::Esc); // 1 отложено, на экране 2, в очереди 3
+        // Пока были офлайн, группу 1 удалили, а 2 отозвали.
+        let gone = a.sync_invites(&[3], 0, true);
+        assert_eq!(gone, vec![(2, "g2".to_string()), (1, "g1".to_string())]);
+        assert_eq!(shown_gid(&a), Some(3));
+        assert!(!a.has_invite(1) && !a.has_invite(2) && a.later_invites.is_empty());
+        assert!(a.sync_invites(&[3], 0, true).is_empty());
+    }
+
+    #[test]
+    fn неполный_список_снимает_устаревшие_только_до_последнего_gid() {
+        let mut a = online();
+        for g in [1, 2, 3, 20, 30] {
+            a.on_invite(inv(g), false);
+        }
+        // Сервер обрезал список после gid 3 (больше 16 приглашений): 2
+        // отозвано, а про 20 и 30 список ничего не говорит.
+        let gone = a.sync_invites(&[1, 3], 0, false);
+        assert_eq!(gone, vec![(2, "g2".to_string())]);
+        assert!(a.has_invite(1) && a.has_invite(3) && a.has_invite(20) && a.has_invite(30));
+        // Пустой неполный список ничего не снимает.
+        assert!(a.sync_invites(&[], 0, false).is_empty());
+        // Полный — снимает и хвост.
+        let gone = a.sync_invites(&[1, 3, 30], 0, true);
+        assert_eq!(gone, vec![(20, "g20".to_string())]);
+    }
+
+    #[test]
+    fn окно_списка_снимает_устаревшие_только_в_своих_границах() {
+        let mut a = online();
+        for g in [1, 2, 17, 18, 25, 40] {
+            a.on_invite(inv(g), false);
+        }
+        // Следующее окно (gid ≥ 17, неполное, до 25): 18 отозвано, а про 1,
+        // 2 и 40 окно ничего не говорит.
+        let gone = a.sync_invites(&[17, 25], 17, false);
+        assert_eq!(gone, vec![(18, "g18".to_string())]);
+        assert!(a.has_invite(1) && a.has_invite(2) && a.has_invite(40));
+        // Полное окно с 17 снимает хвост, но не начало.
+        let gone = a.sync_invites(&[17, 25], 17, true);
+        assert_eq!(gone, vec![(40, "g40".to_string())]);
+        assert!(a.has_invite(1) && a.has_invite(2));
+    }
+
+    #[test]
+    fn запоздавший_список_не_возвращает_отклонённое_приглашение() {
+        let mut a = online();
+        a.on_invite(inv(1), false);
+        a.on_invite(inv(2), false);
+        // Отклонили 1, затем 2 (защиту от промаха press() снимает).
+        assert!(matches!(press(&mut a, KeyCode::Char('n')), Some(Cmd::DeclineInvite(1))));
+        assert!(matches!(press(&mut a, KeyCode::Char('n')), Some(Cmd::DeclineInvite(2))));
+        assert!(!a.has_invite(2));
+        // Ответ на отказ от 1 пришёл поздно — собран до отказа от 2: [2].
+        let mut stale = inv(2);
+        stale.received_at = Instant::now();
+        a.on_invite(stale, false);
+        assert!(!a.has_invite(2) && a.stack.is_empty(), "отклонённое снова на экране");
+        assert!(a.sync_invites(&[2], 0, true).is_empty());
+        // То же для `:decline`-пути — через note_declined.
+        a.on_invite(inv(3), false);
+        a.note_declined(3);
+        a.drop_invite(3);
+        a.on_invite(inv(3), false);
+        assert!(!a.has_invite(3));
+        // Спустя INVITE_DECLINE_MEMORY повторное приглашение снова видно.
+        for d in a.declined.iter_mut() {
+            d.1 = Instant::now()
+                .checked_sub(INVITE_DECLINE_MEMORY * 2)
+                .unwrap_or_else(Instant::now);
+        }
+        a.on_invite(inv(2), false);
+        assert!(a.has_invite(2));
+    }
+
+    #[test]
+    fn список_после_отклонённого_входа_снимает_принятое_приглашение() {
+        let mut a = online();
+        a.on_invite(inv(7), false);
+        assert!(matches!(press(&mut a, KeyCode::Enter), Some(Cmd::Join(7))));
+        assert!(a.has_invite(7), "держится до GroupJoined");
+        // JOIN отклонён (приглашение отозвано) — сервер прислал список без 7.
+        let gone = a.sync_invites(&[], 0, true);
+        assert_eq!(gone, vec![(7, "g7".to_string())]);
+        assert!(!a.has_invite(7) && a.later_invites.is_empty());
+    }
+
+    #[test]
+    fn сверка_не_снимает_только_что_пришедшее_приглашение() {
+        let mut a = online();
+        a.on_invite(inv(1), false);
+        let mut fresh = inv(2);
+        fresh.received_at = Instant::now();
+        a.on_invite(fresh, false);
+        // Список собран сервером до приглашения 2 и пришёл после него.
+        let gone = a.sync_invites(&[], 0, true);
+        assert_eq!(gone, vec![(1, "g1".to_string())]);
+        assert!(a.has_invite(2), "свежее приглашение не снято устаревшим списком");
+    }
+
+    #[test]
+    fn запоздавшая_карточка_друга_не_ложится_на_приглашение() {
+        let mut a = online();
+        a.on_invite(inv(4), false);
+        a.on_friend_groups([7; 32], vec![]);
+        assert_eq!(a.stack.len(), 1);
+        assert_eq!(shown_gid(&a), Some(4));
+        // Без окна приглашения ответ открывает карточку, как раньше.
+        a.stack.clear();
+        a.on_friend_groups([7; 32], vec![]);
+        assert!(matches!(a.stack.last(), Some(Popup::FriendCard(_))));
+    }
+
+    #[test]
+    fn приглашение_защита_от_случайного_нажатия() {
+        let mut a = online();
+        a.on_invite(inv(4), false);
+        // Окно только что появилось: Enter и «n» не отвечают.
+        let Some(Popup::Invite(i)) = a.stack.pop() else { panic!() };
+        assert!(i.shown_at.is_some());
+        assert!(a.invite_key(i, key(KeyCode::Enter)).is_none());
+        assert_eq!(shown_gid(&a), Some(4));
+        let Some(Popup::Invite(i)) = a.stack.pop() else { panic!() };
+        assert!(a.invite_key(i, key(KeyCode::Char('n'))).is_none());
+        assert_eq!(shown_gid(&a), Some(4));
+        // Esc («Позже») — сразу; приглашение не отклонено.
+        let Some(Popup::Invite(i)) = a.stack.pop() else { panic!() };
+        assert!(a.invite_key(i, key(KeyCode::Esc)).is_none());
+        assert!(a.stack.is_empty());
+        assert!(a.has_invite(4));
+        // Ctrl-«n» / Ctrl-C — тоже только «Позже».
+        a.reopen_invites();
+        let Some(Popup::Invite(mut i)) = a.stack.pop() else { panic!() };
+        i.shown_at = None;
+        let ctrl_n = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL);
+        assert!(a.invite_key(i, ctrl_n).is_none());
+        assert!(a.stack.is_empty() && a.has_invite(4));
+    }
+
+    #[test]
+    fn приглашение_снимается_при_входе_и_удалении() {
+        let mut a = online();
+        a.on_invite(inv(1), false);
+        a.on_invite(inv(2), false);
+        a.on_invite(inv(3), false);
+        let _ = press(&mut a, KeyCode::Esc); // 1 отложено, на экране 2
+        assert_eq!(shown_gid(&a), Some(2));
+        a.drop_invite(2); // вошли в 2 другим путём — окно закрыто, следующее
+        assert_eq!(shown_gid(&a), Some(3));
+        a.drop_invite(1); // отложенное тоже убирается
+        a.drop_invite(3);
+        assert!(a.stack.is_empty() && a.invites.is_empty() && a.later_invites.is_empty());
+    }
+
+    #[test]
+    fn приглашение_без_связи_и_уже_в_группе() {
+        let mut a = app(); // не подключено
+        a.on_invite(inv(5), false);
+        assert!(press(&mut a, KeyCode::Enter).is_none(), "без связи команда не уйдёт");
+        assert!(a.has_invite(5), "приглашение отложено, не потеряно");
+        // Уже участник / автовход — окна нет, только лог.
+        let mut a = online();
+        a.on_invite(inv(6), true);
+        assert!(a.stack.is_empty() && !a.has_invite(6));
+        assert!(a.log.iter().any(|l| l.text.contains("g6")));
+    }
+
+    #[test]
+    fn приглашение_от_друга_показывает_алиас() {
+        let mut a = online();
+        assert_eq!(a.invite_from_label(&inv(1)), "bravo-srv");
+        a.friends = vec![FriendView {
+            alias: "Боря".into(),
+            pubkey: [2; 32],
+            online: true,
+            shared_groups: 0,
+        }];
+        assert_eq!(a.invite_from_label(&inv(1)), "Боря (bravo-srv)");
+    }
+
+    #[test]
+    fn парс_команд_приглашений() {
+        assert_eq!(parse_command("decline 4").unwrap(), Command::Decline(4));
+        assert_eq!(parse_command("invites").unwrap(), Command::Invites);
+        assert!(parse_command("decline").is_err());
     }
 }

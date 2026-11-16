@@ -13,7 +13,7 @@ use std::time::Duration;
 use anyhow::Result;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use tunnel_protocol as proto;
 
 use super::theme::{Theme, ThemeKind};
@@ -271,6 +271,8 @@ fn handle_key(key: ratatui::crossterm::event::KeyEvent, form: &mut Form, has_ser
 }
 
 fn draw(f: &mut Frame, form: &Form, errs: &[String], th: &Theme, my_code: &str) {
+    // Фон — цветом темы, как и в основном экране.
+    f.render_widget(Block::default().style(th.frame()), f.area());
     let area = centered(f.area(), 72, 15 + errs.len() as u16);
     f.render_widget(Clear, area);
 
@@ -318,8 +320,10 @@ fn draw(f: &mut Frame, form: &Form, errs: &[String], th: &Theme, my_code: &str) 
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(th.accent)
-        .title(" Первичная настройка Tunnel ")
+        .border_type(BorderType::Rounded)
+        .border_style(th.focused_border)
+        .style(th.surface())
+        .title(Span::styled(" ◆ Первичная настройка Tunnel ", th.title))
         .title_bottom(Line::from(Span::styled(
             format!(" твой friend code: {my_code} "),
             th.dim,
