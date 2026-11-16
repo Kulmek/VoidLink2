@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use rand::RngCore;
+use rand::Rng;
 use tunnel_protocol as proto;
 use proto::ctrl;
 use proto::payloads::{GroupState, GroupSummary, MemberInfo};
@@ -504,7 +504,7 @@ fn handle_ctrl(
             let gid = s.next_gid.max(GID_MIN);
             s.next_gid = gid + 1;
             let mut key = [0u8; 32];
-            rand::thread_rng().fill_bytes(&mut key);
+            rand::rng().fill_bytes(&mut key);
             let mut members = HashMap::new();
             let owner_name = s.sessions.get(&src).unwrap().name.clone();
             members.insert(ed_pub, Member { ip: gid_subnet_base(gid) + HOST_MIN, name: owner_name.clone(), status: String::new() });
