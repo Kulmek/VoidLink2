@@ -441,7 +441,6 @@ fn handle_hello(
             m.name = name.clone();
         }
     }
-    let ses = s.sessions.get(&src).unwrap();
     // WELCOME — открытым текстом: x_pub сервера + подпись ed25519 (клиент
     // pinned ed-ключ сервера → подмена невозможна). Остальные фреймы — шифром.
     let x_pub = s.identity.x_pub();
@@ -472,10 +471,7 @@ fn handle_ctrl(
     let Some(ses) = s.sessions.get(&src) else { return Ok(()) };
     let ctrl_key = ses.ctrl_key;
     let ed_pub = ses.ed_pub;
-    let payload = match proto::open_ctrl(&ctrl_key, typ, body) {
-        Ok(p) => p,
-        Err(e) => return Err(e),
-    };
+    let payload = proto::open_ctrl(&ctrl_key, typ, body)?;
     match typ {
         ctrl::CTRL_PING => {
             s.sessions.get_mut(&src).unwrap().last_seen = Instant::now();
@@ -596,11 +592,11 @@ fn handle_ctrl(
             let gname = g.name.clone();
             s.dirty = true;
             eprintln!("[server] {msg} {gid}: {}", hex(&target));
-            if kicked {
-                if let Some((a, ses)) = s.sessions.iter().find(|(_, ses)| ses.ed_pub == target) {
-                    let (a, key) = (*a, ses.ctrl_key);
-                    send_error(sock, a, &key, &format!("вас {msg} группу \"{gname}\""));
-                }
+            if kicked
+                && let Some((a, ses)) = s.sessions.iter().find(|(_, ses)| ses.ed_pub == target)
+            {
+                let (a, key) = (*a, ses.ctrl_key);
+                send_error(sock, a, &key, &format!("вас {msg} группу \"{gname}\""));
             }
             broadcast_group(sock, &s, gid);
         }

@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [ "master" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Юнит-тесты кроссплатформенных крейтов (protocol, server). Клиент
+  # зависит от wintun (Windows API) и на Linux не собирается.
+  tests-linux:
+    name: tests · ubuntu (protocol + server)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Тесты (protocol, server)
+        run: cargo test -p tunnel-protocol -p tunnel-server
+      - name: Clippy (protocol, server)
+        run: cargo clippy -p tunnel-protocol -p tunnel-server --all-targets -- -D warnings
+
+  # Полный набор тестов (включая client/TUI) — только на Windows.
+  tests-windows:
+    name: tests · windows (весь workspace)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Тесты (workspace)
+        run: cargo test --workspace
+
+  # Сборка релиза для Windows: exe-шники + подписанный wintun.dll
+  # в один артефакт. Поднимается, только если тесты прошли.
+  build-windows:
+    name: build · windows release
+    needs: [tests-linux, tests-windows]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Сборка (release)
+        run: cargo build --release --workspace
+      - name: Собрать артефакты
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item target/release/tunnel-client.exe dist/
+          Copy-Item target/release/tunnel-server.exe dist/
+          Copy-Item vendor/wintun/wintun.dll dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tunnel-windows-x64
+          path: dist/
+          retention-days: 14

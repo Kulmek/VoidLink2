@@ -25,6 +25,9 @@
 //!   friends                     — список друзей
 //!   run                         — поднять туннель (autojoin-группы)
 //!   tui                         — поднять туннель с графическим интерфейсом
+//!
+//! Если в конфиге нет имени или серверов, `tui` сначала показывает
+//! экран первичной настройки (tui::setup): имя, сервер, адаптер, dll.
 
 mod engine;
 mod store;
@@ -322,13 +325,23 @@ fn main() -> Result<()> {
             }
         }
         "run" | "tui" | "ui" => {
-            let (server, pub_key) = pick_server(&cfg, server_sel.as_deref())?;
-            if cfg.name.is_empty() {
-                bail!("задай имя: set-name <имя>");
+            let tui_mode = cmd != "run";
+            // Первичная настройка: если конфиг не заполнен (нет имени или
+            // серверов) и флаги не заданы — спрашиваем прямо в TUI, до старта
+            // движка. Консольному `run` достаточно CLI-подсказки.
+            if tui_mode && (cfg.name.is_empty() || cfg.servers.is_empty()) {
+                if !tui::setup::run(&mut cfg, &mut adapter, &mut dll)? {
+                    bail!("настройка не завершена; запусти ещё раз или задай параметры командами CLI");
+                }
+                save(&cfg)?;
             }
+            if cfg.name.is_empty() {
+                bail!("задай имя: set-name <имя> (или запусти `tunnel-client tui` — настройка там)");
+            }
+            let (server, pub_key) = pick_server(&cfg, server_sel.as_deref())?;
             save(&cfg)?;
             let cfg = Arc::new(cfg);
-            if cmd == "run" {
+            if !tui_mode {
                 engine::run(cfg, server, pub_key, identity.clone(), &adapter, dll)?;
             } else {
                 let store = Arc::new(store::Store::new(&dir));
@@ -370,7 +383,10 @@ global: --dir <path> --debug
   add-friend <code> [alias] | del-friend <alias> | friends
   run                         поднять туннель (global: --adapter --dll --server <N>)
   tui                         то же, но с графическим интерфейсом (ratatui)
-peer = friend code (TUN-…) | hex | alias"#
+peer = friend code (TUN-…) | hex | alias
+
+Если при запуске tui имя или сервер не заданы — сначала открывается
+экран первичной настройки (Enter — применить, Esc — отмена)."#
     );
 }
 
