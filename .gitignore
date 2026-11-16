@@ -1,5 +1,5 @@
 # Rust / Cargo
-/target
+target/
 
 # Wintun driver artifacts (dll хранится в vendor/ намеренно)
 *.exp
@@ -12,7 +12,16 @@
 # Editor / OS
 .vscode/
 .idea/
+.helix/
 *.swp
+*.orig
+*.rej
+*.rs.bk
 Thumbs.db
 Desktop.ini
+.DS_Store
 opencode.jsonc
+
+# Локальные сборки/прочее
+dist/
+*.log
