@@ -135,7 +135,7 @@ cargo build --release --workspace        # релиз, как в CI
 | `cargo build -p tunnel-winsvc` | только Windows |
 
 Статический сервер для VPS (кросс-сборка с macOS или Windows) описан в
-[docs/SERVER.md](SERVER.md#сборка-под-linux):
+[docs/SERVER.md](SERVER.md#сборка):
 
 ```bash
 cargo zigbuild --release -p tunnel-server --target x86_64-unknown-linux-musl
