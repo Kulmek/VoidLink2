@@ -426,6 +426,10 @@ pub struct App {
     pub later_invites: Vec<InvitePopup>,
     /// Только что отклонённые (gid, когда) — см. [`INVITE_DECLINE_MEMORY`].
     pub declined: Vec<(u32, Instant)>,
+    /// Сервер, к которому относятся приглашения и окна с gid (последний
+    /// `Connected`/`ServerSwitched`): gid — номер группы на конкретном
+    /// сервере, на другом сервере тот же gid — чужая группа.
+    pub invites_server: Option<std::net::SocketAddr>,
 }
 
 impl App {
@@ -469,6 +473,7 @@ impl App {
             invites: VecDeque::new(),
             later_invites: Vec::new(),
             declined: Vec::new(),
+            invites_server: None,
         }
     }
 
@@ -649,6 +654,7 @@ impl App {
             };
             match ev {
                 E::Connected(s) => {
+                    self.on_server(s);
                     self.log(MsgKind::Ok, format!("подключено к {s}"));
                 }
                 E::Disconnected(r) => {
@@ -701,6 +707,7 @@ impl App {
                     self.toast(MsgKind::Warn, msg);
                 }
                 E::ServerSwitched { addr, label } => {
+                    self.on_server(addr);
                     let msg = if label.is_empty() {
                         format!("переключено на сервер {addr}")
                     } else {
@@ -898,6 +905,39 @@ impl App {
         self.log(MsgKind::Warn, msg.clone());
         self.toast(MsgKind::Warn, msg);
         self.invites.push_back(inv);
+        self.pump_invites();
+    }
+
+    /// Текущий сервер — `addr`. Если это другой сервер, всё, что
+    /// привязано к gid старого (приглашения на экране, в очереди и
+    /// отложенные, недавние отказы, окна выбора участника / подтверждения
+    /// выхода и удаления, ввод для переименования / кода приглашения),
+    /// сбрасывается: принять такое приглашение значило бы JOIN в тот же gid
+    /// на новом сервере — чужую группу.
+    pub fn on_server(&mut self, addr: std::net::SocketAddr) {
+        let prev = self.invites_server.replace(addr);
+        if prev.is_none() || prev == Some(addr) {
+            return;
+        }
+        self.invites.clear();
+        self.later_invites.clear();
+        self.declined.clear();
+        self.stack.retain(|p| {
+            !matches!(
+                p,
+                Popup::Invite(_)
+                    | Popup::PeerPick(_)
+                    | Popup::FriendCard(_)
+                    | Popup::Confirm(ConfirmPopup {
+                        action: ConfirmAction::DeleteGroup(_) | ConfirmAction::LeaveGroup(_),
+                        ..
+                    })
+                    | Popup::Input(InputPopup {
+                        action: InputAction::RenameGroup(_) | InputAction::InviteCode(_),
+                        ..
+                    })
+            )
+        });
         self.pump_invites();
     }
 
@@ -2605,6 +2645,40 @@ mod tests {
         assert_eq!(shown_gid(&a), Some(7));
         assert!(a.status_msg.contains("Enter/y"));
         assert!(matches!(press(&mut a, KeyCode::Enter), Some(Cmd::Join(7))));
+    }
+
+    #[test]
+    fn смена_сервера_сбрасывает_приглашения_старого() {
+        let a1: std::net::SocketAddr = "10.0.0.1:5599".parse().unwrap();
+        let a2: std::net::SocketAddr = "10.0.0.2:5599".parse().unwrap();
+        let mut a = online();
+        a.on_server(a1);
+        a.on_invite(inv(1), false);
+        a.on_invite(inv(2), false);
+        a.on_invite(inv(3), false);
+        assert!(press(&mut a, KeyCode::Esc).is_none()); // 1 — «позже»
+        assert!(matches!(press(&mut a, KeyCode::Char('n')), Some(Cmd::DeclineInvite(2))));
+        assert_eq!(shown_gid(&a), Some(3));
+        a.stack.push(Popup::Confirm(ConfirmPopup {
+            title: String::new(),
+            message: String::new(),
+            action: ConfirmAction::LeaveGroup(9),
+        }));
+        a.stack.push(Popup::Help);
+        // Переподключение к тому же серверу ничего не трогает.
+        a.on_server(a1);
+        assert!(a.has_invite(1) && a.has_invite(3) && a.stack.len() == 3);
+        // Другой сервер: ни окна, ни очереди, ни «позже», ни окон с gid.
+        a.on_server(a2);
+        assert!(!a.has_invite(1) && !a.has_invite(3));
+        assert!(a.invites.is_empty() && a.later_invites.is_empty() && a.declined.is_empty());
+        assert!(matches!(a.stack.as_slice(), [Popup::Help]), "окна без gid остаются");
+        a.reopen_invites();
+        assert!(shown_gid(&a).is_none(), "«o» не вернёт приглашение старого сервера");
+        // Отказ на старом сервере не глушит приглашение с тем же gid на новом.
+        a.stack.clear();
+        a.on_invite(inv(2), false);
+        assert_eq!(shown_gid(&a), Some(2));
     }
 
     #[test]
