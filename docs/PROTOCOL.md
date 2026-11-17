@@ -231,7 +231,7 @@ msg_id u32 | inner_typ u8 | idx u16 | count u16 | chunk
 | 0x86 | ERROR              | text str                                  |
 | 0x87 | INVITE_DECLINED    | gid, group_name str, by pk, by_name str   |
 | 0x88 | INVITE_LIST        | from u32, complete bool, n u8 × InviteInfo |
-| 0x89 | KICKED             | gid, group_name str, banned bool          |
+| 0x89 | KICKED             | gid, group_name str, banned bool, rev u32 |
 | 0x8A | ADMIN_INFO         | раздел 6                                  |
 | 0x8B | CHALLENGE          | открытым текстом                          |
 | 0x8C | CTRL_PONG          | —                                         |
@@ -241,7 +241,9 @@ msg_id u32 | inner_typ u8 | idx u16 | count u16 | chunk
 | 0x90 | UNSUPPORTED        | открытым текстом                          |
 
 `KICKED` заменяет разбор текста ERROR «вас кикнули из группы "…"»: клиент
-удаляет группу по gid. Шлётся только удалённому участнику (если он онлайн;
+удаляет группу по gid. `rev` — ревизия группы после кика: GROUP_STATE и
+строки GROUP_LIST этой группы с `rev` не новее — запоздавшие (раздел 5;
+своей ревизии клиента мало — она могла отставать). Шлётся только удалённому участнику (если он онлайн;
 KICK/BAN не участника — отзыв приглашения, ему приходит `INVITE_LIST`).
 
 `GET_GROUP`: участнику — `GROUP_STATE`; на несуществующую группу —
@@ -293,7 +295,7 @@ gid u32 | rev u32 | epoch u32 | revoke_prev bool | name str | owner pk
 клиент отбрасывает GROUP_STATE с `rev` меньше уже принятой в этой сессии:
 задержанный ответ на GET_GROUP, пришедший после кика, иначе вернул бы
 ключ, отозванный киком (и клиент шифровал бы им снова). После `KICKED`
-состояние группы с `rev` не новее ревизии на момент кика тоже запоздавшее
+состояние группы с `rev` не новее ревизии из `KICKED` тоже запоздавшее
 (группа не возвращается). Новая сессия (после рестарта сервера ревизии
 могли откатиться) — первый GROUP_STATE принимается без сверки.
 

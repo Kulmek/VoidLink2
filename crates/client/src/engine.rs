@@ -1431,9 +1431,10 @@ struct State {
     /// Номер серверной сессии (растёт на каждую новую): ревизии групп
     /// сравнимы только в пределах одной.
     sess_gen: u64,
-    /// Группы, из которых нас исключили (KICKED): gid → наша ревизия тогда и
-    /// время. Запоздавший GROUP_STATE (или список групп) не новее неё группу
-    /// не возвращает; действует в пределах сессии и `TOMB_TTL`.
+    /// Группы, из которых нас исключили (KICKED): gid → ревизия сервера
+    /// после кика (из KICKED; не меньше нашей тогда) и время. Запоздавший
+    /// GROUP_STATE (или список групп) не новее неё группу не возвращает;
+    /// действует в пределах сессии и `TOMB_TTL`.
     tombs: HashMap<u32, (u32, Instant)>,
     /// Новая сессия: автовход ещё не сверен с первым GROUP_LIST.
     autojoin_due: bool,
@@ -2121,10 +2122,14 @@ fn on_ctrl(env: &Env, st: &mut State, typ: u8, payload: &[u8]) {
         ctrl::KICKED => {
             if let Ok(k) = payloads::dec_kicked(payload) {
                 let local = env.groups.lock().unwrap().remove(&k.gid).map(|g| (g.name.clone(), g.rev));
-                let local = local.map(|(name, rev)| {
-                    st.tombs.insert(k.gid, (rev, Instant::now()));
-                    name
-                });
+                // Граница запоздания — ревизия сервера после кика из KICKED:
+                // своя могла отставать (пропущенная дельта — как раз повод
+                // для GET_GROUP, ответ на который придёт с ревизией новее
+                // нашей, но не новее кика). Ставится и без локальной группы:
+                // её мог ещё не принести запоздавший GROUP_STATE после JOIN.
+                let tomb = local.as_ref().map_or(k.rev, |(_, rev)| (*rev).max(k.rev));
+                st.tombs.insert(k.gid, (tomb, Instant::now()));
+                let local = local.map(|(name, _)| name);
                 env.autojoin_remove(k.gid);
                 st.want_group.remove(&k.gid);
                 let name = if k.group_name.is_empty() { local.unwrap_or_default() } else { k.group_name };
