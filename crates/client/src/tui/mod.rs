@@ -75,9 +75,10 @@ pub fn run(
     app.adapter_name = adapter_name.to_string();
     app.dll_path = dll_path;
     let res = event_loop(&mut term, &mut app, &eng);
-    restore_terminal(&mut term)?;
-    // Останавливаем движок (потоки туннеля).
+    let restore = restore_terminal(&mut term, true);
+    // Останавливаем движок (потоки туннеля) в любом случае.
     let _ = eng.send(Cmd::Quit);
+    restore?;
     res
 }
 
@@ -92,7 +93,7 @@ pub fn run_remote(eng: IpcEngine, ui: &Config) -> Result<()> {
     app.adapter_name = String::new();
     app.dll_path = String::new();
     let res = event_loop(&mut term, &mut app, &eng);
-    restore_terminal(&mut term)?;
+    restore_terminal(&mut term, true)?;
     res
 }
 
@@ -101,12 +102,16 @@ pub fn run_remote(eng: IpcEngine, ui: &Config) -> Result<()> {
 /// событий движения не вызывает лишних перерисовок.
 pub(crate) fn setup_terminal(mouse: bool) -> Result<Terminal<CrosstermBackend<Stdout>>> {
     install_panic_hook();
-    enable_raw_mode()?;
     let mut out = std::io::stdout();
-    execute!(out, EnterAlternateScreen)?;
+    // Захват мыши — до raw-режима: crossterm запоминает текущий режим
+    // консоли и восстанавливает его при `DisableMouseCapture`. Иначе в
+    // «исходном» режиме остался бы raw, и после выхода из TUI консоль была
+    // бы без эха.
     if mouse {
         execute!(out, EnableMouseCapture)?;
     }
+    enable_raw_mode()?;
+    execute!(out, EnterAlternateScreen)?;
     Ok(Terminal::new(CrosstermBackend::new(out))?)
 }
 
@@ -119,19 +124,31 @@ fn install_panic_hook() {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             let _ = disable_raw_mode();
-            let _ = execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+            // По отдельности: DisableMouseCapture без EnableMouseCapture на
+            // Windows падает — и LeaveAlternateScreen тогда бы не выполнился.
+            let _ = execute!(std::io::stdout(), DisableMouseCapture);
+            let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
             prev(info);
         }));
     });
 }
 
-pub(crate) fn restore_terminal(term: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+/// Восстановление консоли. `mouse` — был ли включён захват мыши: снимать
+/// надо только то, что включали. На Windows `DisableMouseCapture` без
+/// предшествующего `EnableMouseCapture` падает с «Initial console modes not
+/// set» (crossterm не знает исходного режима мыши) — а экран первичной
+/// настройки мышь не включает.
+pub(crate) fn restore_terminal(
+    term: &mut Terminal<CrosstermBackend<Stdout>>,
+    mouse: bool,
+) -> Result<()> {
+    // Сначала захват мыши: crossterm восстанавливает запомненный режим
+    // консоли целиком — вместе с эхом и вводом строки.
+    if mouse {
+        execute!(term.backend_mut(), DisableMouseCapture)?;
+    }
     disable_raw_mode()?;
-    execute!(
-        term.backend_mut(),
-        DisableMouseCapture,
-        LeaveAlternateScreen
-    )?;
+    execute!(term.backend_mut(), LeaveAlternateScreen)?;
     term.show_cursor()?;
     Ok(())
 }
