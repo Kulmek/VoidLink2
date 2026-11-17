@@ -25,3 +25,4 @@ opencode.jsonc
 # Локальные сборки/прочее
 dist/
 *.log
+.claude/worktrees/
