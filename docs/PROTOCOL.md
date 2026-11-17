@@ -439,3 +439,6 @@ multicast, broadcast). PUNCH уходит на endpoint и на все канд�
 | session timeout     | 30 с |
 | max_owned_groups    | 16 |
 | invite_ttl          | 7 дней |
+| max_invites_per_group  | 256 (ошибка «лимит приглашений в группе»; повторный INVITE той же цели — продление, не новое) |
+| max_bans_per_group     | 1024 (ошибка «лимит банов в группе»; повторный BAN — не новый) |
+| max_invites_per_target | 64 живых приглашения одной цели по всем группам (ошибка «лимит приглашений у цели») |
