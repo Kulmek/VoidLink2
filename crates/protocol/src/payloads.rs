@@ -325,6 +325,7 @@ pub fn dec_group_update(p: &[u8]) -> Result<GroupUpdate> {
 
 /// GROUP_LIST: сводка по группам (свои + публичные).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct GroupSummary {
     pub gid: u32,
     pub name: String,
@@ -607,6 +608,7 @@ pub fn dec_error(p: &[u8]) -> Result<String> {
 
 /// Группа друга в FRIEND_GROUPS_RESP.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FriendGroup {
     pub gid: u32,
     pub name: String,

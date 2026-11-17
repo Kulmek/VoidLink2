@@ -4,8 +4,16 @@ version = "0.2.0"
 edition = "2024"
 publish = false
 
+[lib]
+name = "tunnel_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tunnel-client"
+path = "src/main.rs"
+
 [dependencies]
-tunnel-protocol = { path = "../protocol" }
+tunnel-protocol = { path = "../protocol", features = ["serde"] }
 anyhow.workspace = true
 blake3.workspace = true
 chacha20poly1305.workspace = true
