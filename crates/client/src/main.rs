@@ -38,6 +38,7 @@ mod engine_e2e;
 mod ipv6;
 mod invites;
 mod snapshot;
+mod profile;
 mod store;
 mod tcp_link;
 mod tun;
