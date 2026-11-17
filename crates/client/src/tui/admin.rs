@@ -154,6 +154,11 @@ impl AdminView {
         self.clamp();
     }
 
+    /// Список текущей вкладки пуст.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Длина списка текущей вкладки.
     pub fn len(&self) -> usize {
         match self.tab {
@@ -593,7 +598,7 @@ fn draw_table(f: &mut Frame, th: &Theme, v: &AdminView, area: Rect) {
 }
 
 fn draw_actions(f: &mut Frame, th: &Theme, v: &AdminView, row: Rect) {
-    let empty = v.len() == 0;
+    let empty = v.is_empty();
     let enter = key(KeyCode::Enter);
     let main = match v.tab {
         AdminTab::Bans => ("Разбанить (Enter)", Btn::Primary),

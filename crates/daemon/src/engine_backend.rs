@@ -9,24 +9,29 @@
 //! - команды — JSON-форма `Cmd` движка; правки конфига (`AddFriend`,
 //!   `DelServer`…) проверяются до отправки, отказ уходит клиенту в `Ack`.
 //!
-//! [`start_from_dir`] поднимает движок по `client.json` каталога данных
-//! демона с настоящим TUN (Wintun / utun / Linux TUN — нужны права
-//! администратора); тесты собирают движок сами и отдают его в
+//! [`DaemonEngine`] — бэкенд режимов `console` и `service`: конфиг и identity
+//! каталога данных демона, движок с настоящим TUN ([`real_start`]: Wintun /
+//! utun / Linux TUN — нужны права администратора) по первому серверу, а без
+//! серверов — состояние «нет сервера» до `AddServer`. Тесты подставляют свой
+//! [`StartFn`] (TUN-заглушка) или собирают движок сами для
 //! [`EngineBackend::new`].
 
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use serde_json::{Value, json};
-use tunnel_client::api::{EngineApi, LocalEngine};
-use tunnel_client::engine::{self, Cmd, Engine};
-use tunnel_client::snapshot::Snapshot;
+use serde_json::Value;
+use tunnel_client::api::{EngineApi, LocalEngine, Me};
+use tunnel_client::engine::{self, Cmd, Engine, Event};
+use tunnel_client::snapshot::{CfgView, Snapshot};
 use tunnel_client::store::{self, Config};
 use tunnel_protocol as proto;
 
 use crate::hub::Backend;
 use crate::log::{Level, LogFn};
+use crate::service::ResumeSignal;
 
 /// Имя адаптера Wintun службы.
 pub const ADAPTER_NAME: &str = "TunnelVPN";
@@ -102,53 +107,64 @@ pub fn pick_server(cfg: &Config) -> Result<(SocketAddr, [u8; 32]), String> {
     Ok((addr, pk))
 }
 
-/// Движок по `client.json` каталога данных демона с настоящим TUN.
-pub fn start_from_dir(data_dir: &Path, log: LogFn) -> Result<EngineBackend, String> {
-    let st = Arc::new(store::Store::new(data_dir));
-    let mut cfg = st.load().map_err(|e| format!("чтение конфига: {e:#}"))?;
-    if cfg.identity.is_none() {
-        let id = store::ensure_identity(&mut cfg);
-        st.save(&cfg).map_err(|e| format!("запись конфига: {e:#}"))?;
-        log(Level::Info, &format!("создана новая identity: {}", id.friend_code()));
-    }
-    let identity = store::ensure_identity(&mut cfg);
-    let (server, server_pub) = pick_server(&cfg)?;
-    let mtu = cfg.mtu();
-    let cfg = Arc::new(Mutex::new(cfg));
-    let save: Arc<dyn Fn(&Config) + Send + Sync> = {
-        let log = log.clone();
-        Arc::new(move |c: &Config| {
-            if let Err(e) = st.save(c) {
-                log(Level::Error, &format!("запись конфига: {e:#}"));
-            }
-        })
-    };
-    log(Level::Info, &format!("движок: сервер {server}"));
-    platform_start(cfg, server, server_pub, identity, save, mtu).map_err(|e| format!("движок: {e:#}"))
+/// Колбэк сохранения конфига движком.
+pub type SaveFn = Arc<dyn Fn(&Config) + Send + Sync>;
+
+/// Всё для запуска движка на выбранном сервере.
+pub struct EngineStart {
+    /// Общий конфиг: тот же `Arc`, что у [`DaemonEngine`] (правки до и после
+    /// запуска видны обоим).
+    pub cfg: Arc<Mutex<Config>>,
+    pub server: SocketAddr,
+    pub server_pub: [u8; 32],
+    pub identity: proto::Identity,
+    pub save: SaveFn,
+}
+
+/// Запуск движка: настоящий TUN ([`real_start`]) или тестовый.
+pub type StartFn = Arc<dyn Fn(EngineStart) -> anyhow::Result<EngineBackend> + Send + Sync>;
+
+/// Откуда брать `wintun.dll` (только Windows).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WintunDll {
+    /// `console`: `dll` из конфига, иначе рядом с exe, иначе поиск ОС.
+    Search,
+    /// Служба: только этот путь (защищённый резолвер `tunnel-winsvc`).
+    Only(PathBuf),
+    /// Служба: DLL рядом с exe не нашлась — TUN не поднять (причина).
+    Missing(String),
+}
+
+/// Параметры настоящего TUN.
+#[derive(Debug, Clone)]
+pub struct TunOpts {
+    pub wintun: WintunDll,
+}
+
+/// Настоящий TUN платформы (Wintun / utun / Linux TUN; нужны права
+/// администратора). Адаптер — `adapter` из конфига, пусто — по умолчанию.
+pub fn real_start(tun: TunOpts) -> StartFn {
+    Arc::new(move |a: EngineStart| platform_start(a, &tun))
 }
 
 #[cfg(windows)]
-fn platform_start(
-    cfg: Arc<Mutex<Config>>,
-    server: SocketAddr,
-    server_pub: [u8; 32],
-    identity: proto::Identity,
-    save: Arc<dyn Fn(&Config) + Send + Sync>,
-    _mtu: usize,
-) -> anyhow::Result<EngineBackend> {
-    let eng = engine::start(cfg, server, server_pub, identity, ADAPTER_NAME, None, save)?;
+fn platform_start(a: EngineStart, tun: &TunOpts) -> anyhow::Result<EngineBackend> {
+    let (adapter, cfg_dll) = {
+        let c = a.cfg.lock().unwrap_or_else(|p| p.into_inner());
+        (c.adapter.clone(), c.dll.clone())
+    };
+    let adapter = if adapter.trim().is_empty() { ADAPTER_NAME.to_string() } else { adapter };
+    let dll = match &tun.wintun {
+        WintunDll::Search => (!cfg_dll.trim().is_empty()).then_some(cfg_dll),
+        WintunDll::Only(p) => Some(p.to_string_lossy().into_owned()),
+        WintunDll::Missing(why) => anyhow::bail!("wintun.dll: {why}"),
+    };
+    let eng = engine::start(a.cfg, a.server, a.server_pub, a.identity, &adapter, dll, a.save)?;
     Ok(EngineBackend::new(eng))
 }
 
 #[cfg(target_os = "macos")]
-fn platform_start(
-    cfg: Arc<Mutex<Config>>,
-    server: SocketAddr,
-    server_pub: [u8; 32],
-    identity: proto::Identity,
-    save: Arc<dyn Fn(&Config) + Send + Sync>,
-    mtu: usize,
-) -> anyhow::Result<EngineBackend> {
+fn platform_start(a: EngineStart, _tun: &TunOpts) -> anyhow::Result<EngineBackend> {
     use tunnel_client::tun_macos::Utun;
 
     struct Dev(Arc<Utun>);
@@ -162,8 +178,9 @@ fn platform_start(
         }
     }
 
+    let mtu = a.cfg.lock().unwrap_or_else(|p| p.into_inner()).mtu();
     let tun = Arc::new(Utun::open(mtu)?);
-    let eng = engine::start_with_tun(cfg, server, server_pub, identity, Arc::new(Dev(tun.clone())), save)?;
+    let eng = engine::start_with_tun(a.cfg, a.server, a.server_pub, a.identity, Arc::new(Dev(tun.clone())), a.save)?;
     let sink = eng.ip_sink();
     // read() блокирующий: поток живёт до конца процесса демона.
     std::thread::Builder::new().name("tun".into()).spawn(move || {
@@ -180,14 +197,7 @@ fn platform_start(
 }
 
 #[cfg(target_os = "linux")]
-fn platform_start(
-    cfg: Arc<Mutex<Config>>,
-    server: SocketAddr,
-    server_pub: [u8; 32],
-    identity: proto::Identity,
-    save: Arc<dyn Fn(&Config) + Send + Sync>,
-    mtu: usize,
-) -> anyhow::Result<EngineBackend> {
+fn platform_start(a: EngineStart, _tun: &TunOpts) -> anyhow::Result<EngineBackend> {
     use tunnel_client::tun_linux::{LinuxTun, spawn_reader};
 
     struct Dev(Arc<LinuxTun>);
@@ -200,8 +210,15 @@ fn platform_start(
         }
     }
 
-    let tun = Arc::new(LinuxTun::open("tunnel0", mtu)?);
-    let eng = engine::start_with_tun(cfg, server, server_pub, identity, Arc::new(Dev(tun.clone())), save)?;
+    let (mtu, name) = {
+        let c = a.cfg.lock().unwrap_or_else(|p| p.into_inner());
+        let n = c.adapter.trim();
+        // Виндовое имя по умолчанию Linux-интерфейсу не годится.
+        let n = if n.is_empty() || n == ADAPTER_NAME { "tunnel0".to_string() } else { n.to_string() };
+        (c.mtu(), n)
+    };
+    let tun = Arc::new(LinuxTun::open(&name, mtu)?);
+    let eng = engine::start_with_tun(a.cfg, a.server, a.server_pub, a.identity, Arc::new(Dev(tun.clone())), a.save)?;
     let sink = eng.ip_sink();
     let reader = spawn_reader(tun, move |p| {
         sink(p);
@@ -211,53 +228,441 @@ fn platform_start(
 }
 
 #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
-fn platform_start(
-    _cfg: Arc<Mutex<Config>>,
-    _server: SocketAddr,
-    _server_pub: [u8; 32],
-    _identity: proto::Identity,
-    _save: Arc<dyn Fn(&Config) + Send + Sync>,
-    _mtu: usize,
-) -> anyhow::Result<EngineBackend> {
+fn platform_start(_a: EngineStart, _tun: &TunOpts) -> anyhow::Result<EngineBackend> {
     anyhow::bail!("TUN на этой ОС не поддерживается")
 }
 
-/// Бэкенд `console`: живой движок или ошибка запуска (демон тогда сразу
-/// останавливается, а ошибка возвращается из `main`).
-pub enum ConsoleBackend {
-    Live(Box<EngineBackend>),
+// ---------- демон: «нет сервера» → движок ----------
+
+/// Пауза между попытками запуска движка, пока он не поднялся (сервер
+/// недоступен, сеть ещё не готова при загрузке, нет прав на TUN).
+pub const START_RETRY: Duration = Duration::from_secs(30);
+
+/// Ответ на сетевые команды без движка (PLAN.md 7.1).
+pub const NO_SERVER: &str = "нет сервера: добавьте сервер (AddServer / add-server)";
+
+/// Адрес-заглушка «текущего сервера» для проверки команд без движка.
+const NO_CURRENT: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
+
+enum State {
+    /// Движка нет: в конфиге нет серверов или запуск не удался (`reason`).
+    Waiting {
+        reason: String,
+        /// Идёт попытка запуска (поток `engine-start`).
+        starting: bool,
+        /// Когда пробовать снова (`None` — только по `AddServer`).
+        retry_at: Option<Instant>,
+    },
+    Live(Arc<EngineBackend>),
+}
+
+struct Inner {
+    cfg: Arc<Mutex<Config>>,
+    save: SaveFn,
+    identity: proto::Identity,
+    me: Me,
+    start: StartFn,
+    log: LogFn,
+    resume: Option<ResumeSignal>,
+    state: Mutex<State>,
+    /// События состояния «нет сервера» (Notice/Error) до хаба.
+    events: Mutex<Vec<Value>>,
+    changed: AtomicBool,
+}
+
+/// Бэкенд демона (console и служба): владеет конфигом и identity каталога
+/// данных; есть сервер — поднимает движок ([`EngineBackend`]), нет — ждёт
+/// `AddServer` в состоянии «нет сервера» (PLAN.md 7.1): снимок с конфигом,
+/// правки конфига применяются сразу, сетевые команды — `Ack` Err
+/// [`NO_SERVER`]. Неудачный запуск повторяется раз в [`START_RETRY`] (и сразу
+/// по выходу из сна). Выход из сна при живом движке — `Cmd::Reconnect`.
+pub struct DaemonEngine {
+    inner: Arc<Inner>,
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+impl DaemonEngine {
+    /// Конфиг из `data_dir/client.json` (нет identity — создаётся и
+    /// сохраняется). Движок не запускается: [`DaemonEngine::start_now`] или
+    /// [`DaemonEngine::start_async`].
+    pub fn open(data_dir: &Path, log: LogFn, start: StartFn, resume: Option<ResumeSignal>) -> Result<Self, String> {
+        let st = Arc::new(store::Store::new(data_dir));
+        let mut cfg = st.load().map_err(|e| format!("чтение конфига: {e:#}"))?;
+        let fresh = cfg.identity.is_none();
+        let identity = store::ensure_identity(&mut cfg);
+        if fresh {
+            st.save(&cfg).map_err(|e| format!("запись конфига: {e:#}"))?;
+            log(Level::Info, &format!("создана новая identity: {}", identity.friend_code()));
+        }
+        let save: SaveFn = {
+            let log = log.clone();
+            Arc::new(move |c: &Config| {
+                if let Err(e) = st.save(c) {
+                    log(Level::Error, &format!("запись конфига: {e:#}"));
+                }
+            })
+        };
+        let reason = if cfg.servers.is_empty() { NO_SERVER.to_string() } else { "движок не запущен".to_string() };
+        let me = Me { my_pub: identity.ed_pub(), my_code: identity.friend_code() };
+        Ok(DaemonEngine {
+            inner: Arc::new(Inner {
+                cfg: Arc::new(Mutex::new(cfg)),
+                save,
+                identity,
+                me,
+                start,
+                log,
+                resume,
+                state: Mutex::new(State::Waiting { reason, starting: false, retry_at: None }),
+                events: Mutex::new(Vec::new()),
+                changed: AtomicBool::new(true),
+            }),
+        })
+    }
+
+    /// В конфиге есть серверы.
+    pub fn has_server(&self) -> bool {
+        !lock(&self.inner.cfg).servers.is_empty()
+    }
+
+    /// Движок запущен.
+    pub fn is_live(&self) -> bool {
+        matches!(*lock(&self.inner.state), State::Live(_))
+    }
+
+    /// Запустить движок синхронно (`console`: ошибка — выход из демона).
+    pub fn start_now(&self) -> Result<(), String> {
+        {
+            let mut g = lock(&self.inner.state);
+            match &mut *g {
+                State::Live(_) => return Ok(()),
+                State::Waiting { starting: true, .. } => return Err("движок уже запускается".into()),
+                State::Waiting { starting, .. } => *starting = true,
+            }
+        }
+        Inner::attempt(&self.inner)
+    }
+
+    /// Запустить движок в фоне (служба: IPC доступен сразу). Нет серверов
+    /// или запуск уже идёт — ничего.
+    pub fn start_async(&self) {
+        Inner::kick(&self.inner);
+    }
+
+    fn live(&self) -> Option<Arc<EngineBackend>> {
+        match &*lock(&self.inner.state) {
+            State::Live(b) => Some(b.clone()),
+            State::Waiting { .. } => None,
+        }
+    }
+}
+
+impl Inner {
+    fn push(&self, ev: &Event) {
+        if let Ok(v) = serde_json::to_value(ev) {
+            lock(&self.events).push(v);
+        }
+        self.changed.store(true, Ordering::Relaxed);
+    }
+
+    /// Попытка запуска в фоне, если ждём и сервер есть.
+    fn kick(this: &Arc<Inner>) {
+        if lock(&this.cfg).servers.is_empty() {
+            return;
+        }
+        {
+            let mut g = lock(&this.state);
+            match &mut *g {
+                State::Waiting { starting, .. } if !*starting => *starting = true,
+                _ => return,
+            }
+        }
+        let me = this.clone();
+        let spawned = std::thread::Builder::new().name("engine-start".into()).spawn(move || {
+            let _ = Inner::attempt(&me);
+        });
+        if let Err(e) = spawned {
+            this.fail(format!("поток запуска движка: {e}"));
+        }
+    }
+
+    /// Запуск (флаг `starting` уже взведён вызывающим).
+    fn attempt(this: &Arc<Inner>) -> Result<(), String> {
+        let picked = pick_server(&lock(&this.cfg));
+        let (server, server_pub) = match picked {
+            Ok(p) => p,
+            Err(e) => {
+                this.fail(e.clone());
+                return Err(e);
+            }
+        };
+        (this.log)(Level::Info, &format!("движок: сервер {server}"));
+        let args = EngineStart {
+            cfg: this.cfg.clone(),
+            server,
+            server_pub,
+            identity: this.identity.clone(),
+            save: this.save.clone(),
+        };
+        match (this.start)(args) {
+            Ok(b) => {
+                *lock(&this.state) = State::Live(Arc::new(b));
+                this.changed.store(true, Ordering::Relaxed);
+                (this.log)(Level::Info, "движок запущен");
+                Ok(())
+            }
+            Err(e) => {
+                let e = format!("движок: {e:#}");
+                this.fail(e.clone());
+                Err(e)
+            }
+        }
+    }
+
+    fn fail(&self, e: String) {
+        (self.log)(Level::Error, &format!("{e}; следующая попытка через {} с", START_RETRY.as_secs()));
+        self.push(&Event::Error(e.clone()));
+        *lock(&self.state) = State::Waiting { reason: e, starting: false, retry_at: Some(Instant::now() + START_RETRY) };
+    }
+
+    /// Команда без движка: правки конфига — сразу, остальное — отказ.
+    fn offline_cmd(this: &Arc<Inner>, cmd: Cmd, reason: &str) -> Result<(), String> {
+        if let Some(e) = engine::check_cfg_cmd(&lock(&this.cfg), NO_CURRENT, &cmd) {
+            return Err(e);
+        }
+        let notice = match &cmd {
+            Cmd::SetName(_) => "имя сохранено".to_string(),
+            Cmd::SetStatus(_) => "статус сохранён".to_string(),
+            Cmd::SetInvisible(on) => format!("невидимка: {}", if *on { "вкл" } else { "выкл" }),
+            Cmd::ToggleAutojoin(gid) => format!("автовход: группа {gid}"),
+            Cmd::AddFriend { alias, .. } => format!("друг добавлен: {alias}"),
+            Cmd::DelFriend(_) => "друг удалён".to_string(),
+            Cmd::SetAlias { alias, .. } => format!("alias: {alias}"),
+            Cmd::AddServer { addr, .. } => format!("сервер добавлен: {addr}"),
+            Cmd::DelServer { idx } => format!("сервер №{idx} удалён"),
+            Cmd::SetPrimaryServer { idx } => format!("сервер по умолчанию: №{idx}"),
+            Cmd::Reconnect => {
+                Inner::retry_now(this);
+                return Ok(());
+            }
+            Cmd::Quit => return Err("демон не завершается по команде фронтенда".into()),
+            _ => return Err(reason.to_string()),
+        };
+        let start = matches!(cmd, Cmd::AddServer { .. } | Cmd::SetPrimaryServer { .. });
+        let saved = {
+            let mut c = lock(&this.cfg);
+            apply_offline(&mut c, cmd);
+            c.clone()
+        };
+        (this.save)(&saved);
+        this.push(&Event::Notice(notice));
+        if start {
+            Inner::retry_now(this);
+        }
+        Ok(())
+    }
+
+    /// Попытка запуска сейчас, не дожидаясь [`START_RETRY`].
+    fn retry_now(this: &Arc<Inner>) {
+        if let State::Waiting { retry_at, .. } = &mut *lock(&this.state) {
+            *retry_at = None;
+        }
+        Inner::kick(this);
+    }
+}
+
+/// Правка конфига командой без движка (проверена `check_cfg_cmd`) — то же,
+/// что делает движок (`cfg_cmd`/локальные команды `do_cmd`).
+fn apply_offline(c: &mut Config, cmd: Cmd) {
+    match cmd {
+        Cmd::SetName(n) => c.name = n,
+        Cmd::SetStatus(t) => c.status = t,
+        Cmd::SetInvisible(on) => c.invisible = on,
+        Cmd::ToggleAutojoin(gid) => {
+            if let Some(i) = c.autojoin.iter().position(|g| *g == gid) {
+                c.autojoin.remove(i);
+            } else {
+                c.autojoin.push(gid);
+            }
+        }
+        Cmd::AddFriend { pubkey, alias } => {
+            let hex = proto::hex_of(&pubkey);
+            match c.friends.iter_mut().find(|f| f.pubkey == hex) {
+                Some(f) => f.alias = alias,
+                None => c.friends.push(store::StoredFriend { pubkey: hex, alias }),
+            }
+        }
+        Cmd::DelFriend(pubkey) => {
+            let hex = proto::hex_of(&pubkey);
+            c.friends.retain(|f| f.pubkey != hex);
+        }
+        Cmd::SetAlias { pubkey, alias } => {
+            let hex = proto::hex_of(&pubkey);
+            if let Some(f) = c.friends.iter_mut().find(|f| f.pubkey == hex) {
+                f.alias = alias;
+            }
+        }
+        Cmd::AddServer { addr, pubkey, label } => {
+            let hex = proto::hex_of(&pubkey);
+            let sa: Option<SocketAddr> = addr.parse().ok();
+            match c.servers.iter_mut().find(|s| s.addr.parse::<SocketAddr>().ok() == sa) {
+                Some(s) => {
+                    s.pubkey = hex;
+                    s.label = label;
+                }
+                None => c.servers.push(store::StoredServer {
+                    addr: sa.map(|a| a.to_string()).unwrap_or(addr),
+                    pubkey: hex,
+                    label,
+                }),
+            }
+        }
+        Cmd::DelServer { idx } => {
+            if idx < c.servers.len() {
+                c.servers.remove(idx);
+            }
+        }
+        Cmd::SetPrimaryServer { idx }
+            if idx < c.servers.len() => {
+                let s = c.servers.remove(idx);
+                // Первый в списке и активный — его возьмёт запуск движка.
+                c.active_server = s.addr.parse::<SocketAddr>().map(|a| a.to_string()).unwrap_or_default();
+                c.servers.insert(0, s);
+            }
+        _ => {}
+    }
+}
+
+impl Backend for DaemonEngine {
+    fn snapshot(&self) -> Value {
+        if let Some(b) = self.live() {
+            return b.snapshot();
+        }
+        let snap = Snapshot { cfg: CfgView::from_cfg(&lock(&self.inner.cfg)), ..Snapshot::default() };
+        serde_json::to_value(snap).unwrap_or(Value::Null)
+    }
+
+    fn poll_events(&self) -> Vec<Value> {
+        let resumed = self.inner.resume.as_ref().is_some_and(ResumeSignal::take);
+        let mut evs = std::mem::take(&mut *lock(&self.inner.events));
+        match self.live() {
+            Some(b) => {
+                if resumed {
+                    (self.inner.log)(Level::Info, "выход из сна — переподключение");
+                    let _ = b.local().send(Cmd::Reconnect);
+                }
+                evs.extend(b.poll_events());
+            }
+            None => {
+                let due = match &*lock(&self.inner.state) {
+                    State::Waiting { starting: false, retry_at: Some(t), .. } => resumed || Instant::now() >= *t,
+                    _ => false,
+                };
+                if due {
+                    Inner::retry_now(&self.inner);
+                }
+            }
+        }
+        evs
+    }
+
+    fn send(&self, cmd: Value) -> Result<(), String> {
+        if let Some(b) = self.live() {
+            return b.send(cmd);
+        }
+        let cmd: Cmd = serde_json::from_value(cmd).map_err(|e| format!("неверная команда: {e}"))?;
+        let reason = match &*lock(&self.inner.state) {
+            State::Waiting { starting: true, .. } => "движок запускается — повторите позже".to_string(),
+            State::Waiting { reason, .. } => reason.clone(),
+            State::Live(_) => String::new(),
+        };
+        Inner::offline_cmd(&self.inner, cmd, &reason)
+    }
+
+    fn me(&self) -> Value {
+        self.inner.me.to_json()
+    }
+
+    fn changed(&self) -> bool {
+        let own = self.inner.changed.swap(false, Ordering::Relaxed);
+        let live = self.live().is_some_and(|b| b.changed());
+        own || live
+    }
+}
+
+/// Бэкенд режимов `console`/`service`: [`DaemonEngine`] или ошибка открытия
+/// каталога данных (битый `client.json`) — тогда снимок `{"engine": null,
+/// "error": …}` (фронтенд показывает причину), команды — `Ack` Err.
+pub enum DaemonBackend {
+    Ready(Box<DaemonEngine>),
     Failed(String),
 }
 
-impl Backend for ConsoleBackend {
+impl DaemonBackend {
+    /// Бэкенд службы: wintun.dll — только от защищённого резолвера
+    /// (`ServiceEnv::wintun_dll`), выход из сна — подсказка движку; движок
+    /// запускается в фоне (IPC доступен сразу), без серверов — ждёт `AddServer`.
+    pub fn service(env: crate::service::ServiceEnv) -> Self {
+        let wintun = match env.wintun_dll {
+            Some(p) => WintunDll::Only(p),
+            None => WintunDll::Missing("нет wintun.dll рядом с exe службы (см. лог)".to_string()),
+        };
+        match DaemonEngine::open(&env.data_dir, env.log.clone(), real_start(TunOpts { wintun }), Some(env.resume)) {
+            Ok(e) => {
+                if e.has_server() {
+                    e.start_async();
+                } else {
+                    (env.log)(Level::Warn, "в конфиге нет серверов — ждём AddServer (tunnel-client tui / add-server)");
+                }
+                DaemonBackend::Ready(Box::new(e))
+            }
+            Err(e) => {
+                (env.log)(Level::Error, &e);
+                DaemonBackend::Failed(e)
+            }
+        }
+    }
+
+    pub fn engine(&self) -> Option<&DaemonEngine> {
+        match self {
+            DaemonBackend::Ready(e) => Some(e),
+            DaemonBackend::Failed(_) => None,
+        }
+    }
+}
+
+impl Backend for DaemonBackend {
     fn snapshot(&self) -> Value {
         match self {
-            ConsoleBackend::Live(b) => b.snapshot(),
-            ConsoleBackend::Failed(e) => json!({ "engine": null, "error": e }),
+            DaemonBackend::Ready(b) => b.snapshot(),
+            DaemonBackend::Failed(e) => serde_json::json!({ "engine": null, "error": e }),
         }
     }
     fn poll_events(&self) -> Vec<Value> {
         match self {
-            ConsoleBackend::Live(b) => b.poll_events(),
-            ConsoleBackend::Failed(_) => Vec::new(),
+            DaemonBackend::Ready(b) => b.poll_events(),
+            DaemonBackend::Failed(_) => Vec::new(),
         }
     }
     fn send(&self, cmd: Value) -> Result<(), String> {
         match self {
-            ConsoleBackend::Live(b) => b.send(cmd),
-            ConsoleBackend::Failed(e) => Err(e.clone()),
+            DaemonBackend::Ready(b) => b.send(cmd),
+            DaemonBackend::Failed(e) => Err(e.clone()),
         }
     }
     fn me(&self) -> Value {
         match self {
-            ConsoleBackend::Live(b) => b.me(),
-            ConsoleBackend::Failed(_) => Value::Null,
+            DaemonBackend::Ready(b) => b.me(),
+            DaemonBackend::Failed(_) => Value::Null,
         }
     }
     fn changed(&self) -> bool {
         match self {
-            ConsoleBackend::Live(b) => b.changed(),
-            ConsoleBackend::Failed(_) => false,
+            DaemonBackend::Ready(b) => b.changed(),
+            DaemonBackend::Failed(_) => false,
         }
     }
 }

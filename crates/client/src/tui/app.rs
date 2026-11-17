@@ -466,7 +466,7 @@ pub struct App {
 
 impl App {
     pub fn new(my_pub: [u8; 32], my_code: &str, cfg: &Config) -> Self {
-        let theme_kind = ThemeKind::from_str(&cfg.theme).unwrap_or(ThemeKind::Dark);
+        let theme_kind = ThemeKind::from_key(&cfg.theme).unwrap_or(ThemeKind::Dark);
         Self {
             focus: Focus::Groups,
             sel_group: None,
@@ -662,7 +662,7 @@ impl App {
                     shared_groups: shared,
                 });
             }
-            friends.sort_by(|a, b| a.alias.to_lowercase().cmp(&b.alias.to_lowercase()));
+            friends.sort_by_key(|a| a.alias.to_lowercase());
             self.friends = friends;
             self.my_name = cfg.name.clone();
             self.my_status = cfg.status.clone();
@@ -1565,11 +1565,10 @@ impl App {
             Hit::PopupInside => {
                 // Строка «приватная группа» в создании группы — переключатель.
                 let r = self.hits.popup.get();
-                if let Some(Popup::Input(inp)) = self.stack.last() {
-                    if matches!(inp.action, InputAction::CreateGroup) && y == r.y + 2 {
+                if let Some(Popup::Input(inp)) = self.stack.last()
+                    && matches!(inp.action, InputAction::CreateGroup) && y == r.y + 2 {
                         self.handle_key(key(KeyCode::Tab), eng);
                     }
-                }
             }
             Hit::Panel(f) => self.focus = f,
             Hit::Item(f, i) => {
@@ -1676,13 +1675,12 @@ impl App {
                 }
             }
             Focus::Groups => {
-                if let Some(g) = self.selected_group() {
-                    if !g.mine {
+                if let Some(g) = self.selected_group()
+                    && !g.mine {
                         let gid = g.gid;
                         self.send(eng, Cmd::Join(gid));
                         self.toast(MsgKind::Info, format!("входим в группу {gid}"));
                     }
-                }
             }
             Focus::Peers | Focus::Log => {}
         }
@@ -1770,15 +1768,12 @@ impl App {
                 }
                 _ => {}
             },
-            Popup::FriendCard(card) => match key.code {
-                KeyCode::Char('c') => {
-                    self.copy_toast(
-                        &proto::friend_code_of(&card.pubkey),
-                        "friend code друга скопирован".into(),
-                    );
-                    self.stack.push(Popup::FriendCard(card));
-                }
-                _ => {}
+            Popup::FriendCard(card) => if let KeyCode::Char('c') = key.code {
+                self.copy_toast(
+                    &proto::friend_code_of(&card.pubkey),
+                    "friend code друга скопирован".into(),
+                );
+                self.stack.push(Popup::FriendCard(card));
             },
             Popup::ListPick(mut p) => match key.code {
                 KeyCode::Up => {
@@ -2778,7 +2773,7 @@ pub enum Command {
 
 /// Разбирает строку командной строки (без ведущего «:»).
 pub fn parse_command(line: &str) -> Result<Command> {
-    let mut it = line.trim().split_whitespace();
+    let mut it = line.split_whitespace();
     let cmd = it.next().unwrap_or("").to_lowercase();
     let rest: Vec<&str> = it.collect();
     let gid_of = |i: usize| -> Result<u32> {
@@ -2795,7 +2790,7 @@ pub fn parse_command(line: &str) -> Result<Command> {
         "invites" => Command::Invites,
         "leave" => Command::Leave(gid_of(0)?),
         "create" => {
-            let private = rest.iter().any(|a| *a == "--private");
+            let private = rest.contains(&"--private");
             let name = rest
                 .iter()
                 .filter(|a| **a != "--private")
@@ -3012,9 +3007,7 @@ mod tests {
     use super::*;
 
     fn app() -> App {
-        let mut cfg = Config::default();
-        cfg.name = "alpha".into();
-        cfg.status = "тест".into();
+        let cfg = Config { name: "alpha".into(), status: "тест".into(), ..Config::default() };
         App::new([7; 32], "TUN-TEST-CODE", &cfg)
     }
 
@@ -3618,12 +3611,13 @@ mod tests {
     }
 
     fn servers_cfg() -> Config {
-        let mut cfg = Config::default();
-        cfg.servers = vec![
-            StoredServer { addr: "127.0.0.1:5599".into(), pubkey: proto::hex_of(&[1; 32]), label: "дом".into() },
-            StoredServer { addr: "127.0.0.2:5600".into(), pubkey: proto::hex_of(&[2; 32]), label: String::new() },
-        ];
-        cfg
+        Config {
+            servers: vec![
+                StoredServer { addr: "127.0.0.1:5599".into(), pubkey: proto::hex_of(&[1; 32]), label: "дом".into() },
+                StoredServer { addr: "127.0.0.2:5600".into(), pubkey: proto::hex_of(&[2; 32]), label: String::new() },
+            ],
+            ..Config::default()
+        }
     }
 
     /// Клавиша в экране «Серверы» и применение действия к конфигу.
@@ -3776,12 +3770,13 @@ mod tests {
     }
 
     fn friend_cfg() -> Config {
-        let mut cfg = Config::default();
-        cfg.friends = vec![
-            StoredFriend { pubkey: proto::hex_of(&[2; 32]), alias: "bob".into() },
-            StoredFriend { pubkey: proto::hex_of(&[3; 32]), alias: "eve".into() },
-        ];
-        cfg
+        Config {
+            friends: vec![
+                StoredFriend { pubkey: proto::hex_of(&[2; 32]), alias: "bob".into() },
+                StoredFriend { pubkey: proto::hex_of(&[3; 32]), alias: "eve".into() },
+            ],
+            ..Config::default()
+        }
     }
 
     fn ch(c: char) -> KeyEvent {

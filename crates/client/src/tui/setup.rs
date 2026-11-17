@@ -182,7 +182,7 @@ enum Action {
 /// Показывает экран настройки. Возвращает `true` — продолжать запуск
 /// (конфиг/флаги обновлены), `false` — пользователь отменил.
 pub fn run(cfg: &mut Config, adapter: &mut String, dll: &mut Option<String>) -> Result<bool> {
-    let kind = ThemeKind::from_str(&cfg.theme).unwrap_or(ThemeKind::Dark);
+    let kind = ThemeKind::from_key(&cfg.theme).unwrap_or(ThemeKind::Dark);
     let th = Theme::of(kind);
     let mut form = Form {
         sel: 0,
@@ -212,8 +212,8 @@ fn loop_(
     loop {
         let errs = form.validate(!cfg.servers.is_empty());
         term.draw(|f| draw(f, form, &errs, th, my_code))?;
-        if event::poll(Duration::from_millis(120))? {
-            if let Event::Key(key) = event::read()? {
+        if event::poll(Duration::from_millis(120))?
+            && let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
@@ -228,7 +228,6 @@ fn loop_(
                     Action::Continue => {}
                 }
             }
-        }
     }
 }
 

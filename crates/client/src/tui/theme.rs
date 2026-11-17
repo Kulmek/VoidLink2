@@ -44,7 +44,7 @@ impl ThemeKind {
 
     /// Ключ темы в client.json. Неизвестный ключ → `None` (вызывающий
     /// подставляет тёмную тему).
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn from_key(s: &str) -> Option<Self> {
         match s {
             "light" => Some(ThemeKind::Light),
             "contrast" => Some(ThemeKind::Contrast),
@@ -437,13 +437,13 @@ mod tests {
 
     #[test]
     fn тема_читается_из_строки() {
-        assert_eq!(ThemeKind::from_str("light"), Some(ThemeKind::Light));
-        assert_eq!(ThemeKind::from_str("contrast"), Some(ThemeKind::Contrast));
-        assert_eq!(ThemeKind::from_str("dark"), Some(ThemeKind::Dark));
-        assert_eq!(ThemeKind::from_str("нет"), None);
+        assert_eq!(ThemeKind::from_key("light"), Some(ThemeKind::Light));
+        assert_eq!(ThemeKind::from_key("contrast"), Some(ThemeKind::Contrast));
+        assert_eq!(ThemeKind::from_key("dark"), Some(ThemeKind::Dark));
+        assert_eq!(ThemeKind::from_key("нет"), None);
         assert_eq!(ThemeKind::Light.as_str(), "light");
         for k in ThemeKind::ALL {
-            assert_eq!(ThemeKind::from_str(k.as_str()), Some(k), "{k:?}");
+            assert_eq!(ThemeKind::from_key(k.as_str()), Some(k), "{k:?}");
             assert!(!k.label().is_empty());
         }
     }

@@ -12,15 +12,14 @@ pub fn load_wintun_dll(explicit: Option<&str>) -> Result<wintun::Wintun> {
     if let Some(p) = explicit {
         return unsafe { wintun::load_from_path(p) }.context(format!("cannot load {p}"));
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent() {
             let p = dir.join("wintun.dll");
             if p.exists() {
                 return unsafe { wintun::load_from_path(&p) }
                     .context(format!("cannot load {}", p.display()));
             }
         }
-    }
     unsafe { wintun::load_from_path("wintun.dll") }
         .context("wintun.dll not found (положи рядом с exe или укажи --dll)")
 }

@@ -215,17 +215,15 @@ impl Store {
 
 /// Инициализация identity: загрузка из конфига или генерация новой.
 pub fn ensure_identity(cfg: &mut Config) -> proto::Identity {
-    if let Some(si) = &cfg.identity {
-        if let (Ok(ed), Ok(x)) = (proto::hex_to_bytes(&si.ed_seed), proto::hex_to_bytes(&si.x_seed)) {
-            if ed.len() == 32 && x.len() == 32 {
+    if let Some(si) = &cfg.identity
+        && let (Ok(ed), Ok(x)) = (proto::hex_to_bytes(&si.ed_seed), proto::hex_to_bytes(&si.x_seed))
+            && ed.len() == 32 && x.len() == 32 {
                 let mut edb = [0u8; 32];
                 let mut xb = [0u8; 32];
                 edb.copy_from_slice(&ed);
                 xb.copy_from_slice(&x);
                 return proto::Identity { ed_seed: edb, x_seed: xb };
             }
-        }
-    }
     let id = proto::Identity::generate();
     cfg.identity = Some(StoredIdentity {
         ed_seed: proto::hex_of(&id.ed_seed),
@@ -240,11 +238,10 @@ pub fn resolve_peer(cfg: &Config, token: &str) -> Result<[u8; 32]> {
         return Ok(pk);
     }
     let t = token.trim().to_lowercase();
-    if let Ok(v) = proto::hex_to_bytes(&t) {
-        if v.len() == 32 {
+    if let Ok(v) = proto::hex_to_bytes(&t)
+        && v.len() == 32 {
             return Ok(v.try_into().unwrap());
         }
-    }
     if let Some(f) = cfg.friends.iter().find(|f| f.alias.to_lowercase() == t) {
         let v = proto::hex_to_bytes(&f.pubkey)?;
         anyhow::ensure!(v.len() == 32, "bad stored pubkey");

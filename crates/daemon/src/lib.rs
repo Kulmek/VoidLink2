@@ -2,7 +2,9 @@
 //!
 //! Хаб и IPC знают о движке только через трейт [`hub::Backend`]
 //! (JSON-снимки и события); [`engine_backend::EngineBackend`] — бэкенд на
-//! настоящем движке `tunnel-client`. IPC — [`server`] поверх `tunnel-ipc`;
+//! настоящем движке `tunnel-client`, [`engine_backend::DaemonEngine`] — он же
+//! вместе с конфигом каталога данных и состоянием «нет сервера» (режимы
+//! `console` и `service`). IPC — [`server`] поверх `tunnel-ipc`;
 //! [`fake::FakeBackend`] — бэкенд в памяти для тестов и `console --fake`.
 
 pub mod cli;
@@ -14,7 +16,7 @@ pub mod log;
 pub mod server;
 pub mod service;
 
-pub use engine_backend::EngineBackend;
+pub use engine_backend::{DaemonBackend, DaemonEngine, EngineBackend};
 pub use fake::FakeBackend;
 pub use hub::{Backend, Hub, HubMsg, Subscription};
 pub use lock::{InstanceLock, LockError};

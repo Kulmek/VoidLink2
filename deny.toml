@@ -3,15 +3,29 @@
 # В CI — job `deny` (.github/workflows/ci.yml).
 
 [graph]
-# Проверяем дерево зависимостей для всех платформ сразу (клиент — Windows,
-# сервер — Linux), поэтому targets не ограничиваем.
+# Только платформы, под которые реально собираем (CI: ubuntu, macOS, Windows).
+# cfg-условия cargo-deny проверяет по рёбрам, а не по путям: tray-icon у нас
+# только под cfg(windows), но его linux-ветка (gtk/glib 0.18) всё равно видна
+# в графе — см. ignore в [advisories].
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
 all-features = false
 
 [advisories]
 # Уязвимости из RustSec — ошибка; unmaintained/unsound — по умолчанию тоже.
 # Если какой-то advisory нельзя быстро закрыть — добавить его id в ignore
 # с комментарием, почему это безопасно.
-ignore = []
+ignore = [
+    # proc-macro-error (unmaintained) — только через gtk/glib-macros 0.18 в
+    # linux-ветке tray-icon. tray-icon подключён лишь под cfg(windows), на
+    # Windows этой ветки нет: в сборку крейт не попадает (`cargo tree
+    # --target <любая наша цель> -i proc-macro-error` пуст).
+    { id = "RUSTSEC-2024-0370", reason = "только linux-ветка tray-icon, которая у нас не собирается (tray-icon — cfg(windows))" },
+]
 
 [licenses]
 # Allow-list под фактическое дерево зависимостей. Новая лицензия в дереве =
@@ -21,6 +35,11 @@ allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "BSD-3-Clause",
+    # clipboard-win, error-code (arboard → трей на Windows): пермиссивная.
+    "BSL-1.0",
+    # option-ext (dirs → tray-icon): файловый copyleft, зависимость не
+    # модифицируем — совместимо с закрытой сборкой.
+    "MPL-2.0",
     "ISC",
     "Unicode-3.0",
     "Zlib",

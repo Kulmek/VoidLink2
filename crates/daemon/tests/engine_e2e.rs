@@ -14,7 +14,8 @@ use serde_json::{Value, json};
 use tunnel_client::engine::{self, Cmd, Engine, Event, TunDev};
 use tunnel_client::store::{Config, StoredServer};
 use tunnel_daemon::server::socket_path;
-use tunnel_daemon::{EngineBackend, IpcMode, RunOpts, run_daemon};
+use tunnel_daemon::engine_backend::{DaemonEngine, EngineStart, NO_SERVER, StartFn};
+use tunnel_daemon::{Backend, EngineBackend, IpcMode, ResumeSignal, RunOpts, run_daemon};
 use tunnel_ipc::{AckResult, ClientKind, DaemonMsg, IpcClient};
 use tunnel_protocol as proto;
 
@@ -105,7 +106,10 @@ struct Daemon {
 
 impl Daemon {
     fn start(backend: EngineBackend) -> Daemon {
-        let dir = temp_dir("d");
+        Daemon::start_in(temp_dir("d"), move |_| backend)
+    }
+
+    fn start_in<B: Backend + 'static>(dir: PathBuf, make: impl FnOnce(tunnel_daemon::LogFn) -> B + Send + 'static) -> Daemon {
         let stop = Arc::new(AtomicBool::new(false));
         let opts = RunOpts {
             data_dir: dir.clone(),
@@ -115,7 +119,7 @@ impl Daemon {
             stop_reason: "тест окончен".into(),
         };
         let s = stop.clone();
-        let th = std::thread::spawn(move || run_daemon(&opts, move |_| backend, s));
+        let th = std::thread::spawn(move || run_daemon(&opts, make, s));
         let d = Daemon { dir, stop, th: Some(th) };
         let t0 = Instant::now();
         loop {
@@ -225,4 +229,129 @@ fn демон_на_настоящем_движке() {
     drop(bob);
     server.stop();
     let _ = std::fs::remove_dir_all(&sdir);
+}
+
+/// Запуск движка как у демона, но с TUN-заглушкой; адрес сервера из
+/// конфига — `localhost`-вариант (сервер слушает 127.0.0.1).
+fn test_start(starts: Arc<AtomicU32>) -> StartFn {
+    Arc::new(move |a: EngineStart| {
+        starts.fetch_add(1, Ordering::SeqCst);
+        let eng = engine::start_with_tun(a.cfg, local(a.server), a.server_pub, a.identity, Arc::new(NullTun), a.save)?;
+        Ok(EngineBackend::new(eng))
+    })
+}
+
+/// Первый запуск демона (PLAN.md 7.1): каталог данных пуст → identity
+/// создана, IPC работает в состоянии «нет сервера» (снимок с конфигом,
+/// сетевые команды — Err, правки конфига — Ok), `AddServer` поднимает движок
+/// без перезапуска; выход из сна — подсказка переподключения живому движку.
+#[test]
+fn нет_сервера_затем_add_server() {
+    let sdir = temp_dir("s");
+    let server = start_server(&sdir);
+    let dir = temp_dir("d");
+    let starts = Arc::new(AtomicU32::new(0));
+    let resume = ResumeSignal::default();
+    let (st, rs) = (starts.clone(), resume.clone());
+    let d = Daemon::start_in(dir.clone(), move |log| {
+        let e = DaemonEngine::open(&dir, log, test_start(st), Some(rs)).expect("каталог данных");
+        assert!(!e.has_server());
+        e
+    });
+
+    // identity создана и сохранена; `me` — она.
+    let saved: Config = serde_json::from_slice(&std::fs::read(d.dir.join("client.json")).unwrap()).unwrap();
+    assert!(saved.identity.is_some() && saved.servers.is_empty());
+    let mut cfg2 = saved.clone();
+    let id = tunnel_client::store::ensure_identity(&mut cfg2);
+    let mut c = d.client();
+    assert_eq!(c.me()["my_code"], id.friend_code().as_str());
+
+    // Снимок «нет сервера» — настоящий Snapshot (фронтенд его разбирает).
+    let snap = wait_for(&mut c, "снимок без сервера", snap_where(|s| s["meta"]["connected"] == false));
+    let DaemonMsg::Snapshot { snap, .. } = snap else { unreachable!() };
+    let typed: tunnel_client::snapshot::Snapshot = serde_json::from_value(snap).expect("снимок разбирается");
+    assert!(typed.cfg.servers.is_empty());
+
+    // Сетевые команды — Err «нет сервера»; Quit и мусор — Err.
+    match c.request(json!({ "Create": { "name": "x", "private": false } }), T).unwrap() {
+        AckResult::Err(e) => assert_eq!(e, NO_SERVER),
+        r => panic!("ждали Err, пришло {r:?}"),
+    }
+    assert!(matches!(c.request(json!("Quit"), T).unwrap(), AckResult::Err(_)));
+    assert!(matches!(c.request(json!({ "AddServer": { "addr": "мусор", "pubkey": vec![1u8; 32], "label": "" } }), T).unwrap(), AckResult::Err(_)));
+
+    // Правки конфига без движка: имя, друг — в снимке и на диске.
+    assert_eq!(c.request(json!({ "SetName": "алиса" }), T).unwrap(), AckResult::Ok);
+    let fpk = [9u8; 32];
+    let add = serde_json::to_value(Cmd::AddFriend { pubkey: fpk, alias: "друг".into() }).unwrap();
+    assert_eq!(c.request(add, T).unwrap(), AckResult::Ok);
+    wait_for(&mut c, "имя и друг в снимке", snap_where(|s| s["cfg"]["name"] == "алиса" && s["cfg"]["friends"][0]["alias"] == "друг"));
+    assert_eq!(starts.load(Ordering::SeqCst), 0, "без сервера движок не запускается");
+
+    // AddServer → движок поднимается сам, без перезапуска демона.
+    let addr = local(server.addr);
+    let srv = serde_json::to_value(Cmd::AddServer { addr: addr.to_string(), pubkey: server.pubkey, label: "тест".into() }).unwrap();
+    assert_eq!(c.request(srv, T).unwrap(), AckResult::Ok);
+    wait_for(&mut c, "снимок «подключён»", snap_where(|s| s["meta"]["connected"] == true && s["cfg"]["name"] == "алиса"));
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    let saved: Config = serde_json::from_slice(&std::fs::read(d.dir.join("client.json")).unwrap()).unwrap();
+    assert_eq!(saved.servers.len(), 1);
+    assert_eq!(saved.name, "алиса");
+    assert_eq!(saved.friends.len(), 1);
+    assert_eq!(saved.identity.as_ref().map(|i| &i.ed_seed), cfg2.identity.as_ref().map(|i| &i.ed_seed), "identity та же");
+
+    // Теперь сетевые команды идут движку.
+    let create = json!({ "Create": { "name": "игра", "private": false } });
+    assert_eq!(c.request(create, T).unwrap(), AckResult::Ok);
+    wait_for(&mut c, "GroupJoined", |m| matches!(m, DaemonMsg::Event { ev, .. } if ev.get("GroupJoined").is_some()));
+
+    // Выход из сна: Reconnect живому движку — связь остаётся, группа тоже.
+    resume.raise();
+    let t0 = Instant::now();
+    while resume.is_raised() {
+        assert!(t0.elapsed() < T, "сигнал выхода из сна не снят");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    wait_for(&mut c, "после resume: подключён, группа на месте", snap_where(|s| {
+        s["meta"]["connected"] == true && s["groups"].as_array().map(Vec::len) == Some(1)
+    }));
+    assert_eq!(c.request(json!("Reconnect"), T).unwrap(), AckResult::Ok);
+    assert_eq!(c.request(json!("RefreshList"), T).unwrap(), AckResult::Ok);
+
+    drop(c);
+    drop(d);
+    server.stop();
+    let _ = std::fs::remove_dir_all(&sdir);
+}
+
+/// Сервер в конфиге недоступен: демон не падает, остаётся в «нет сервера»
+/// с причиной, событие Error уходит фронтенду; правки конфига работают.
+#[test]
+fn запуск_движка_не_удался() {
+    let dir = temp_dir("f");
+    let cfg = Config {
+        servers: vec![StoredServer { addr: "127.0.0.1:9".into(), pubkey: proto::hex_of(&[3u8; 32]), label: String::new() }],
+        ..Config::default()
+    };
+    std::fs::write(dir.join("client.json"), serde_json::to_vec(&cfg).unwrap()).unwrap();
+    let start: StartFn = Arc::new(|_a: EngineStart| anyhow::bail!("TUN недоступен"));
+    let dd = dir.clone();
+    let d = Daemon::start_in(dir, move |log| {
+        let e = DaemonEngine::open(&dd, log, start, None).unwrap();
+        assert!(e.has_server());
+        e.start_async();
+        e
+    });
+    let mut c = d.client();
+    wait_for(&mut c, "Error запуска", |m| {
+        matches!(m, DaemonMsg::Event { ev, .. } if ev["Error"].as_str().is_some_and(|e| e.contains("TUN недоступен")))
+    });
+    match c.request(json!({ "Join": 1 }), T).unwrap() {
+        AckResult::Err(e) => assert!(e.contains("TUN недоступен"), "{e}"),
+        r => panic!("ждали Err, пришло {r:?}"),
+    }
+    assert_eq!(c.request(json!({ "SetStatus": "тут" }), T).unwrap(), AckResult::Ok);
+    wait_for(&mut c, "статус в снимке", snap_where(|s| s["cfg"]["status"] == "тут"));
 }

@@ -2352,11 +2352,13 @@ mod tests {
         #[test]
         fn серверы_рисуются_и_переключаются_кликом() {
             let mut app = demo_app();
-            let mut cfg = Config::default();
-            cfg.servers = vec![
-                StoredServer { addr: "127.0.0.1:5599".into(), pubkey: proto::hex_of(&[1; 32]), label: "дом".into() },
-                StoredServer { addr: "127.0.0.9:5601".into(), pubkey: proto::hex_of(&[2; 32]), label: "офис".into() },
-            ];
+            let mut cfg = Config {
+                servers: vec![
+                    StoredServer { addr: "127.0.0.1:5599".into(), pubkey: proto::hex_of(&[1; 32]), label: "дом".into() },
+                    StoredServer { addr: "127.0.0.9:5601".into(), pubkey: proto::hex_of(&[2; 32]), label: "офис".into() },
+                ],
+                ..Config::default()
+            };
             app.open_servers_with(&cfg);
             let s = frame(&app, 140, 40);
             let t = text(&s);

@@ -612,8 +612,14 @@ pub enum Cmd {
     DelServer { idx: usize },
     /// Сервер по умолчанию (первый в списке — его берёт следующий запуск).
     SetPrimaryServer { idx: usize },
+    /// Подсказка «сеть могла смениться» (выход из сна): новое рукопожатие
+    /// сразу, без ожидания таймеров и бэкоффа; группы и адаптер — те же.
+    Reconnect,
     Quit,
 }
+
+/// Приёмник исходящих IP-пакетов (см. [`Engine::ip_sink`]).
+pub type IpSink = Arc<dyn Fn(&[u8]) + Send + Sync>;
 
 /// Всё, что нужно UI от движка.
 pub struct Engine {
@@ -652,7 +658,7 @@ impl Engine {
 
     /// Приёмник исходящих IP-пакетов для своего tun-потока (TUN, который
     /// движок не читает сам: utun/Linux TUN в демоне).
-    pub fn ip_sink(&self) -> Arc<dyn Fn(&[u8]) + Send + Sync> {
+    pub fn ip_sink(&self) -> IpSink {
         let env = self.env.clone();
         Arc::new(move |p: &[u8]| route_packet(&env, p))
     }
@@ -2360,6 +2366,14 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
             switch_server(env, st, addr, pubkey, label);
             return;
         }
+        Cmd::Reconnect => {
+            // Без связи — HELLO3 сразу и бэкофф с начала; со связью —
+            // повторное рукопожатие поверх сессии (сервер мог её уже забыть,
+            // пока мы спали; не ответит — сессия умрёт по таймауту как обычно).
+            st.backoff = HELLO_RETRY;
+            st.new_attempt();
+            return;
+        }
         Cmd::AddFriend { .. }
         | Cmd::DelFriend(_)
         | Cmd::SetAlias { .. }
@@ -2419,6 +2433,7 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
         | Cmd::SetStatus(_)
         | Cmd::SetInvisible(_)
         | Cmd::SwitchServer { .. }
+        | Cmd::Reconnect
         | Cmd::AddFriend { .. }
         | Cmd::DelFriend(_)
         | Cmd::SetAlias { .. }

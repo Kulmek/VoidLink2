@@ -2,6 +2,7 @@
 name = "tunnel-winsvc"
 version = "0.2.0"
 edition = "2024"
+publish = false
 description = "Служба Windows для tunnel-daemon: SCM-обёртка, установка, удаление"
 
 [dependencies]

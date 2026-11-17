@@ -32,12 +32,12 @@ impl Identicon {
             *b = h[2 + i] & 0b111;
         }
         let mut cells = [[false; 5]; 5];
-        for row in 0..5 {
+        for (row, line) in cells.iter_mut().enumerate() {
             for col in 0..3 {
                 let bit_index = row * 3 + col;
                 let on = (bits[bit_index] >> (col % 3)) & 1 == 1;
-                cells[row][col] = on;
-                cells[row][4 - col] = on;
+                line[col] = on;
+                line[4 - col] = on;
             }
         }
         Self { cells, fg, bg }
@@ -73,10 +73,10 @@ mod tests {
     #[test]
     fn узор_симметричен_по_вертикали() {
         let id = Identicon::from_pubkey(&[7u8; 32]);
-        for row in 0..5 {
-            for col in 0..5 {
-                assert_eq!(id.cells[row][col], id.cells[row][4 - col]);
-            }
+        for line in &id.cells {
+            let mut mirrored = *line;
+            mirrored.reverse();
+            assert_eq!(*line, mirrored);
         }
     }
 

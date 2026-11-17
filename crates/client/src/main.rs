@@ -352,7 +352,7 @@ fn main() -> Result<()> {
             println!("статус установлен: {:?}", cfg.status);
         }
         "add-server" => {
-            let addr = rest.get(0).context("usage: add-server <addr> <code> [label]")?;
+            let addr = rest.first().context("usage: add-server <addr> <code> [label]")?;
             let code = rest.get(1).context("usage: add-server <addr> <code> [label]")?;
             addr.parse::<SocketAddr>().context("addr должен быть ip:port")?;
             let pub_hex = proto::hex_of(&proto::Identity::parse_friend_code(code)?);
@@ -563,11 +563,10 @@ fn main() -> Result<()> {
                 let conn = connect(&store, cfg2, server, &pub_key, &identity)?;
                 conn.send_ctrl(typ, &payloads::enc_gid_target(gid, &target));
                 let r = conn.wait_for(ctrl::CTRL_PING, std::time::Duration::from_secs(3));
-                if let Err(e) = r {
-                    if e.to_string().contains("сервер:") {
+                if let Err(e) = r
+                    && e.to_string().contains("сервер:") {
                         bail!("{e}");
                     }
-                }
                 println!("{}: ок", cmd);
                 Ok(())
             })?;
@@ -580,11 +579,10 @@ fn main() -> Result<()> {
                 let conn = connect(&store, cfg2, server, &pub_key, &identity)?;
                 conn.send_ctrl(ctrl::RENAME_GROUP, &payloads::enc_rename(gid, &name));
                 let r = conn.wait_for(ctrl::CTRL_PING, std::time::Duration::from_secs(3));
-                if let Err(e) = r {
-                    if e.to_string().contains("сервер:") {
+                if let Err(e) = r
+                    && e.to_string().contains("сервер:") {
                         bail!("{e}");
                     }
-                }
                 println!("переименовано");
                 Ok(())
             })?;
@@ -595,11 +593,10 @@ fn main() -> Result<()> {
                 let conn = connect(&store, cfg2, server, &pub_key, &identity)?;
                 conn.send_ctrl(ctrl::DELETE_GROUP, &payloads::enc_gid(gid));
                 let r = conn.wait_for(ctrl::CTRL_PING, std::time::Duration::from_secs(3));
-                if let Err(e) = r {
-                    if e.to_string().contains("сервер:") {
+                if let Err(e) = r
+                    && e.to_string().contains("сервер:") {
                         bail!("{e}");
                     }
-                }
                 autojoin_remove(&store, server, gid)?;
                 println!("группа {gid} удалена");
                 Ok(())

@@ -2,8 +2,6 @@
 //! `install`, `uninstall` — служба Windows через `tunnel-winsvc` (7.6; на
 //! других ОС — ошибка «только Windows»).
 
-#![allow(dead_code)] // подключается при интеграции
-
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -17,8 +15,9 @@ use crate::lock::InstanceLock;
 use crate::log::{Level, LogFn, Logger};
 use crate::server::IpcServer;
 
-/// Бэкенд без движка: пока `tunnel-engine` не подключён, `console`
-/// поднимает хаб на нём (пустой снимок, команды отклоняются).
+/// Бэкенд-заглушка без движка (тесты режимов): снимок `{"engine": null}`,
+/// команды отклоняются. Рабочий бэкенд `console`/`service` —
+/// [`crate::DaemonBackend`].
 pub struct NullBackend;
 
 impl Backend for NullBackend {
@@ -202,6 +201,10 @@ impl ResumeSignal {
     pub fn raise(&self) {
         self.0.store(true, Ordering::Relaxed);
     }
+    /// Сигнал взведён и ещё не снят (флаг не трогается).
+    pub fn is_raised(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
     /// `true` — был выход из сна после прошлого вызова (флаг сбрасывается).
     pub fn take(&self) -> bool {
         self.0.swap(false, Ordering::Relaxed)
@@ -210,6 +213,8 @@ impl ResumeSignal {
 
 /// Что служба отдаёт фабрике бэкенда.
 pub struct ServiceEnv {
+    /// Каталог данных службы (`client.json`, identity, логи).
+    pub data_dir: PathBuf,
     /// Лог демона (вместо `eprintln!` движка).
     pub log: LogFn,
     /// `wintun.dll` только рядом с exe (`tunnel_winsvc::service_wintun_dll`);
@@ -226,6 +231,7 @@ pub const ONLY_WINDOWS: &str =
 /// Тело службы (без SCM, тестируется на любой ОС): ядро демона в отдельном
 /// потоке; Stop/Shutdown (или закрытый канал) — остановка, Resume — подсказка
 /// бэкенду. Если ядро завершилось само (ошибка замка/пайпа) — его результат.
+#[cfg_attr(not(windows), allow(dead_code, reason = "вызывается только из службы SCM (Windows); на других ОС — в тестах"))]
 pub(crate) fn service_body<B, F>(
     opts: RunOpts,
     make_backend: F,
@@ -239,6 +245,7 @@ where
 {
     let stop = Arc::new(AtomicBool::new(false));
     let resume = ResumeSignal::default();
+    let data_dir = opts.data_dir.clone();
     let core = {
         let stop = stop.clone();
         let resume = resume.clone();
@@ -258,7 +265,7 @@ where
                                 None
                             }
                         };
-                        make_backend(ServiceEnv { log, wintun_dll: dll, resume })
+                        make_backend(ServiceEnv { data_dir, log, wintun_dll: dll, resume })
                     },
                     stop,
                 )
@@ -323,6 +330,7 @@ where
 
 /// Параметры установки: служба — этот exe, трей — `tunnel-tray.exe` рядом
 /// (нет файла — без Run-ключа и ярлыка, с предупреждением).
+#[cfg_attr(not(windows), allow(dead_code, reason = "вызывается только из службы SCM (Windows); на других ОС — в тестах"))]
 pub(crate) fn install_options(
     exe: &Path,
     appdata: Option<&Path>,
@@ -442,6 +450,45 @@ mod service_tests {
         assert!(!sig.take());
         tx.send(ServiceEvent::Shutdown).unwrap();
         assert_eq!(body.join().unwrap(), Ok(()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Тело службы с её настоящим бэкендом (`DaemonBackend::service`) на
+    /// пустом каталоге данных: identity создана, IPC отвечает в состоянии
+    /// «нет сервера» (TUN не трогается), Stop — штатный выход.
+    #[cfg(unix)]
+    #[test]
+    fn body_service_backend_no_server() {
+        use tunnel_ipc::{AckResult, ClientKind, IpcClient};
+        // Короткий путь: лимит sun_path ~104 байта на macOS.
+        let dir = std::env::temp_dir().join(format!("tsv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (tx, rx) = mpsc::channel();
+        let opts = RunOpts::service(&dir, IpcMode::Unix);
+        let body = std::thread::spawn(move || {
+            service_body(opts, crate::DaemonBackend::service, rx, || Err("нет".into()), Vec::new())
+        });
+        let t = Duration::from_secs(10);
+        let t0 = Instant::now();
+        let mut c = loop {
+            if let Ok(c) = IpcClient::connect(crate::server::socket_path(&dir), ClientKind::Cli, "test", t) {
+                break c;
+            }
+            assert!(t0.elapsed() < t && !body.is_finished(), "служба не подняла IPC");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(c.me()["my_code"].as_str().is_some_and(|s| !s.is_empty()), "identity создана");
+        let cfg = std::fs::read_to_string(dir.join("client.json")).unwrap();
+        assert!(cfg.contains("ed_seed"));
+        match c.request(serde_json::json!("RefreshList"), t).unwrap() {
+            AckResult::Err(e) => assert_eq!(e, crate::engine_backend::NO_SERVER),
+            r => panic!("ждали Err, пришло {r:?}"),
+        }
+        assert_eq!(c.request(serde_json::json!({ "SetName": "svc" }), t).unwrap(), AckResult::Ok);
+        tx.send(ServiceEvent::Resume).unwrap();
+        tx.send(ServiceEvent::Stop).unwrap();
+        assert_eq!(body.join().unwrap(), Ok(()));
+        assert!(std::fs::read_to_string(dir.join("client.json")).unwrap().contains("svc"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

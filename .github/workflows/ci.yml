@@ -31,16 +31,12 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
-  # Кроссплатформенные крейты на Linux: всё, кроме Windows-only
-  # (client зависит от wintun, tray и winsvc — только Windows).
-  # Новые кроссплатформенные крейты (tunnel-ipc, tunnel-daemon, …)
-  # подхватываются автоматически — список исключений, а не включений.
-  # Отсутствующий в workspace пакет в --exclude даёт лишь warning.
+  # Весь workspace на Linux: клиент (движок, TUI, CLI) кроссплатформенный,
+  # tray и winsvc на не-Windows собираются заглушками (их тесты проверяют
+  # именно заглушки и чистую часть: пути, SDDL, скрипты).
   linux:
-    name: test · ubuntu (кроссплатформенные крейты)
+    name: test · ubuntu (весь workspace)
     runs-on: ubuntu-latest
-    env:
-      EXCLUDES: --exclude tunnel-client --exclude tunnel-tray --exclude tunnel-winsvc
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -48,11 +44,26 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Тесты
-        run: cargo test --workspace $EXCLUDES
+        run: cargo test --workspace
       - name: Clippy
-        run: cargo clippy --workspace $EXCLUDES --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
-  # Полный workspace (включая client/TUI, tray, winsvc) — только на Windows.
+  # Весь workspace на macOS (utun, демон на Unix-сокете).
+  macos:
+    name: test · macos (весь workspace)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Тесты
+        run: cargo test --workspace
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # Весь workspace на Windows (Wintun, служба, трей, named pipe).
   windows:
     name: test · windows (весь workspace)
     runs-on: windows-latest
@@ -64,11 +75,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Тесты
         run: cargo test --workspace
-      # В tunnel-client пока ~40 старых lint'ов (collapsible_if, manual_clamp, …).
-      # До разовой чистки (`cargo clippy --fix` на Windows) шаг не валит job,
-      # чтобы не блокировать релизную сборку. После чистки — убрать continue-on-error.
       - name: Clippy
-        continue-on-error: true
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   # Лицензии, баны, источники, advisories — по deny.toml.
@@ -98,7 +105,7 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-  # Релизный tunnel-server под Linux + systemd-юнит (если есть).
+  # Релизный tunnel-server под Linux + systemd-юнит и скрипт установки.
   build-linux-server:
     name: build · linux server release
     needs: [linux, deny]
@@ -117,10 +124,8 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           cp target/x86_64-unknown-linux-gnu/release/tunnel-server dist/
-          # systemd-юнит и прочие файлы деплоя (весь каталог) — если уже появились.
-          if [ -d infrastructure/linux ]; then
-            cp -r infrastructure/linux dist/
-          fi
+          # systemd-юнит и скрипт установки.
+          cp -r infrastructure/linux dist/
           ls -la dist
       - uses: actions/upload-artifact@v4
         with:
@@ -132,7 +137,7 @@ jobs:
   # + PowerShell-скрипты установки в один артефакт.
   build-windows:
     name: build · windows release
-    needs: [linux, windows, deny]
+    needs: [linux, macos, windows, deny]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -145,20 +150,14 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory dist | Out-Null
-          # Бинарники кладём только те, что реально собрались
-          # (daemon/tray появляются по ходу Этапа 7).
+          # Все четыре бинарника обязательны: нет файла — сборка сломана.
           foreach ($exe in 'tunnel-client', 'tunnel-server', 'tunnel-daemon', 'tunnel-tray') {
-            $path = "target/release/$exe.exe"
-            if (Test-Path $path) {
-              Copy-Item $path dist/
-            } else {
-              Write-Host "пропуск: $path не найден"
-            }
+            Copy-Item "target/release/$exe.exe" dist/
           }
           Copy-Item vendor/wintun/wintun.dll dist/
-          if (Test-Path infrastructure/windows) {
-            Get-ChildItem infrastructure/windows -Filter *.ps1 | Copy-Item -Destination dist/
-          }
+          $ps1 = Get-ChildItem infrastructure/windows -Filter *.ps1
+          if (-not $ps1) { throw 'нет infrastructure/windows/*.ps1' }
+          $ps1 | Copy-Item -Destination dist/
           Get-ChildItem dist
       - uses: actions/upload-artifact@v4
         with:

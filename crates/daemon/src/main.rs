@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use tunnel_daemon::cli::{self, Mode};
-use tunnel_daemon::engine_backend::ConsoleBackend;
+use tunnel_daemon::engine_backend::{DaemonBackend, DaemonEngine, TunOpts, WintunDll, real_start};
 use tunnel_daemon::service;
 use tunnel_daemon::Level;
 
@@ -29,7 +29,9 @@ fn main() -> ExitCode {
                 service::run_console(&dir(data_dir), debug, |_log| tunnel_daemon::FakeBackend::new(), stop)
             } else {
                 // Настоящий движок по client.json каталога данных (нужны права
-                // администратора на TUN). Ошибка запуска — останов и выход с ней.
+                // администратора на TUN). Нет серверов — «нет сервера» до
+                // AddServer; ошибка запуска при заданном сервере — останов и
+                // выход с ней (как раньше).
                 tunnel_client::engine::set_debug(debug);
                 let dir = dir(data_dir);
                 let failed = Arc::new(std::sync::Mutex::new(None::<String>));
@@ -37,13 +39,26 @@ fn main() -> ExitCode {
                 let r = service::run_console(
                     &dir,
                     debug,
-                    move |log| match tunnel_daemon::engine_backend::start_from_dir(&d, log.clone()) {
-                        Ok(b) => ConsoleBackend::Live(Box::new(b)),
-                        Err(e) => {
-                            log(Level::Error, &e);
-                            *f.lock().unwrap_or_else(|p| p.into_inner()) = Some(e.clone());
+                    move |log| {
+                        let fail = |e: String| {
+                            *f.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
                             s.store(true, std::sync::atomic::Ordering::SeqCst);
-                            ConsoleBackend::Failed(e)
+                        };
+                        let tun = TunOpts { wintun: WintunDll::Search };
+                        match DaemonEngine::open(&d, log.clone(), real_start(tun), None) {
+                            Ok(e) => {
+                                if !e.has_server() {
+                                    log(Level::Warn, "в конфиге нет серверов — ждём AddServer (tunnel-client tui / add-server)");
+                                } else if let Err(err) = e.start_now() {
+                                    fail(err);
+                                }
+                                DaemonBackend::Ready(Box::new(e))
+                            }
+                            Err(e) => {
+                                log(Level::Error, &e);
+                                fail(e.clone());
+                                DaemonBackend::Failed(e)
+                            }
                         }
                     },
                     stop,
@@ -54,9 +69,10 @@ fn main() -> ExitCode {
                 }
             }
         }
-        // Данные службы — %ProgramData%\tunnel (или --data-dir); движок
-        // подключит интеграция через фабрику (env: лог, wintun.dll, resume).
-        Mode::Service { data_dir } => service::run_service(data_dir.as_deref(), |_env| service::NullBackend),
+        // Данные службы — %ProgramData%\tunnel (или --data-dir): движок по
+        // client.json (wintun.dll — только рядом с exe, адаптер из конфига,
+        // выход из сна — переподключение); без серверов — ждёт AddServer.
+        Mode::Service { data_dir } => service::run_service(data_dir.as_deref(), DaemonBackend::service),
         Mode::Install => service::install(),
         Mode::Uninstall { purge } => service::uninstall(purge, || Ok(())),
     };
