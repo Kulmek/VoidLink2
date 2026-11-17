@@ -6,6 +6,9 @@ edition = "2024"
 [dependencies]
 tunnel-protocol = { path = "../protocol" }
 anyhow.workspace = true
+blake3.workspace = true
+chacha20poly1305.workspace = true
+rand.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true
 serde.workspace = true
