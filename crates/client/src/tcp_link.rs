@@ -54,7 +54,8 @@ pub struct TcpLink {
     peer: SocketAddr,
     writer: Mutex<TcpStream>,
     alive: Arc<AtomicBool>,
-    rx: Receiver<Vec<u8>>,
+    /// Под мьютексом: `TcpLink` делится между потоками движка (`Arc`).
+    rx: Mutex<Receiver<Vec<u8>>>,
     reader: Option<JoinHandle<()>>,
 }
 
@@ -84,7 +85,7 @@ impl TcpLink {
             peer: addr,
             writer: Mutex::new(stream),
             alive,
-            rx,
+            rx: Mutex::new(rx),
             reader: Some(reader),
         })
     }
@@ -147,12 +148,12 @@ impl TcpLink {
 
     /// Следующий входящий кадр (ждать не дольше `timeout`).
     pub fn recv_timeout(&self, timeout: Duration) -> Result<Vec<u8>, RecvTimeoutError> {
-        self.rx.recv_timeout(timeout)
+        self.rx.lock().unwrap().recv_timeout(timeout)
     }
 
     /// Входящий кадр без ожидания.
     pub fn try_recv(&self) -> Result<Vec<u8>, TryRecvError> {
-        self.rx.try_recv()
+        self.rx.lock().unwrap().try_recv()
     }
 
     /// Закрыть соединение.

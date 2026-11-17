@@ -35,7 +35,8 @@ use proto::handshake;
 use proto::payloads;
 use tunnel_protocol as proto;
 
-use crate::store::Config;
+use crate::store::{Config, TransportMode};
+use crate::tcp_link::{self, TcpLink};
 
 const RING_CAPACITY: u32 = 0x40_0000; // 4 MiB
 /// Шаг цикла движка (верхняя граница задержки таймеров).
@@ -104,6 +105,8 @@ const HINT_GAP_MAX: Duration = Duration::from_secs(60);
 const RESET_GRACE: Duration = Duration::from_secs(2);
 /// Сколько помнится кик из группы (против запоздавших состояний и списков).
 const TOMB_TTL: Duration = Duration::from_secs(60);
+/// Таймаут установки TCP-соединения с сервером (фолбэк, когда режут UDP).
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 static DEBUG: AtomicBool = AtomicBool::new(false);
 pub fn set_debug(on: bool) {
@@ -445,9 +448,19 @@ impl Stats {
     }
 }
 
+/// Транспорт до сервера (для UI). P2p с пирами — всегда UDP.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Transport {
+    #[default]
+    Udp,
+    Tcp,
+}
+
 /// Метаданные для статус-бара UI.
 pub struct Meta {
     pub connected: bool,
+    /// Через что сейчас идёт связь с сервером (UDP или TCP-фолбэк).
+    pub transport: Transport,
     pub server: SocketAddr,
     pub server_label: String,
     pub group_list: Vec<payloads::GroupSummary>,
@@ -668,6 +681,8 @@ struct Env {
     server: Mutex<SocketAddr>,
     /// Единственный UDP-сокет: и сервер, и пиры.
     sock: Arc<UdpSocket>,
+    /// TCP-канал до сервера (фолбэк): есть — всё серверу идёт по нему.
+    tcp: Mutex<Option<Arc<TcpLink>>>,
     tun: Arc<dyn TunDev>,
     quit: AtomicBool,
     key_log: KeyLog,
@@ -686,8 +701,17 @@ impl Env {
         *self.server.lock().unwrap()
     }
 
+    fn tcp_link(&self) -> Option<Arc<TcpLink>> {
+        self.tcp.lock().unwrap().clone()
+    }
+
+    /// Фрейм серверу — по TCP, если он поднят; пирам — всегда по UDP.
     fn send(&self, frame: &[u8], to: SocketAddr) {
-        if self.sock.send_to(frame, to).is_ok() {
+        let ok = match self.tcp_link() {
+            Some(t) if to == self.server() => t.send(frame).is_ok(),
+            _ => self.sock.send_to(frame, to).is_ok(),
+        };
+        if ok {
             self.stats.tx_pkts.fetch_add(1, Ordering::Relaxed);
             self.stats.tx_bytes.fetch_add(frame.len() as u64, Ordering::Relaxed);
         }
@@ -976,6 +1000,8 @@ impl CtrlSession {
 pub struct CtrlConn {
     pub sock: Arc<UdpSocket>,
     pub server: SocketAddr,
+    /// TCP-канал до сервера (UDP не ответил или `transport: tcp`).
+    tcp: Option<TcpLink>,
     /// Ключ сервера перезакреплён по цепочке ротации (новый ed25519):
     /// вызывающий сохраняет его в client.json.
     pub rotated: Option<[u8; 32]>,
@@ -1001,10 +1027,17 @@ impl CtrlConn {
         sock.set_read_timeout(Some(Duration::from_millis(200))).ok();
         let flags = hello_flags(cfg);
         let mut hs = Handshake::new();
-        let deadline = Instant::now() + CONNECT_TIMEOUT;
+        let started = Instant::now();
+        let deadline = started + CONNECT_TIMEOUT;
         let mut next_hello = Instant::now();
         let mut early: Vec<(u8, Vec<u8>)> = Vec::new();
         let mut buf = vec![0u8; 65_535];
+        let mut tcp: Option<TcpLink> = None;
+        if cfg.transport == TransportMode::Tcp {
+            tcp = Some(TcpLink::connect(server, TCP_CONNECT_TIMEOUT).with_context(|| format!("TCP {server}"))?);
+        }
+        // HELLO3 по UDP без единого ответа — для фолбэка на TCP.
+        let mut udp_hellos = 0u32;
         let acc = loop {
             let now = Instant::now();
             if now > deadline {
@@ -1012,17 +1045,28 @@ impl CtrlConn {
             }
             // HELLO3 повторяется: UDP может его потерять.
             if now >= next_hello {
-                sock.send_to(&hs.hello(identity, &cfg.name, flags, None), server)?;
-                next_hello = now + HELLO_RETRY;
+                if tcp.is_none()
+                    && cfg.transport == TransportMode::Auto
+                    && tcp_link::should_fallback(udp_hellos, now.duration_since(started))
+                {
+                    match TcpLink::connect(server, TCP_CONNECT_TIMEOUT) {
+                        Ok(l) => tcp = Some(l),
+                        Err(_) => udp_hellos = 0,
+                    }
+                }
+                ctrl_send(&sock, tcp.as_ref(), &hs.hello(identity, &cfg.name, flags, None), server)?;
+                if tcp.is_none() {
+                    udp_hellos += 1;
+                }
+                next_hello = Instant::now() + HELLO_RETRY;
             }
-            let (n, src) = match sock.recv_from(&mut buf) {
-                Ok(x) => x,
-                Err(_) => continue,
-            };
-            if src != server {
+            let Some(frame) = ctrl_recv(&sock, tcp.as_ref(), server, &mut buf) else {
                 continue;
+            };
+            if tcp.is_none() {
+                udp_hellos = 0;
             }
-            let Ok((typ, body)) = proto::split_frame(&buf[..n]) else {
+            let Ok((typ, body)) = proto::split_frame(&frame) else {
                 continue;
             };
             // UNSUPPORTED и WELCOME с чужим ключом не аутентифицированы (их
@@ -1036,7 +1080,7 @@ impl CtrlConn {
                 },
                 ctrl::CHALLENGE => {
                     if let Some(f) = hs.on_challenge(identity, &cfg.name, flags, body, now) {
-                        let _ = sock.send_to(&f, server);
+                        let _ = ctrl_send(&sock, tcp.as_ref(), &f, server);
                     }
                 }
                 ctrl::UNSUPPORTED => hs.advisory = Some(unsupported_msg(body)),
@@ -1062,6 +1106,7 @@ impl CtrlConn {
         Ok(Self {
             sock,
             server,
+            tcp,
             rotated,
             identity: identity.clone(),
             pinned,
@@ -1111,7 +1156,13 @@ impl CtrlConn {
 
     pub fn send_ctrl(&self, typ: u8, payload: &[u8]) {
         let frame = self.sess.lock().unwrap().seal(typ, payload);
-        let _ = self.sock.send_to(&frame, self.server);
+        let _ = ctrl_send(&self.sock, self.tcp.as_ref(), &frame, self.server);
+    }
+
+    /// Связь с сервером идёт по TCP.
+    #[allow(dead_code)] // для вывода CLI и тестов
+    pub fn via_tcp(&self) -> bool {
+        self.tcp.is_some()
     }
 
     /// Ждёт фрейм конкретного типа; ERROR превращает в Err; прочее игнорируется.
@@ -1149,14 +1200,10 @@ impl CtrlConn {
             if now > deadline {
                 anyhow::bail!("таймаут ожидания {expect:02x?} от сервера");
             }
-            let (n, src) = match self.sock.recv_from(&mut buf) {
-                Ok(x) => x,
-                Err(_) => continue,
-            };
-            if src != self.server {
+            let Some(frame) = ctrl_recv(&self.sock, self.tcp.as_ref(), self.server, &mut buf) else {
                 continue;
-            }
-            let (typ, body) = match proto::split_frame(&buf[..n]) {
+            };
+            let (typ, body) = match proto::split_frame(&frame) {
                 Ok(x) => x,
                 Err(_) => continue,
             };
@@ -1191,6 +1238,32 @@ impl CtrlConn {
                 return Ok(r);
             }
         }
+    }
+}
+
+/// Фрейм серверу CLI-соединения: по TCP, если он поднят, иначе по UDP.
+fn ctrl_send(sock: &UdpSocket, tcp: Option<&TcpLink>, frame: &[u8], server: SocketAddr) -> std::io::Result<()> {
+    match tcp {
+        Some(t) => t.send(frame),
+        None => sock.send_to(frame, server).map(|_| ()),
+    }
+}
+
+/// Следующий фрейм от сервера (ждёт ~200 мс): `None` — ничего или чужой.
+fn ctrl_recv(sock: &UdpSocket, tcp: Option<&TcpLink>, server: SocketAddr, buf: &mut [u8]) -> Option<Vec<u8>> {
+    match tcp {
+        Some(t) => {
+            let r = t.recv_timeout(Duration::from_millis(200));
+            if matches!(r, Err(mpsc::RecvTimeoutError::Disconnected)) {
+                // Канал закрыт: не крутиться вхолостую до таймаута вызывающего.
+                thread::sleep(Duration::from_millis(200));
+            }
+            r.ok()
+        }
+        None => match sock.recv_from(buf) {
+            Ok((n, src)) if src == server => Some(buf[..n].to_vec()),
+            _ => None,
+        },
     }
 }
 
@@ -1256,6 +1329,7 @@ pub fn start_with_tun(
     };
     let meta = Arc::new(Mutex::new(Meta {
         connected: false,
+        transport: Transport::Udp,
         server,
         server_label,
         group_list: Vec::new(),
@@ -1278,6 +1352,7 @@ pub fn start_with_tun(
         identity,
         server: Mutex::new(server),
         sock,
+        tcp: Mutex::new(None),
         tun,
         quit: AtomicBool::new(false),
         key_log: KeyLog::default(),
@@ -1308,10 +1383,9 @@ pub fn start_with_tun(
             })
             .context("spawn cmd thread")?;
     }
-    drop(in_tx);
-
     // Первое подключение — синхронно, чтобы ошибка была видна сразу.
     let mut st = State::new(server_pub);
+    st.rx_ctx = Some((env.clone(), in_tx));
     if let Err(e) = first_connect(&env, &in_rx, &mut st) {
         env.quit.store(true, Ordering::Relaxed);
         return Err(e);
@@ -1346,7 +1420,8 @@ pub fn start_with_tun(
 enum Input {
     Cmd(Cmd),
     /// Не групповой фрейм от сервера (открытые рукопожатия/RESET или шифр).
-    Server { typ: u8, body: Vec<u8> },
+    /// `via_tcp` — пришёл по TCP-каналу.
+    Server { typ: u8, body: Vec<u8>, via_tcp: bool },
     /// Фрейм группы новее известной эпохи: пропущена ротация — GET_GROUP.
     NeedGroup(u32),
 }
@@ -1374,27 +1449,52 @@ fn rx_loop(env: Arc<Env>, in_tx: mpsc::Sender<Input>) {
                 continue;
             }
         };
-        let datagram = &buf[..n];
-        let Ok((typ, body)) = proto::split_frame(datagram) else {
-            continue;
-        };
-        let sent = if proto::grp::is_group(typ) {
-            match handle_group_frame(&env, src, datagram) {
-                Some(gid) => in_tx.send(Input::NeedGroup(gid)).is_ok(),
-                None => true,
-            }
-        } else if src == env.server() {
-            in_tx
-                .send(Input::Server {
-                    typ,
-                    body: body.to_vec(),
-                })
-                .is_ok()
-        } else {
-            true
-        };
-        if !sent {
+        if !dispatch(&env, &in_tx, src, &buf[..n], false) {
             break;
+        }
+    }
+}
+
+/// Разбор входящей датаграммы (UDP или кадра TCP): `false` — движок
+/// остановлен.
+fn dispatch(env: &Env, in_tx: &mpsc::Sender<Input>, src: SocketAddr, datagram: &[u8], via_tcp: bool) -> bool {
+    let Ok((typ, body)) = proto::split_frame(datagram) else {
+        return true;
+    };
+    if proto::grp::is_group(typ) {
+        match handle_group_frame(env, src, datagram) {
+            Some(gid) => in_tx.send(Input::NeedGroup(gid)).is_ok(),
+            None => true,
+        }
+    } else if src == env.server() {
+        in_tx
+            .send(Input::Server {
+                typ,
+                body: body.to_vec(),
+                via_tcp,
+            })
+            .is_ok()
+    } else {
+        true
+    }
+}
+
+/// Приём по TCP-каналу: кадры — как датаграммы от сервера. Выходит, когда
+/// канал закрыт, заменён другим или движок остановлен.
+fn tcp_rx_loop(env: Arc<Env>, link: Arc<TcpLink>, in_tx: mpsc::Sender<Input>) {
+    while !env.quitting() {
+        let current = env.tcp_link().is_some_and(|t| Arc::ptr_eq(&t, &link));
+        if !current {
+            return;
+        }
+        match link.recv_timeout(RX_POLL) {
+            Ok(frame) => {
+                if !dispatch(&env, &in_tx, env.server(), &frame, true) {
+                    return;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
     }
 }
@@ -1404,6 +1504,12 @@ fn rx_loop(env: Arc<Env>, in_tx: mpsc::Sender<Input>) {
 /// Состояние цикла движка (живёт только в потоке engine).
 struct State {
     server_pub: [u8; 32],
+    /// Движок и копия входного канала — для потока приёма TCP.
+    rx_ctx: Option<(Arc<Env>, mpsc::Sender<Input>)>,
+    /// HELLO3 по UDP подряд без единого ответа сервера по UDP.
+    udp_hellos: u32,
+    /// Первый из них (для `tcp_link::should_fallback`).
+    udp_since: Option<Instant>,
     /// Сессия с сервером (есть — подключены).
     sess: Option<CtrlSession>,
     /// Попытка рукопожатия: без сессии — подключение, с сессией — повторное
@@ -1453,6 +1559,9 @@ impl State {
         let now = Instant::now();
         Self {
             server_pub,
+            rx_ctx: None,
+            udp_hellos: 0,
+            udp_since: None,
             sess: None,
             hs: None,
             hs_error: None,
@@ -1499,6 +1608,14 @@ impl State {
     }
 
     fn send_hello(&mut self, env: &Env) {
+        if self.hs.is_none() {
+            return;
+        }
+        ensure_transport(env, self);
+        if env.tcp_link().is_none() {
+            self.udp_hellos += 1;
+            self.udp_since.get_or_insert_with(Instant::now);
+        }
         let Some(hs) = &self.hs else { return };
         let frame = {
             let cfg = env.cfg.lock().unwrap();
@@ -1515,6 +1632,61 @@ impl State {
         }
         self.hs_error = Some(msg);
     }
+}
+
+/// Перед HELLO3: выбрать транспорт до сервера. TCP поднимается в режиме
+/// `tcp` всегда, в `auto` — когда UDP-рукопожатия остаются без ответа
+/// (`tcp_link::should_fallback`). Мёртвый TCP-канал забывается.
+fn ensure_transport(env: &Env, st: &mut State) {
+    if let Some(t) = env.tcp_link() {
+        if t.is_alive() {
+            return;
+        }
+        drop_tcp(env);
+    }
+    let mode = env.cfg.lock().unwrap().transport;
+    let want = match mode {
+        TransportMode::Udp => false,
+        TransportMode::Tcp => true,
+        TransportMode::Auto => {
+            let elapsed = st.udp_since.map(|t| t.elapsed()).unwrap_or_default();
+            tcp_link::should_fallback(st.udp_hellos, elapsed)
+        }
+    };
+    if !want {
+        return;
+    }
+    let Some((env_arc, in_tx)) = st.rx_ctx.clone() else { return };
+    let server = env.server();
+    match TcpLink::connect(server, TCP_CONNECT_TIMEOUT) {
+        Ok(link) => {
+            let link = Arc::new(link);
+            *env.tcp.lock().unwrap() = Some(link.clone());
+            env.meta.lock().unwrap().transport = Transport::Tcp;
+            if mode == TransportMode::Auto {
+                env.emit(Event::Notice(format!("UDP до сервера {server} не отвечает — связь через TCP")));
+            }
+            let _ = thread::Builder::new()
+                .name("tcp-rx".into())
+                .spawn(move || tcp_rx_loop(env_arc, link, in_tx));
+        }
+        Err(e) => {
+            // Снова несколько попыток по UDP, потом — TCP заново.
+            st.udp_hellos = 0;
+            st.udp_since = None;
+            if debug() || mode == TransportMode::Tcp {
+                env.emit(Event::Error(format!("TCP {server}: {e}")));
+            }
+        }
+    }
+}
+
+/// Закрыть TCP-канал (обрыв, смена сервера): дальше — UDP.
+fn drop_tcp(env: &Env) {
+    if let Some(t) = env.tcp.lock().unwrap().take() {
+        t.close();
+    }
+    env.meta.lock().unwrap().transport = Transport::Udp;
 }
 
 /// Синхронное первое подключение: HELLO3 с повтором раз в секунду, до 10 с.
@@ -1542,7 +1714,13 @@ fn first_connect(env: &Env, in_rx: &mpsc::Receiver<Input>, st: &mut State) -> Re
         st.backoff = HELLO_RETRY;
         tick(env, st, now);
         match in_rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(Input::Server { typ, body }) => on_server_frame(env, st, typ, &body),
+            Ok(Input::Server { typ, body, via_tcp }) => {
+                if !via_tcp {
+                    st.udp_hellos = 0;
+                    st.udp_since = None;
+                }
+                on_server_frame(env, st, typ, &body)
+            }
             Ok(Input::Cmd(Cmd::Quit)) => anyhow::bail!("остановлено"),
             Ok(Input::Cmd(c)) => early.push(c),
             Ok(Input::NeedGroup(_)) => {}
@@ -1560,7 +1738,13 @@ fn engine_loop(env: Arc<Env>, in_rx: mpsc::Receiver<Input>, mut st: State) {
                 return;
             }
             Ok(Input::Cmd(c)) => do_cmd(&env, &mut st, c),
-            Ok(Input::Server { typ, body }) => on_server_frame(&env, &mut st, typ, &body),
+            Ok(Input::Server { typ, body, via_tcp }) => {
+                if !via_tcp {
+                    st.udp_hellos = 0;
+                    st.udp_since = None;
+                }
+                on_server_frame(&env, &mut st, typ, &body)
+            }
             Ok(Input::NeedGroup(gid)) => {
                 if env.groups.lock().unwrap().contains_key(&gid) {
                     st.want_group.insert(gid);
@@ -1741,6 +1925,10 @@ fn establish(env: &Env, st: &mut State, eph: proto::EphemeralKey, acc: Accepted)
 
 /// Таймеры: идут по часам на каждой итерации цикла.
 fn tick(env: &Env, st: &mut State, now: Instant) {
+    if env.tcp_link().is_some_and(|t| !t.is_alive()) {
+        drop_tcp(env);
+        lose_server(env, st, "TCP-соединение с сервером закрыто");
+    }
     if st.connected() && now.duration_since(st.last_server_rx) > SERVER_TIMEOUT {
         lose_server(env, st, "сервер не отвечает");
     }
@@ -1980,6 +2168,9 @@ fn switch_server(env: &Env, st: &mut State, addr: SocketAddr, pubkey: [u8; 32], 
     st.autojoin_due = false;
     st.last_get.clear();
     st.candidates.clear();
+    st.udp_hellos = 0;
+    st.udp_since = None;
+    drop_tcp(env);
     *env.server.lock().unwrap() = addr;
     {
         let mut cfg = env.cfg.lock().unwrap();

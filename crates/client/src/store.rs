@@ -59,6 +59,22 @@ pub struct Config {
     /// и при смене сервера чужие gid вошли бы в посторонние группы.
     #[serde(default)]
     pub autojoin_by_server: BTreeMap<String, Vec<u32>>,
+    /// Транспорт до сервера: auto (UDP, при молчании — TCP) | udp | tcp.
+    #[serde(default)]
+    pub transport: TransportMode,
+}
+
+/// Выбор транспорта до сервера.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransportMode {
+    /// UDP, а если рукопожатие не отвечает (`tcp_link::should_fallback`) — TCP.
+    #[default]
+    Auto,
+    /// Только UDP.
+    Udp,
+    /// Только TCP (сервер — по TCP, p2p с пирами — всё равно UDP).
+    Tcp,
 }
 
 impl Default for Config {
@@ -76,6 +92,7 @@ impl Default for Config {
             invisible: false,
             active_server: String::new(),
             autojoin_by_server: BTreeMap::new(),
+            transport: TransportMode::Auto,
         }
     }
 }
