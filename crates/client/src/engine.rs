@@ -669,6 +669,16 @@ pub trait TunDev: Send + Sync {
     fn inject(&self, packet: &[u8]) -> Result<()>;
     /// Назначить адаптеру IP группы (идемпотентно).
     fn ensure_address(&self, ip: u32) -> Result<()>;
+    /// Назначить адаптеру IPv6 оверлея `fd66:766c:696e:<gid>::<host>/64`
+    /// для IPv4 группы `v4` (идемпотентно). По умолчанию — ничего.
+    fn ensure_address6(&self, _v4: u32) -> Result<()> {
+        Ok(())
+    }
+    /// Маршрут на встроенный DNS (100.66.0.53) через адаптер (идемпотентно).
+    /// По умолчанию — ничего.
+    fn ensure_dns_route(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(windows)]
@@ -676,6 +686,27 @@ struct WintunDev {
     adapter: Arc<wintun::Adapter>,
     session: Arc<wintun::Session>,
     configured: Mutex<HashSet<u32>>,
+    /// IPv4 групп, для которых IPv6 оверлея уже назначен.
+    configured6: Mutex<HashSet<u32>>,
+    /// Маршрут на 100.66.0.53 уже ставили (успешно или нет — не повторяем).
+    dns_route: AtomicBool,
+}
+
+#[cfg(windows)]
+impl WintunDev {
+    fn if_index(&self) -> Result<u32> {
+        self.adapter.get_adapter_index().context("adapter index")
+    }
+}
+
+/// Запустить команду ОС, ошибка — с её stderr.
+fn run_cmd(mut c: std::process::Command, what: &str) -> Result<()> {
+    let out = c.output().with_context(|| what.to_string())?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(anyhow::anyhow!("{what}: {}", err.trim()));
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -694,6 +725,53 @@ impl TunDev for WintunDev {
     fn ensure_address(&self, ip: u32) -> Result<()> {
         let mut cfg = self.configured.lock().unwrap();
         crate::tun::ensure_address(&self.adapter, &mut cfg, ip)
+    }
+
+    fn ensure_address6(&self, v4: u32) -> Result<()> {
+        if self.configured6.lock().unwrap().contains(&v4) {
+            return Ok(());
+        }
+        let idx = self.if_index()?;
+        let c = crate::ipv6::cmd_add_windows(idx, v4)
+            .ok_or_else(|| anyhow::anyhow!("адрес вне 100.66.0.0/16"))?;
+        run_cmd(c.to_command(), "netsh add ipv6 address")?;
+        self.configured6.lock().unwrap().insert(v4);
+        Ok(())
+    }
+
+    fn ensure_dns_route(&self) -> Result<()> {
+        if self.dns_route.swap(true, Ordering::Relaxed) {
+            return Ok(());
+        }
+        let idx = self.if_index()?;
+        let mut c = std::process::Command::new("netsh");
+        c.args([
+            "interface", "ipv4", "add", "route",
+            &format!("{}/32", crate::dns::DNS_ADDR),
+            &idx.to_string(),
+            "store=active",
+        ]);
+        run_cmd(c, "netsh add dns route")
+    }
+}
+
+/// Split-DNS ОС для `.vl` → 100.66.0.53 (best effort).
+fn configure_os_dns(ifname: &str) -> Result<()> {
+    if cfg!(windows) {
+        let mut c = std::process::Command::new("powershell");
+        c.args(["-NoProfile", "-NonInteractive", "-Command", &crate::dns::windows_nrpt_add()]);
+        run_cmd(c, "NRPT")
+    } else if cfg!(target_os = "macos") {
+        std::fs::create_dir_all("/etc/resolver").context("/etc/resolver")?;
+        std::fs::write(crate::dns::MACOS_RESOLVER_PATH, crate::dns::macos_resolver_content())
+            .context(crate::dns::MACOS_RESOLVER_PATH)
+    } else {
+        for argv in crate::dns::linux_resolvectl_setup(ifname) {
+            let mut c = std::process::Command::new(&argv[0]);
+            c.args(&argv[1..]);
+            run_cmd(c, "resolvectl")?;
+        }
+        Ok(())
     }
 }
 
@@ -1290,8 +1368,14 @@ pub fn start(
             adapter,
             session: session.clone(),
             configured: Mutex::new(HashSet::new()),
+            configured6: Mutex::new(HashSet::new()),
+            dns_route: AtomicBool::new(false),
         });
+        let dns_on = cfg.lock().unwrap().dns;
         let eng = start_with_tun(cfg, server, server_pub, identity, dev, save)?;
+        if dns_on && let Err(e) = configure_os_dns(adapter_name) {
+            eng.env.emit(Event::Notice(format!("DNS для .vl не настроен: {e}")));
+        }
         spawn_tun_reader(session, eng.env.clone());
         Ok(eng)
     }
@@ -1309,7 +1393,11 @@ pub fn start(
             format!("не удалось создать TUN-интерфейс {name} (запусти от root или дай CAP_NET_ADMIN)")
         })?);
         eprintln!("[tun] interface {} up, mtu {mtu}", dev.name());
+        let dns_on = cfg.lock().unwrap().dns;
         let eng = start_with_tun(cfg, server, server_pub, identity, dev.clone(), save)?;
+        if dns_on && let Err(e) = configure_os_dns(dev.name()) {
+            eng.env.emit(Event::Notice(format!("DNS для .vl не настроен: {e}")));
+        }
         let fd = std::os::fd::AsRawFd::as_raw_fd(dev.as_ref());
         let rd = dev.clone();
         spawn_unix_tun_reader(fd, move |buf| rd.read(buf).map(Some), eng.env.clone());
@@ -1321,7 +1409,11 @@ pub fn start(
         let dev = Arc::new(
             crate::tun_macos::Utun::open(mtu).context("не удалось создать utun (запусти через sudo)")?,
         );
+        let dns_on = cfg.lock().unwrap().dns;
         let eng = start_with_tun(cfg, server, server_pub, identity, dev.clone(), save)?;
+        if dns_on && let Err(e) = configure_os_dns("") {
+            eng.env.emit(Event::Notice(format!("DNS для .vl не настроен: {e}")));
+        }
         let fd = dev.raw_fd();
         let rd = dev.clone();
         spawn_unix_tun_reader(
@@ -2456,6 +2548,14 @@ fn apply_group_state(env: &Env, es: &mut State, st: &payloads::GroupState) {
             proto::ip_str(st.my_ip)
         )));
     }
+    if let Err(e) = env.tun.ensure_address6(st.my_ip) {
+        env.emit(Event::Notice(format!("IPv6 группы {} не назначен: {e}", st.name)));
+    }
+    if env.cfg.lock().unwrap().dns
+        && let Err(e) = env.tun.ensure_dns_route()
+    {
+        env.emit(Event::Notice(format!("маршрут на DNS {}: {e}", crate::dns::DNS_ADDR)));
+    }
     for ev in events {
         env.emit(ev);
     }
@@ -2544,8 +2644,8 @@ fn handle_group_frame(env: &Env, src: SocketAddr, datagram: &[u8]) -> Option<u32
     };
     // 2. Расшифровка (подлинность заголовка — он в AAD).
     let (typ, h, ctr, payload) = proto::open_group(&key, datagram).ok()?;
-    // 6. DATA: внутренний IPv4-источник — сам отправитель.
-    if typ == proto::grp::DATA && proto::ipv4_src(&payload).ok() != Some(h.src) {
+    // 6. DATA: внутренний источник (IPv4 или IPv6 оверлея) — сам отправитель.
+    if typ == proto::grp::DATA && crate::ipv6::source_member(&payload) != Some(h.src) {
         return None;
     }
     let mut became_direct: Option<String> = None;
@@ -2624,7 +2724,13 @@ fn route_packet(env: &Env, bytes: &[u8]) {
     if bytes.len() > proto::MAX_GROUP_PAYLOAD {
         return;
     }
-    let Ok(dst) = proto::ipv4_dst(bytes) else {
+    // Запрос к встроенному DNS — отвечаем сами, в туннель не шлём.
+    if bytes.len() >= 20 && bytes[0] >> 4 == 4 && bytes[16..20] == crate::dns::DNS_ADDR.octets() {
+        answer_dns(env, bytes);
+        return;
+    }
+    // IPv4 участника-получателя (для IPv6 — по адресу оверлея).
+    let Some(dst) = crate::ipv6::route_target(bytes) else {
         return;
     };
     let gid = proto::group_of_ip(dst);
@@ -2644,6 +2750,51 @@ fn route_packet(env: &Env, bytes: &[u8]) {
     };
     let frame = proto::seal_group(&key, proto::grp::DATA, &h, ctr, bytes);
     env.send(&frame, target);
+}
+
+/// Ответ встроенного DNS на запрос из адаптера: имена — нормализованные
+/// отображаемые имена участников (и свои), `<member>.vl` — по всем группам
+/// (меньший gid при совпадении), `<member>.<group>.vl` — в группе.
+fn answer_dns(env: &Env, bytes: &[u8]) {
+    let (on, my_name) = {
+        let c = env.cfg.lock().unwrap();
+        (c.dns, crate::dns::normalize_label(&c.name))
+    };
+    if !on {
+        return;
+    }
+    let reply = {
+        let g = env.groups.lock().unwrap();
+        crate::dns::handle_packet(bytes, |member, group| {
+            let mut best: Option<(u32, u32)> = None;
+            for (gid, gs) in g.iter() {
+                if group.is_some_and(|n| crate::dns::normalize_label(&gs.name) != n) {
+                    continue;
+                }
+                let ip = if !my_name.is_empty() && my_name == member {
+                    Some(gs.my_ip)
+                } else {
+                    gs.members
+                        .values()
+                        .filter(|p| crate::dns::normalize_label(&p.name) == member)
+                        .map(|p| p.ip)
+                        .min()
+                };
+                if let Some(ip) = ip
+                    && best.is_none_or(|(b, _)| *gid < b)
+                {
+                    best = Some((*gid, ip));
+                }
+            }
+            best.map(|(_, ip)| (Some(ip), crate::ipv6::v6_of(ip).map(|a| a.octets())))
+        })
+    };
+    if let Some(r) = reply
+        && let Err(e) = env.tun.inject(&r)
+        && debug()
+    {
+        env.emit(Event::Error(format!("inject dns: {e}")));
+    }
 }
 
 // ---------- раунды RTT и NAT ----------
