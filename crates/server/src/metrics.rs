@@ -45,6 +45,9 @@ pub const DEFAULT_ADDR: SocketAddr =
 /// Колбэк проверки здоровья.
 pub type HealthFn = Arc<dyn Fn() -> bool + Send + Sync>;
 
+/// Колбэк перед отдачей `/metrics`: выставить датчики из авторитетного состояния.
+pub type RefreshFn = Arc<dyn Fn() + Send + Sync>;
+
 /// Реестр метрик. Счётчики только растут, датчики (gauge) выставляются.
 #[derive(Default)]
 pub struct Metrics {
@@ -150,6 +153,16 @@ impl MetricsServer {
     /// Слушать `addr` и отдавать метрики. Порт 0 — выбрать свободный
     /// (реальный адрес — `local_addr()`).
     pub fn start(addr: SocketAddr, metrics: Arc<Metrics>, health: HealthFn) -> Result<Self> {
+        Self::start_with_refresh(addr, metrics, health, Arc::new(|| {}))
+    }
+
+    /// Как `start`, плюс `refresh` перед каждой отдачей `/metrics`.
+    pub fn start_with_refresh(
+        addr: SocketAddr,
+        metrics: Arc<Metrics>,
+        health: HealthFn,
+        refresh: RefreshFn,
+    ) -> Result<Self> {
         let listener =
             TcpListener::bind(addr).with_context(|| format!("метрики: не удалось занять {addr}"))?;
         listener.set_nonblocking(true)?;
@@ -158,7 +171,7 @@ impl MetricsServer {
         let stop2 = stop.clone();
         let thread = thread::Builder::new()
             .name("metrics-http".into())
-            .spawn(move || serve(listener, metrics, health, stop2))?;
+            .spawn(move || serve(listener, metrics, health, refresh, stop2))?;
         Ok(Self { addr, stop, thread: Some(thread) })
     }
 
@@ -185,12 +198,12 @@ impl Drop for MetricsServer {
     }
 }
 
-fn serve(listener: TcpListener, metrics: Arc<Metrics>, health: HealthFn, stop: Arc<AtomicBool>) {
+fn serve(listener: TcpListener, metrics: Arc<Metrics>, health: HealthFn, refresh: RefreshFn, stop: Arc<AtomicBool>) {
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => {
                 // Ошибки отдельного клиента не роняют сервер.
-                let _ = handle(stream, &metrics, &health);
+                let _ = handle(stream, &metrics, &health, &refresh);
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => thread::sleep(ACCEPT_POLL),
             Err(_) => thread::sleep(ACCEPT_POLL),
@@ -227,7 +240,7 @@ fn read_request(stream: &mut TcpStream) -> Option<Vec<u8>> {
     }
 }
 
-fn handle(mut stream: TcpStream, metrics: &Metrics, health: &HealthFn) -> std::io::Result<()> {
+fn handle(mut stream: TcpStream, metrics: &Metrics, health: &HealthFn, refresh: &RefreshFn) -> std::io::Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     let Some(req) = read_request(&mut stream) else {
@@ -245,7 +258,10 @@ fn handle(mut stream: TcpStream, metrics: &Metrics, health: &HealthFn) -> std::i
         ("405 Method Not Allowed", "text/plain; charset=utf-8", "method not allowed\n".to_string())
     } else {
         match path {
-            "/metrics" => ("200 OK", "text/plain; version=0.0.4; charset=utf-8", metrics.render()),
+            "/metrics" => {
+                refresh();
+                ("200 OK", "text/plain; version=0.0.4; charset=utf-8", metrics.render())
+            }
             "/healthz" => {
                 if health() {
                     ("200 OK", "text/plain; charset=utf-8", "ok\n".to_string())

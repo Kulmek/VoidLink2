@@ -40,8 +40,8 @@ pub mod tcp;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -153,6 +153,10 @@ pub struct Config {
     /// Не печатать события (для тестов).
     pub quiet: bool,
     pub limits: Limits,
+    /// TCP-фолбэк на том же порту, что и UDP (`--tcp` / `--no-tcp`).
+    pub tcp: bool,
+    /// Адрес HTTP-эндпоинта метрик (`--metrics`); `None` — выключен.
+    pub metrics: Option<SocketAddr>,
 }
 
 impl Default for Config {
@@ -163,9 +167,14 @@ impl Default for Config {
             workers: 0,
             quiet: false,
             limits: Limits::default(),
+            tcp: true,
+            metrics: None,
         }
     }
 }
+
+/// Health: housekeeping не отмечался дольше этого — сервер «завис».
+const HEALTH_TICK_MAX: Duration = Duration::from_secs(10);
 
 /// Запущенный сервер. Останавливается через [`Server::stop`] или при drop.
 pub struct Server {
@@ -173,8 +182,14 @@ pub struct Server {
     /// Friend code сервера (клиент пиннит его ed25519-ключ).
     pub code: String,
     pub pubkey: [u8; 32],
+    /// Адрес TCP-фолбэка (тот же порт, что UDP), если он включён и занялся.
+    pub tcp_addr: Option<SocketAddr>,
+    /// Адрес эндпоинта метрик, если включён.
+    pub metrics_addr: Option<SocketAddr>,
     shared: Arc<Shared>,
     threads: Vec<JoinHandle<()>>,
+    tcp: Option<tcp::TcpTransport>,
+    metrics_srv: Option<metrics::MetricsServer>,
 }
 
 impl Server {
@@ -222,6 +237,11 @@ impl Server {
             rotated: Mutex::new(None),
             relayed: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
+            metrics: metrics::Metrics::new(),
+            tcp: OnceLock::new(),
+            alive: AtomicUsize::new(0),
+            expected_threads: AtomicUsize::new(usize::MAX),
+            last_tick: AtomicU64::new(0),
         });
         if !cfg.quiet {
             if fresh {
@@ -248,30 +268,89 @@ impl Server {
             cfg.workers
         };
         let mut threads = Vec::new();
+        shared.expected_threads.store(workers + 1, Ordering::Relaxed);
         for i in 0..workers {
             let sh = shared.clone();
+            sh.alive.fetch_add(1, Ordering::Relaxed);
             threads.push(
                 thread::Builder::new()
                     .name(format!("worker-{i}"))
-                    .spawn(move || worker(sh))?,
+                    .spawn(move || {
+                        let _alive = Alive(&sh.alive);
+                        worker(sh.clone())
+                    })?,
             );
         }
         {
             let sh = shared.clone();
+            sh.alive.fetch_add(1, Ordering::Relaxed);
             threads.push(
                 thread::Builder::new()
                     .name("housekeeping".into())
-                    .spawn(move || housekeeping(sh))?,
+                    .spawn(move || {
+                        let _alive = Alive(&sh.alive);
+                        housekeeping(sh.clone())
+                    })?,
             );
         }
+        // TCP-фолбэк на том же порту: кадры идут тем же путём, что UDP, а
+        // источником сессии считается адрес TCP-соединения.
+        let tcp = if cfg.tcp {
+            let on_frame: tcp::FrameHandler = {
+                let sh = shared.clone();
+                Arc::new(move |peer, frame| handle_datagram(&sh, peer.addr(), frame))
+            };
+            let on_close: tcp::CloseHandler = {
+                let sh = shared.clone();
+                Arc::new(move |peer| drop_session_at(&sh, peer.addr()))
+            };
+            match tcp::TcpTransport::start_with_close(addr, on_frame, on_close, tcp::TcpLimits::default()) {
+                Ok(t) => {
+                    let _ = shared.tcp.set(t.sender());
+                    Some(t)
+                }
+                Err(e) => {
+                    eprintln!("[server] TCP {addr}: {e} — работаю только по UDP");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let tcp_addr = tcp.as_ref().map(|t| t.local_addr());
+        let metrics_srv = match cfg.metrics {
+            Some(maddr) => {
+                let health: metrics::HealthFn = {
+                    let sh = shared.clone();
+                    Arc::new(move || healthy(&sh))
+                };
+                let refresh: metrics::RefreshFn = {
+                    let sh = shared.clone();
+                    Arc::new(move || refresh_gauges(&sh))
+                };
+                Some(metrics::MetricsServer::start_with_refresh(maddr, shared.metrics.clone(), health, refresh)?)
+            }
+            None => None,
+        };
+        let metrics_addr = metrics_srv.as_ref().map(|m| m.local_addr());
         shared.log(format!("listening on {addr}, воркеров: {workers}"));
+        if let Some(t) = tcp_addr {
+            shared.log(format!("TCP-фолбэк на {t}"));
+        }
+        if let Some(m) = metrics_addr {
+            shared.log(format!("метрики: http://{m}/metrics"));
+        }
         shared.log(format!("Server code: {code}"));
         Ok(Server {
             addr,
             code,
             pubkey,
+            tcp_addr,
+            metrics_addr,
             shared,
             threads,
+            tcp,
+            metrics_srv,
         })
     }
 
@@ -290,6 +369,13 @@ impl Server {
     fn shutdown(&mut self) {
         self.shared.stop.store(true, Ordering::Relaxed);
         self.shared.urgent.1.notify_all();
+        if let Some(m) = self.metrics_srv.take() {
+            m.stop();
+        }
+        // TCP — раньше воркеров: читатели соединений тоже вызывают обработку.
+        if let Some(mut t) = self.tcp.take() {
+            t.stop();
+        }
         for t in self.threads.drain(..) {
             let _ = t.join();
         }
@@ -593,6 +679,59 @@ struct Shared {
     rotated: Mutex<Option<persist::PKey>>,
     relayed: AtomicU64,
     dropped: AtomicU64,
+    /// Счётчики для `/metrics`.
+    metrics: Arc<metrics::Metrics>,
+    /// Реестр TCP-клиентов (если TCP-фолбэк включён).
+    tcp: OnceLock<tcp::TcpSender>,
+    /// Живых потоков (воркеры + housekeeping) и сколько их должно быть.
+    alive: AtomicUsize,
+    expected_threads: AtomicUsize,
+    /// `now_ms` последнего прохода housekeeping.
+    last_tick: AtomicU64,
+}
+
+/// Учёт живого потока: декремент при выходе, в том числе по панике.
+struct Alive<'a>(&'a AtomicUsize);
+
+impl Drop for Alive<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// `/healthz`: все потоки живы, housekeeping недавно отмечался.
+fn healthy(sh: &Shared) -> bool {
+    !sh.stop.load(Ordering::Relaxed)
+        && sh.alive.load(Ordering::Relaxed) == sh.expected_threads.load(Ordering::Relaxed)
+        && sh.now_ms().saturating_sub(sh.last_tick.load(Ordering::Relaxed)) < duration_ms(HEALTH_TICK_MAX)
+}
+
+/// Датчики метрик — из авторитетного состояния.
+fn refresh_gauges(sh: &Shared) {
+    let now = unix_ms();
+    let s = sh.state.read().unwrap();
+    let m = &sh.metrics;
+    metrics::Metrics::set(&m.sessions, s.sessions.len() as u64);
+    metrics::Metrics::set(&m.groups, s.groups.len() as u64);
+    metrics::Metrics::set(&m.members, s.groups.values().map(|g| g.members.len() as u64).sum());
+    let pending = s.groups.values().flat_map(|g| g.invites.values()).filter(|i| s.invite_live(i, now)).count();
+    metrics::Metrics::set(&m.invites_pending, pending as u64);
+}
+
+/// TCP-соединение закрылось: его сессия — офлайн сразу, не по таймауту.
+fn drop_session_at(sh: &Shared, addr: SocketAddr) {
+    let mut out = Outbox::new();
+    {
+        let mut s = sh.state.write().unwrap();
+        let Some(ses) = s.remove_session(&addr) else { return };
+        sh.log(format!("offline: {} ({}) — TCP закрыт", ses.name, short(&ses.ed_pub)));
+        if !s.online(&ses.ed_pub) {
+            member_changed(&mut s, &ses.ed_pub, &mut out);
+        }
+    }
+    sh.list_dirty.store(true, Ordering::Relaxed);
+    sh.dirty.store(true, Ordering::Relaxed);
+    sh.flush(out);
 }
 
 impl Shared {
@@ -608,6 +747,22 @@ impl Shared {
 
     fn drop_frame(&self) {
         self.dropped.fetch_add(1, Ordering::Relaxed);
+        metrics::Metrics::inc(&self.metrics.dropped_frames, 1);
+    }
+
+    /// Единственный путь датаграммы клиенту: адрес живого TCP-клиента —
+    /// через реестр TCP, остальное — UDP.
+    fn send_to(&self, frame: &[u8], addr: SocketAddr) {
+        if let Some(t) = self.tcp.get() {
+            let peer = tcp::Peer::Tcp(addr);
+            if t.is_live(peer) {
+                if !t.send(peer, frame) {
+                    self.drop_frame();
+                }
+                return;
+            }
+        }
+        let _ = self.sock.send_to(frame, addr);
     }
 
     /// Жетон лимита HELLO для адреса. IPv6 считается по /64: у одного
@@ -642,7 +797,7 @@ impl Shared {
 
     fn flush(&self, out: Outbox) {
         for (addr, frame) in out {
-            let _ = self.sock.send_to(&frame, addr);
+            self.send_to(&frame, addr);
         }
     }
 
@@ -654,7 +809,7 @@ impl Shared {
             self.drop_frame();
             return;
         }
-        let _ = self.sock.send_to(&proto::plain_frame(typ, body), addr);
+        self.send_to(&proto::plain_frame(typ, body), addr);
     }
 }
 
@@ -951,6 +1106,7 @@ fn housekeeping(sh: Arc<Shared>) {
     let mut last_stats = Instant::now();
     let mut last_relayed = 0u64;
     while !sh.stop.load(Ordering::Relaxed) {
+        sh.last_tick.store(sh.now_ms(), Ordering::Relaxed);
         let left = HOUSEKEEPING_EVERY.saturating_sub(last_tick.elapsed());
         if wait_urgent(&sh, left) {
             // Срочное — сразу, но не чаще URGENT_SAVE_GAP.
@@ -967,6 +1123,7 @@ fn housekeeping(sh: Arc<Shared>) {
         last_tick = Instant::now();
         expire_sessions(&sh);
         expire_invites(&sh);
+        refresh_gauges(&sh);
         if sh.list_dirty.swap(false, Ordering::Relaxed) {
             broadcast_group_list(&sh);
         }
@@ -1106,6 +1263,7 @@ fn handle_datagram(sh: &Shared, src: SocketAddr, datagram: &[u8]) {
             sh.drop_frame();
             return;
         }
+        metrics::Metrics::inc(&sh.metrics.hello_total, 1);
         if typ == ctrl::HELLO {
             // v2: тело не разбирается; ответ — не длиннее запроса.
             match unsupported_body(datagram.len()) {
@@ -1165,7 +1323,8 @@ fn relay_group(sh: &Shared, src: SocketAddr, datagram: &[u8]) {
         addr
     };
     sh.relayed.fetch_add(1, Ordering::Relaxed);
-    let _ = sh.sock.send_to(datagram, target);
+    sh.metrics.relayed(datagram.len());
+    sh.send_to(datagram, target);
 }
 
 // ---------- отправка ----------
@@ -1502,6 +1661,7 @@ fn handle_hello3(sh: &Shared, src: SocketAddr, body: &[u8]) {
     let now = hs::unix_now();
     let cookie_ok = h.cookie.as_ref().is_some_and(|c| sh.cookies.verify(src, &h.eph_pub, c, now));
     if !cookie_ok {
+        metrics::Metrics::inc(&sh.metrics.challenge_total, 1);
         sh.send_plain(src, ctrl::CHALLENGE, &hs::enc_challenge(&sh.cookies.make(src, &h.eph_pub, now)));
         return;
     }
@@ -1699,6 +1859,7 @@ fn is_urgent(typ: u8) -> bool {
 }
 
 fn handle_ctrl_frame(sh: &Shared, src: SocketAddr, typ: u8, body: &[u8]) {
+    metrics::Metrics::inc(&sh.metrics.ctrl_frames, 1);
     // Быстрый путь — под блокировкой на чтение: сессия, окно повторов,
     // расшифровка, лимит.
     let (me, payload) = {
@@ -2430,6 +2591,7 @@ mod tests {
             workers,
             quiet: true,
             limits,
+            ..Config::default()
         })
         .unwrap()
     }
@@ -2513,6 +2675,7 @@ mod tests {
             workers: 1,
             quiet: true,
             limits: Limits::default(),
+            ..Config::default()
         })
         .unwrap();
         assert_eq!(again.code, code, "identity сервера сохранилась");
@@ -3666,6 +3829,171 @@ mod tests {
         assert_eq!((g.invites[&invited].created_ms, g.invites[&invited].name.as_str()), (42, "who"));
         assert_eq!((g.members[&member].name.as_str(), g.members[&member].status.as_str()), ("b", "st"));
         assert_eq!(g.banned[&banned], "zed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- эксплуатация: метрики и TCP-фолбэк ----------
+
+    fn http_get(addr: SocketAddr, path: &str) -> String {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes()).unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).unwrap();
+        out
+    }
+
+    fn metric_values(resp: &str) -> HashMap<String, u64> {
+        let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        body.lines()
+            .filter(|l| !l.starts_with('#'))
+            .filter_map(|l| l.split_once(' '))
+            .map(|(k, v)| (k.to_string(), v.parse().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn метрики_показывают_живые_счётчики_после_рукопожатия() {
+        let dir = temp_dir("metrics");
+        let server = Server::start(Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            data_dir: dir.clone(),
+            workers: 1,
+            quiet: true,
+            metrics: Some("127.0.0.1:0".parse().unwrap()),
+            ..Config::default()
+        })
+        .unwrap();
+        let maddr = server.metrics_addr.expect("метрики включены");
+        let a = Raw::connect(server.addr, "alpha");
+        a.expect(ctrl::GROUP_LIST);
+        let st = a.create("game", false);
+        let b = Raw::connect(server.addr, "bravo");
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(st.gid));
+        let st_b = b.state();
+        let x = proto::Identity::generate().ed_pub();
+        a.send(ctrl::INVITE, &payloads::enc_gid_target(st.gid, &x));
+        a.sync();
+        let f = frame_for(&st_b, st.my_ip, st_b.my_ip, b"hi");
+        a.sock.send_to(&f, server.addr).unwrap();
+        b.group_frame(Duration::from_secs(3)).expect("релей");
+
+        let r = http_get(maddr, "/metrics");
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        let v = metric_values(&r);
+        assert_eq!(v["voidlink_sessions"], 2);
+        assert_eq!(v["voidlink_groups"], 1);
+        assert_eq!(v["voidlink_members"], 2);
+        assert_eq!(v["voidlink_invites_pending"], 1);
+        assert!(v["voidlink_hello_total"] >= 4, "{v:?}");
+        assert!(v["voidlink_challenge_total"] >= 2, "{v:?}");
+        assert!(v["voidlink_ctrl_frames_total"] >= 3, "{v:?}");
+        assert_eq!(v["voidlink_relayed_frames_total"], 1);
+        assert_eq!(v["voidlink_bytes_relayed_total"], f.len() as u64);
+
+        let h = http_get(maddr, "/healthz");
+        assert!(h.starts_with("HTTP/1.1 200"), "{h}");
+        server.stop();
+        assert!(std::net::TcpStream::connect_timeout(&maddr, Duration::from_millis(300)).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// UDP ↔ TCP мост для `Raw`: клиент шлёт датаграммы на локальный UDP,
+    /// мост пересылает их рамками по TCP-соединению с сервером и обратно.
+    struct TcpBridge {
+        udp: SocketAddr,
+        tcp_local: SocketAddr,
+        stream: std::net::TcpStream,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl TcpBridge {
+        fn new(srv: SocketAddr) -> TcpBridge {
+            use std::io::{Read, Write};
+            let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+            udp.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+            let stream = std::net::TcpStream::connect(srv).unwrap();
+            stream.set_nodelay(true).unwrap();
+            let tcp_local = stream.local_addr().unwrap();
+            let client: Arc<Mutex<Option<SocketAddr>>> = Arc::default();
+            let stop = Arc::new(AtomicBool::new(false));
+            {
+                let (udp, mut w, client, stop) =
+                    (udp.try_clone().unwrap(), stream.try_clone().unwrap(), client.clone(), stop.clone());
+                thread::spawn(move || {
+                    let mut buf = [0u8; 65_535];
+                    while !stop.load(Ordering::Relaxed) {
+                        let Ok((n, from)) = udp.recv_from(&mut buf) else { continue };
+                        *client.lock().unwrap() = Some(from);
+                        if w.write_all(&tcp::encode_frame(&buf[..n])).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            {
+                let (udp, mut r) = (udp.try_clone().unwrap(), stream.try_clone().unwrap());
+                thread::spawn(move || {
+                    loop {
+                        let mut hdr = [0u8; 2];
+                        if r.read_exact(&mut hdr).is_err() {
+                            break;
+                        }
+                        let mut body = vec![0u8; u16::from_le_bytes(hdr) as usize];
+                        if r.read_exact(&mut body).is_err() {
+                            break;
+                        }
+                        if let Some(to) = *client.lock().unwrap() {
+                            let _ = udp.send_to(&body, to);
+                        }
+                    }
+                });
+            }
+            TcpBridge { udp: udp.local_addr().unwrap(), tcp_local, stream, stop }
+        }
+
+        fn close(&self) {
+            self.stop.store(true, Ordering::Relaxed);
+            let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    #[test]
+    fn tcp_клиент_и_udp_клиент_релеят_друг_другу() {
+        let (server, dir) = test_server("tcp");
+        let tcp_addr = server.tcp_addr.expect("TCP-фолбэк включён по умолчанию");
+        assert_eq!(tcp_addr.port(), server.addr.port(), "TCP на том же порту, что UDP");
+        let bridge = TcpBridge::new(tcp_addr);
+
+        // A — по TCP (рукопожатие v3 целиком через TCP), B — по UDP.
+        let a = Raw::connect(bridge.udp, "alpha");
+        a.expect(ctrl::GROUP_LIST);
+        let st = a.create("game", false);
+        assert_eq!(
+            server.shared.state.read().unwrap().by_pub.get(&a.pk).copied(),
+            Some(bridge.tcp_local),
+            "источник сессии — адрес TCP-соединения"
+        );
+        let b = Raw::connect(server.addr, "bravo");
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(st.gid));
+        let st_b = b.state();
+
+        // TCP → UDP.
+        let ab = frame_for(&st_b, st.my_ip, st_b.my_ip, b"over tcp");
+        a.sock.send_to(&ab, a.srv).unwrap();
+        assert_eq!(b.group_frame(Duration::from_secs(3)).expect("релей TCP → UDP"), ab);
+        // UDP → TCP: ответ идёт через реестр TCP, а не UDP-сокетом.
+        let ba = frame_for(&st_b, st_b.my_ip, st.my_ip, b"over udp");
+        b.sock.send_to(&ba, server.addr).unwrap();
+        assert_eq!(a.group_frame(Duration::from_secs(3)).expect("релей UDP → TCP"), ba);
+
+        // Закрытие TCP — сессия снимается сразу, не по таймауту.
+        bridge.close();
+        wait_until_srv(Duration::from_secs(3), || {
+            !server.shared.state.read().unwrap().by_pub.contains_key(&a.pk)
+        });
+        server.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

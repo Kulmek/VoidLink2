@@ -29,6 +29,13 @@ const USAGE: &str = "\
   --session-timeout <сек>   сессия без пакетов столько — офлайн (30)
   --max-owned-groups N      групп во владении одной identity (16)
   --invite-ttl-days N       срок жизни приглашения, дней (7)
+  --tcp / --no-tcp          TCP-фолбэк на том же порту, что UDP (включён)
+  --metrics <addr>          HTTP-метрики: /metrics (Prometheus) и /healthz,
+                            например 127.0.0.1:9100 (по умолчанию выключены)
+
+SIGTERM/SIGINT (Windows: Ctrl+C, закрытие консоли) — корректная остановка:
+воркеры останавливаются, состояние сохраняется, код выхода 0. Повторный
+сигнал во время остановки — немедленный выход с кодом 1.
 
 rotate-key: сменить ключ сервера. Старый ключ подписывает новый, звено
 дописывается в server.json; клиенты со старым кодом перезакрепляются сами,
@@ -98,6 +105,15 @@ fn main() -> Result<()> {
             "--join-burst" => l.join_burst = value(&args, i, a)?,
             "--session-timeout" => l.session_timeout = Duration::from_secs(value(&args, i, a)?),
             "--max-owned-groups" => l.max_owned_groups = value(&args, i, a)?,
+            "--metrics" => {
+                let m: String = value(&args, i, a)?;
+                cfg.metrics = Some(m.parse::<SocketAddr>().context("--metrics: неверный адрес")?);
+            }
+            "--tcp" | "--no-tcp" => {
+                cfg.tcp = a == "--tcp";
+                i += 1;
+                continue;
+            }
             "--invite-ttl-days" => {
                 let days: u64 = value(&args, i, a)?;
                 l.invite_ttl = Duration::from_secs(days.saturating_mul(24 * 3600));
@@ -138,7 +154,16 @@ fn main() -> Result<()> {
     anyhow::ensure!(!l.session_timeout.is_zero(), "--session-timeout: нужно ≥ 1 с");
     anyhow::ensure!(!l.invite_ttl.is_zero(), "--invite-ttl-days: нужно ≥ 1");
     cfg.listen = listen.parse::<SocketAddr>().context("bad listen addr")?;
+    // Обработчики — до старта: сигнал в первые миллисекунды тоже корректно
+    // останавливает сервер.
+    let shutdown = tunnel_server::signals::Shutdown::install()?;
+    let quiet = cfg.quiet;
     let server = tunnel_server::Server::start(cfg)?;
-    server.wait();
+    shutdown.wait();
+    if !quiet {
+        eprintln!("[server] сигнал остановки: сохраняю состояние и выхожу");
+    }
+    // Останавливает воркеры, TCP и метрики, затем финальный save_now.
+    server.stop();
     Ok(())
 }
