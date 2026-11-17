@@ -16,13 +16,11 @@ serde.workspace = true
 serde_json.workspace = true
 wintun.workspace = true
 
-[target.'cfg(target_os = "linux")'.dependencies]
-[target.'cfg(target_os = "macos")'.dependencies]
-# utun-устройство на macOS (tun_macos.rs).
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Time", "Win32_Foundation"] }
 
 [target.'cfg(unix)'.dependencies]
+# TUN на Linux/macOS (tun_linux.rs, tun_macos.rs), часы (tui/clock.rs).
 libc = "0.2"
 
 [dev-dependencies]
