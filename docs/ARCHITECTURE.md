@@ -41,7 +41,7 @@ Workspace на Rust 2024 содержит семь крейтов. Статус 
 | `crates/server` (`tunnel-server`) | Рандеву-сервер: identity, группы, выдача IP, приглашения, релей, персистентность `server.json` | Готов: TCP-фолбэк на том же порту (`tcp.rs`, `--tcp` / `--no-tcp`), метрики Prometheus (`metrics.rs`, `--metrics`) и корректная остановка по сигналу (`signals.rs`) подключены |
 | `crates/client` (`tunnel-client`) | Движок (`engine.rs`), хранилище (`store.rs`), TUN, DNS, IPv6, TUI (ratatui), CLI | Библиотека (`lib.rs`) и бинарь CLI. Движок, TUN (Wintun, `tun_linux.rs`, `tun_macos.rs`), встроенный DNS, IPv6-оверлей, TCP-фолбэк, TUI. IPC-клиент (`remote.rs`, `remote_cli.rs`) и `EngineApi` (`api.rs`) для TUI и CLI поверх демона (этап 7.4) |
 | `crates/ipc` (`tunnel-ipc`) | Транспорт и сообщения IPC между демоном и фронтендами: фрейм `u32 LE + JSON`, named pipe / Unix-сокет | Библиотека готова; используется демоном и треем |
-| `crates/daemon` (`tunnel-daemon`) | Ядро демона: хаб событий, IPC-сервер, замок single-instance, лог с ротацией, `FakeBackend` | Ядро, `EngineBackend` поверх `tunnel-client`, `console` с настоящим движком или `--fake`. В режиме `service` движок пока не подключён (заглушка `NullBackend`) |
+| `crates/daemon` (`tunnel-daemon`) | Ядро демона: хаб событий, IPC-сервер, замок single-instance, лог с ротацией, `FakeBackend` | Ядро, `EngineBackend` поверх `tunnel-client`, `console` с настоящим движком или `--fake`. `console` и `service` запускают настоящий движок (`DaemonEngine`); без сервера — режим ожидания `AddServer` |
 | `crates/winsvc` (`tunnel-winsvc`) | Служба Windows: SCM-вход, установка и удаление, ACL каталога данных | SCM-вход, установка и удаление службы, ACL каталога данных; подключены в `tunnel-daemon` (`service`, `install`, `uninstall`) |
 | `crates/tray` (`tunnel-tray`) | Значок в области уведомлений: IPC-клиент демона, меню, уведомления | IPC-бэкенд, Win32-оболочка и `--demo`; трей не зависит от `tunnel-client` и читает JSON-снимок. Собирается только под Windows |
 
@@ -584,8 +584,8 @@ single-instance (`tunnel-ipc::lock`, общий для демона, embedded TU
 - **Движок живёт в `crates/client`.** Отдельный крейт `tunnel-engine` не
   создавался: демон подключает `tunnel-client` как библиотеку и работает с ним
   через `Backend`.
-- **Служба без движка.** В `tunnel-daemon service` движок пока не подключён
-  (заглушка `NullBackend`); рабочий движок есть в `console`.
+- **Служба проверена только компиляцией.** `tunnel-daemon service` запускает
+  настоящий движок, но SCM, Wintun и события питания на живой Windows не прогонялись.
 - **Настройки движка при демоне.** IPC-команд для `set-transport`, `set-mtu`, `dns`
   и `import-identity` нет: при работающем демоне их меняют, остановив демон.
 - **Единая identity на машину.** Служба одна, поэтому несколько пользователей

@@ -36,7 +36,7 @@
 |---|---|
 | Ядро демона: замок, лог с ротацией, хаб событий, IPC-сервер (`crates/daemon`, `crates/ipc`) | реализовано |
 | `console`: настоящий движок по `client.json` каталога данных (`engine_backend`), а также `--fake` | реализовано |
-| Служба Windows: `service`, `install`, `uninstall` (`crates/winsvc`, обёртка SCM, установка, ACL) | реализовано; в `main.rs` режим `service` пока запускается с заглушкой `NullBackend` (пустой снимок, команды отклоняются): подключение движка к службе дорабатывается; рабочий движок сейчас в `console` |
+| Служба Windows: `service`, `install`, `uninstall` (`crates/winsvc`, обёртка SCM, установка, ACL) | реализовано: `service` и `console` запускают настоящий движок (`DaemonEngine`); данные службы — `%ProgramData%\tunnel`, `wintun.dll` только рядом с exe; без настроенного сервера демон отвечает по IPC и ждёт `AddServer`, после пробуждения — немедленное переподключение |
 | Трей: модель, IPC-бэкенд (`remote.rs`), Win32-оболочка (`crates/tray`) | реализовано; трей собирается только под Windows |
 | TUI и CLI поверх IPC (тонкий режим, `tui --remote` / `--embedded`, `crates/client/src/{api,remote,remote_cli}.rs`) | реализовано (этап 7.4) |
 

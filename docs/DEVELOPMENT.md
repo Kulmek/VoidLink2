@@ -225,7 +225,7 @@ tunnel-client.exe --dir C:\vl-a run
 | `tunnel-server` | юнит-тесты состояния групп, лимитов, персистентности; `tests/sigterm.rs` — корректная остановка по сигналу (Unix) | Linux, macOS, Windows |
 | `tunnel-ipc` | `tests/unix_socket.rs` — транспорт поверх Unix-сокета | Linux, macOS |
 | `tunnel-daemon` | `tests/ipc_e2e.rs` — демон с `FakeBackend` на настоящем Unix-сокете; `tests/engine_e2e.rs` — демон с настоящим движком; модуль `cli.rs` | Linux, macOS |
-| `tunnel-client` | `src/engine_e2e.rs` — e2e-тесты движка: настоящий сервер и движки на loopback, TUN заменён заглушкой; юнит-тесты CLI, TUI, DNS, IPv6 | везде (в CI — на Windows) |
+| `tunnel-client` | `src/engine_e2e.rs` — e2e-тесты движка: настоящий сервер и движки на loopback, TUN заменён заглушкой; юнит-тесты CLI, TUI, DNS, IPv6 | везде (в CI — ubuntu, macOS, Windows) |
 
 Сводка по командам:
 
