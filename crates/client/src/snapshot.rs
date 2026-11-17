@@ -57,7 +57,7 @@ impl PeerSnap {
             online: p.online,
             ip: p.ip,
             endpoint: p.endpoint.map(|a| a.to_string()),
-            direct: p.direct,
+            direct: p.direct(),
             last_rx_ms_ago: ms_ago(p.last_rx, now),
             last_direct_ms_ago: p.last_direct.map(|t| ms_ago(t, now)),
             rtt_ms: p.rtt_ms,
@@ -323,6 +323,7 @@ mod tests {
             friends: vec![StoredFriend { pubkey: "fp".into(), alias: "f".into() }],
             autojoin: vec![1, 2],
             theme: "dark".into(),
+            ..Config::default()
         };
         let v = CfgView::from_cfg(&cfg);
         assert_eq!(v.name, "alpha");
@@ -344,7 +345,8 @@ mod tests {
             online: true,
             ip: 5,
             endpoint: Some("1.2.3.4:5".parse().unwrap()),
-            direct: false,
+            candidates: Vec::new(),
+            direct_addr: None,
             last_rx: base + Duration::from_millis(9_750),
             last_direct: Some(base),
             rtt_ms: None,

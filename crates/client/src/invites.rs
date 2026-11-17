@@ -43,14 +43,13 @@ pub struct IncomingInvite {
 }
 
 impl From<payloads::InviteInfo> for IncomingInvite {
-    // При переходе на v3 сюда добавляется `expires_in: Some(i.expires_in)`.
     fn from(i: payloads::InviteInfo) -> Self {
         Self {
             gid: i.gid,
             group_name: i.group_name,
             from_pubkey: i.from_pubkey,
             from_name: i.from_name,
-            expires_in: None,
+            expires_in: Some(i.expires_in),
         }
     }
 }
@@ -487,9 +486,10 @@ mod tests {
             group_name: "g".into(),
             from_pubkey: [1; 32],
             from_name: "a".into(),
+            expires_in: 90,
         };
         let inc: IncomingInvite = i.into();
-        assert_eq!((inc.gid, inc.expires_in), (4, None));
+        assert_eq!((inc.gid, inc.expires_in), (4, Some(90)));
     }
 
     #[test]
