@@ -1753,3 +1753,125 @@ fn e2e_dns_имена_участников_и_ipv6_оверлей() {
     server.stop();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Сервер, «видимый» клиенту только по TCP: на порту — TCP-слушатель и
+/// UDP-сокет, который всё глотает (сеть режет UDP). Каждое TCP-соединение
+/// мостится в свой UDP-сокет к настоящему серверу (рамка `u16 LE` + кадр).
+struct TcpOnlyBridge {
+    addr: SocketAddr,
+    stop: Arc<AtomicBool>,
+    _udp_hole: UdpSocket,
+}
+
+impl TcpOnlyBridge {
+    fn start(server: SocketAddr) -> TcpOnlyBridge {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let (listener, hole) = loop {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            if let Ok(u) = UdpSocket::bind(l.local_addr().unwrap()) {
+                break (l, u);
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let st = stop.clone();
+        std::thread::spawn(move || {
+            while !st.load(Ordering::Relaxed) {
+                let Ok((tcp, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                };
+                tcp.set_nonblocking(false).unwrap();
+                let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+                udp.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+                // TCP → сервер.
+                let (mut rd, u1, s1) = (tcp.try_clone().unwrap(), udp.clone(), st.clone());
+                std::thread::spawn(move || {
+                    let mut hdr = [0u8; 2];
+                    while !s1.load(Ordering::Relaxed) && rd.read_exact(&mut hdr).is_ok() {
+                        let mut f = vec![0u8; u16::from_le_bytes(hdr) as usize];
+                        if rd.read_exact(&mut f).is_err() {
+                            break;
+                        }
+                        let _ = u1.send_to(&f, server);
+                    }
+                });
+                // Сервер → TCP.
+                let (mut wr, s2) = (tcp, st.clone());
+                std::thread::spawn(move || {
+                    let mut buf = vec![0u8; 65_535];
+                    while !s2.load(Ordering::Relaxed) {
+                        let Ok((n, src)) = udp.recv_from(&mut buf) else { continue };
+                        if src != server {
+                            continue;
+                        }
+                        let mut out = (n as u16).to_le_bytes().to_vec();
+                        out.extend_from_slice(&buf[..n]);
+                        if wr.write_all(&out).is_err() {
+                            break;
+                        }
+                    }
+                    let _ = wr.shutdown(std::net::Shutdown::Both);
+                });
+            }
+        });
+        TcpOnlyBridge { addr, stop, _udp_hole: hole }
+    }
+}
+
+impl Drop for TcpOnlyBridge {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn e2e_udp_заблокирован_движок_уходит_на_tcp() {
+    let dir = temp_dir("tcp-fallback");
+    let server = start_server(&dir, 0);
+    let bridge = TcpOnlyBridge::start(local(server.addr));
+
+    let mut a = Node::start("alpha", &server);
+    a.wait("A подключён", T, |e| matches!(e, Event::Connected(_)));
+    assert_eq!(a.eng.meta.lock().unwrap().transport, engine::Transport::Udp);
+
+    // B видит сервер только по TCP: auto — несколько HELLO3 по UDP, потом TCP.
+    let cfg = Config { name: "bravo".into(), ..Config::default() };
+    let mut b = Node::start_cfg(cfg, bridge.addr, server.pubkey, proto::Identity::generate(), Arc::new(|_| {}))
+        .expect("B подключается по TCP");
+    assert_eq!(b.eng.meta.lock().unwrap().transport, engine::Transport::Tcp);
+
+    let gid = a.create("tcp", false);
+    b.join(gid);
+    wait_until("оба видят друг друга онлайн", T, || a.sees_online(gid, 1) && b.sees_online(gid, 1));
+    deliver(&a, &b, gid, "a-to-b", T);
+    deliver(&b, &a, gid, "b-to-a", T);
+
+    // Режим tcp: сразу по TCP, без попыток по UDP.
+    let cfg = Config {
+        name: "charlie".into(),
+        transport: crate::store::TransportMode::Tcp,
+        ..Config::default()
+    };
+    let t0 = Instant::now();
+    let c = Node::start_cfg(cfg, bridge.addr, server.pubkey, proto::Identity::generate(), Arc::new(|_| {}))
+        .expect("C подключается по TCP");
+    assert!(t0.elapsed() < Duration::from_secs(2), "режим tcp не ждёт UDP");
+    assert_eq!(c.eng.meta.lock().unwrap().transport, engine::Transport::Tcp);
+
+    // CLI-соединение: тот же фолбэк.
+    let cli = engine::CtrlConn::connect(
+        &Config { name: "delta".into(), ..Config::default() },
+        bridge.addr,
+        &server.pubkey,
+        &proto::Identity::generate(),
+    )
+    .expect("CtrlConn по TCP");
+    assert!(cli.via_tcp());
+    cli.send_ctrl(ctrl::CTRL_PING, &[]);
+    cli.wait_for(ctrl::CTRL_PONG, T).expect("PONG по TCP");
+    drop(b);
+    let _ = std::fs::remove_dir_all(&dir);
+}
