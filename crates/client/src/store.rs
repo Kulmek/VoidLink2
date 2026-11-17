@@ -59,6 +59,19 @@ pub struct Config {
     /// и при смене сервера чужие gid вошли бы в посторонние группы.
     #[serde(default)]
     pub autojoin_by_server: BTreeMap<String, Vec<u32>>,
+    /// Транспорт до сервера: auto | udp | tcp (CLI `set-transport`).
+    #[serde(default = "default_transport")]
+    pub transport: String,
+    /// Встроенный DNS для имён пиров (`*.vl`, CLI `dns on|off`).
+    #[serde(default)]
+    pub dns: bool,
+}
+
+/// Допустимые значения `Config::transport`.
+pub const TRANSPORTS: [&str; 3] = ["auto", "udp", "tcp"];
+
+fn default_transport() -> String {
+    "auto".into()
 }
 
 impl Default for Config {
@@ -76,6 +89,8 @@ impl Default for Config {
             invisible: false,
             active_server: String::new(),
             autojoin_by_server: BTreeMap::new(),
+            transport: default_transport(),
+            dns: false,
         }
     }
 }
