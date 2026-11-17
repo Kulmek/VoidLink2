@@ -144,9 +144,11 @@ where
         return Some(response(id, rd, RCODE_REFUSED, question, &[]));
     }
 
-    let resolved = lookup(&labels, resolve);
-    let Some((v4, v6)) = resolved else {
-        return Some(response(id, rd, RCODE_NXDOMAIN, question, &[]));
+    let (v4, v6) = match lookup(&labels, resolve) {
+        Lookup::Found(r) => r,
+        // имя-узел существует (apex или возможная группа) — NOERROR без ответов
+        Lookup::NoData => return Some(response(id, rd, RCODE_NOERROR, question, &[])),
+        Lookup::NxDomain => return Some(response(id, rd, RCODE_NXDOMAIN, question, &[])),
     };
     let mut answers: Vec<(u16, Vec<u8>)> = Vec::new();
     if let (TYPE_A | TYPE_ANY, Some(a)) = (qtype, v4) {
@@ -189,15 +191,30 @@ fn parse_qname(q: &[u8], mut off: usize) -> Option<(Vec<String>, usize)> {
     Some((labels, off))
 }
 
+/// Результат сопоставления имени.
+enum Lookup {
+    Found(Resolved),
+    /// Узел может существовать (apex `vl`, `<group>.vl`) — NOERROR без ответов.
+    /// NXDOMAIN здесь недопустим: по RFC 8020 резолвер закэширует «ниже ничего
+    /// нет» и перестанет спрашивать `<member>.<group>.vl`.
+    NoData,
+    NxDomain,
+}
+
 /// Сопоставить метки с `<member>.vl` / `<member>.<group>.vl`.
-fn lookup<F>(labels: &[String], resolve: &F) -> Option<Resolved>
+fn lookup<F>(labels: &[String], resolve: &F) -> Lookup
 where
     F: Fn(&str, Option<&str>) -> Option<Resolved>,
 {
+    let found = |r: Option<Resolved>, miss: Lookup| r.map_or(miss, Lookup::Found);
     match labels {
-        [member, suffix] if suffix == DNS_SUFFIX => resolve(member, None),
-        [member, group, suffix] if suffix == DNS_SUFFIX => resolve(member, Some(group)),
-        _ => None,
+        [suffix] if suffix == DNS_SUFFIX => Lookup::NoData,
+        // двухметочное имя может оказаться группой — не NXDOMAIN
+        [member, suffix] if suffix == DNS_SUFFIX => found(resolve(member, None), Lookup::NoData),
+        [member, group, suffix] if suffix == DNS_SUFFIX => {
+            found(resolve(member, Some(group)), Lookup::NxDomain)
+        }
+        _ => Lookup::NxDomain,
     }
 }
 
@@ -373,13 +390,20 @@ pub fn normalize_label(display: &str) -> String {
 
 /// Windows: PowerShell-команда добавления NRPT-правила для `.vl`.
 pub fn windows_nrpt_add() -> String {
-    format!("Add-DnsClientNrptRule -Namespace \".{DNS_SUFFIX}\" -NameServers \"{DNS_ADDR}\"")
+    // сначала убираем свои старые правила — повторный вызов не плодит дубликаты
+    format!(
+        "{}; Add-DnsClientNrptRule -Namespace \".{DNS_SUFFIX}\" -NameServers \"{DNS_ADDR}\" -Comment \"{NRPT_COMMENT}\"",
+        windows_nrpt_remove()
+    )
 }
+
+/// Метка наших NRPT-правил (чтобы не трогать пользовательские `.vl`).
+const NRPT_COMMENT: &str = "VoidLink";
 
 /// Windows: PowerShell-команда удаления наших NRPT-правил.
 pub fn windows_nrpt_remove() -> String {
     format!(
-        "Get-DnsClientNrptRule | Where-Object {{ $_.Namespace -eq '.{DNS_SUFFIX}' }} | Remove-DnsClientNrptRule -Force"
+        "Get-DnsClientNrptRule | Where-Object {{ $_.Namespace -eq '.{DNS_SUFFIX}' -and $_.Comment -eq '{NRPT_COMMENT}' }} | Remove-DnsClientNrptRule -Force"
     )
 }
 
@@ -560,8 +584,18 @@ mod tests {
     }
 
     #[test]
+    fn apex_and_two_label_misses_nodata() {
+        for name in ["vl", "VL", "nobody.vl", "work.vl"] {
+            let r = ask(name, TYPE_A);
+            assert_eq!(r.rcode(), RCODE_NOERROR, "{name}");
+            assert_eq!(r.qd(), 1);
+            assert_eq!(r.an(), 0);
+        }
+    }
+
+    #[test]
     fn unknown_names_nxdomain() {
-        for name in ["nobody.vl", "alpha.other.vl", "alpha.com", "vl", "a.b.c.vl", "alpha.vl.example"] {
+        for name in ["alpha.other.vl", "alpha.com", "a.b.c.vl", "alpha.vl.example"] {
             let r = ask(name, TYPE_A);
             assert_eq!(r.rcode(), RCODE_NXDOMAIN, "{name}");
             assert_eq!(r.qd(), 1);
@@ -701,12 +735,14 @@ mod tests {
 
     #[test]
     fn os_commands() {
-        assert_eq!(
-            windows_nrpt_add(),
-            "Add-DnsClientNrptRule -Namespace \".vl\" -NameServers \"100.66.0.53\""
-        );
+        let add = windows_nrpt_add();
+        assert!(add.starts_with(&windows_nrpt_remove()), "{add}");
+        assert!(add.ends_with(
+            "; Add-DnsClientNrptRule -Namespace \".vl\" -NameServers \"100.66.0.53\" -Comment \"VoidLink\""
+        ));
         assert!(windows_nrpt_remove().contains("Remove-DnsClientNrptRule"));
         assert!(windows_nrpt_remove().contains("'.vl'"));
+        assert!(windows_nrpt_remove().contains("$_.Comment -eq 'VoidLink'"));
         let l = linux_resolvectl_setup("voidlink0");
         assert_eq!(l[0], ["resolvectl", "dns", "voidlink0", "100.66.0.53"]);
         assert_eq!(l[1], ["resolvectl", "domain", "voidlink0", "~vl"]);
