@@ -6,6 +6,7 @@
 
 pub mod app;
 pub mod identicon;
+pub mod servers;
 pub mod setup;
 pub mod theme;
 pub mod ui;
