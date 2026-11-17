@@ -1,0 +1,31 @@
+[package]
+name = "tunnel-daemon"
+version = "0.2.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "tunnel_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tunnel-daemon"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+tunnel-client = { path = "../client" }
+tunnel-ipc = { path = "../ipc" }
+tunnel-protocol = { path = "../protocol" }
+tunnel-winsvc = { path = "../winsvc" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Threading"] }
+
+[dev-dependencies]
+# e2e: настоящий движок против сервера в том же процессе.
+tunnel-server = { path = "../server" }

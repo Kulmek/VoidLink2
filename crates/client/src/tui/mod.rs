@@ -1,11 +1,18 @@
 //! TUI-режим клиента (ratatui + crossterm).
 //!
-//! Движок ничего не знает про UI: TUI читает состояние (`Engine::groups`,
-//! `Engine::meta`, `Engine::stats`), шлёт команды (`Engine::cmds`) и слушает
-//! события (`Engine::events`).
+//! Движок ничего не знает про UI: TUI видит его через [`EngineApi`] —
+//! снимок состояния, события и команды. Два режима (PLAN.md 7.4):
+//! [`run`] — embedded, движок в этом процессе ([`LocalEngine`], нужны права
+//! на TUN); [`run_remote`] — тонкий клиент демона ([`IpcEngine`]).
 
+pub mod admin;
 pub mod app;
+pub mod badges;
+pub mod clipboard;
+pub mod clock;
 pub mod identicon;
+pub mod keymap;
+pub mod servers;
 pub mod setup;
 pub mod theme;
 pub mod ui;
@@ -20,11 +27,13 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::prelude::*;
 
-use crate::engine::{self, Engine};
+use crate::api::{EngineApi, LocalEngine};
+use crate::engine::{self, Cmd};
+use crate::remote::IpcEngine;
 use crate::store::{Config, Store};
 
 use app::App;
@@ -39,6 +48,9 @@ pub fn run(
     dll: Option<String>,
     store: Arc<Store>,
 ) -> Result<()> {
+    let dll_path = dll.clone().unwrap_or_default();
+    // Смещение локального времени — до запуска потоков движка.
+    clock::init();
     let shared = Arc::new(Mutex::new((*cfg).clone()));
     let save_store = store.clone();
     let save = move |c: &Config| {
@@ -54,13 +66,33 @@ pub fn run(
         Arc::new(save),
     )?;
 
-    let mut term = setup_terminal(true)?;
     let cfg_snapshot = eng.cfg.lock().unwrap().clone();
-    let mut app = App::new(eng.my_pub, &eng.my_code, &cfg_snapshot);
+    let eng = LocalEngine::new(eng);
+
+    let mut term = setup_terminal(true)?;
+    let mut app = App::new(eng.me().my_pub, &eng.me().my_code, &cfg_snapshot);
+    // Экран «Серверы» показывает то, с чем клиент запущен на самом деле.
+    app.adapter_name = adapter_name.to_string();
+    app.dll_path = dll_path;
     let res = event_loop(&mut term, &mut app, &eng);
     restore_terminal(&mut term)?;
     // Останавливаем движок (потоки туннеля).
-    let _ = eng.cmds.send(engine::Cmd::Quit);
+    let _ = eng.send(Cmd::Quit);
+    res
+}
+
+/// Тонкий клиент: движок в демоне, TUI только рисует и шлёт команды
+/// (права администратора не нужны). `ui` — локальные настройки (тема).
+/// Закрытие TUI туннель не трогает.
+pub fn run_remote(eng: IpcEngine, ui: &Config) -> Result<()> {
+    clock::init();
+    let mut term = setup_terminal(true)?;
+    let mut app = App::new(eng.me().my_pub, &eng.me().my_code, ui);
+    // Адаптер и dll — у демона, TUI их не знает.
+    app.adapter_name = String::new();
+    app.dll_path = String::new();
+    let res = event_loop(&mut term, &mut app, &eng);
+    restore_terminal(&mut term)?;
     res
 }
 
@@ -95,7 +127,11 @@ fn install_panic_hook() {
 
 pub(crate) fn restore_terminal(term: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     disable_raw_mode()?;
-    execute!(term.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
+    execute!(
+        term.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     term.show_cursor()?;
     Ok(())
 }
@@ -103,7 +139,7 @@ pub(crate) fn restore_terminal(term: &mut Terminal<CrosstermBackend<Stdout>>) ->
 fn event_loop(
     term: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
-    eng: &Engine,
+    eng: &dyn EngineApi,
 ) -> Result<()> {
     let tick = Duration::from_millis(120);
     loop {
@@ -124,10 +160,8 @@ fn event_loop(
                         app.handle_key(key, eng);
                     }
                     Event::Mouse(m) => {
-                        significant = !matches!(
-                            m.kind,
-                            MouseEventKind::Moved | MouseEventKind::Drag(_)
-                        );
+                        significant =
+                            !matches!(m.kind, MouseEventKind::Moved | MouseEventKind::Drag(_));
                         app.handle_mouse(m, eng);
                     }
                     _ => {}

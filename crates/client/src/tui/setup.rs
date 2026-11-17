@@ -13,7 +13,7 @@ use std::time::Duration;
 use anyhow::Result;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use tunnel_protocol as proto;
 
 use super::theme::{Theme, ThemeKind};
@@ -155,7 +155,8 @@ impl Form {
         let addr = self.addr.trim();
         if !addr.is_empty() {
             let pk = proto::hex_of(
-                &proto::Identity::parse_friend_code(self.code.trim()).expect("код проверен validate"),
+                &proto::Identity::parse_friend_code(self.code.trim())
+                    .expect("код проверен validate"),
             );
             if let Some(existing) = cfg.servers.iter_mut().find(|s| s.addr == addr) {
                 // Сервер уже есть — обновляем закреплённый ключ.
@@ -163,13 +164,21 @@ impl Form {
             } else {
                 cfg.servers.insert(
                     0,
-                    StoredServer { addr: addr.to_string(), pubkey: pk, label: String::new() },
+                    StoredServer {
+                        addr: addr.to_string(),
+                        pubkey: pk,
+                        label: String::new(),
+                    },
                 );
             }
         }
         *adapter = self.adapter.trim().to_string();
         let dll_path = self.dll.trim();
-        *dll = if dll_path.is_empty() { None } else { Some(dll_path.to_string()) };
+        *dll = if dll_path.is_empty() {
+            None
+        } else {
+            Some(dll_path.to_string())
+        };
     }
 }
 
@@ -182,12 +191,16 @@ enum Action {
 /// Показывает экран настройки. Возвращает `true` — продолжать запуск
 /// (конфиг/флаги обновлены), `false` — пользователь отменил.
 pub fn run(cfg: &mut Config, adapter: &mut String, dll: &mut Option<String>) -> Result<bool> {
-    let kind = ThemeKind::from_str(&cfg.theme).unwrap_or(ThemeKind::Dark);
+    let kind = ThemeKind::from_key(&cfg.theme).unwrap_or(ThemeKind::Dark);
     let th = Theme::of(kind);
     let mut form = Form {
         sel: 0,
         name: cfg.name.clone(),
-        addr: cfg.servers.first().map(|s| s.addr.clone()).unwrap_or_default(),
+        addr: cfg
+            .servers
+            .first()
+            .map(|s| s.addr.clone())
+            .unwrap_or_default(),
         code: String::new(),
         adapter: adapter.clone(),
         dll: dll.clone().unwrap_or_default(),
@@ -212,27 +225,31 @@ fn loop_(
     loop {
         let errs = form.validate(!cfg.servers.is_empty());
         term.draw(|f| draw(f, form, &errs, th, my_code))?;
-        if event::poll(Duration::from_millis(120))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                match handle_key(key, form, !cfg.servers.is_empty()) {
-                    Action::Cancel => return Ok(false),
-                    Action::Apply => {
-                        if errs.is_empty() {
-                            form.apply(cfg, adapter, dll);
-                            return Ok(true);
-                        }
+        if event::poll(Duration::from_millis(120))?
+            && let Event::Key(key) = event::read()?
+        {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match handle_key(key, form, !cfg.servers.is_empty()) {
+                Action::Cancel => return Ok(false),
+                Action::Apply => {
+                    if errs.is_empty() {
+                        form.apply(cfg, adapter, dll);
+                        return Ok(true);
                     }
-                    Action::Continue => {}
                 }
+                Action::Continue => {}
             }
         }
     }
 }
 
-fn handle_key(key: ratatui::crossterm::event::KeyEvent, form: &mut Form, has_servers: bool) -> Action {
+fn handle_key(
+    key: ratatui::crossterm::event::KeyEvent,
+    form: &mut Form,
+    has_servers: bool,
+) -> Action {
     // Ctrl-C — выход без сохранения.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Action::Cancel;
@@ -271,6 +288,8 @@ fn handle_key(key: ratatui::crossterm::event::KeyEvent, form: &mut Form, has_ser
 }
 
 fn draw(f: &mut Frame, form: &Form, errs: &[String], th: &Theme, my_code: &str) {
+    // Фон — цветом темы, как и в основном экране.
+    f.render_widget(Block::default().style(th.frame()), f.area());
     let area = centered(f.area(), 72, 15 + errs.len() as u16);
     f.render_widget(Clear, area);
 
@@ -289,13 +308,13 @@ fn draw(f: &mut Frame, form: &Form, errs: &[String], th: &Theme, my_code: &str) 
             };
             let mut rows = vec![Line::from(vec![
                 Span::styled(format!("{:<15}", field.label()), th.dim),
-                Span::styled(
-                    value,
-                    if sel { th.focused_border } else { th.base },
-                ),
+                Span::styled(value, if sel { th.focused_border } else { th.base }),
             ])];
             if sel {
-                rows.push(Line::from(Span::styled(format!("  {}", field.hint()), th.dim)));
+                rows.push(Line::from(Span::styled(
+                    format!("  {}", field.hint()),
+                    th.dim,
+                )));
             }
             rows
         })
@@ -318,8 +337,10 @@ fn draw(f: &mut Frame, form: &Form, errs: &[String], th: &Theme, my_code: &str) 
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(th.accent)
-        .title(" Первичная настройка Tunnel ")
+        .border_type(BorderType::Rounded)
+        .border_style(th.focused_border)
+        .style(th.surface())
+        .title(Span::styled(" ◆ Первичная настройка Tunnel ", th.title))
         .title_bottom(Line::from(Span::styled(
             format!(" твой friend code: {my_code} "),
             th.dim,
@@ -356,7 +377,8 @@ mod tests {
     fn render(form: &Form, errs: &[String], w: u16, h: u16) -> String {
         let mut term = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
         let th = Theme::of(ThemeKind::Dark);
-        term.draw(|f| draw(f, form, errs, &th, "TUN-TEST-CODE")).unwrap();
+        term.draw(|f| draw(f, form, errs, &th, "TUN-TEST-CODE"))
+            .unwrap();
         let buf = term.backend().buffer().clone();
         let mut out = String::new();
         for y in 0..h {
@@ -372,7 +394,10 @@ mod tests {
     fn экран_настройки_рисуется() {
         let f = form("", "", "");
         let text = render(&f, &f.validate(false), 100, 30);
-        assert!(text.contains("Первичная настройка"), "нет заголовка:\n{text}");
+        assert!(
+            text.contains("Первичная настройка"),
+            "нет заголовка:\n{text}"
+        );
         assert!(text.contains("имя"), "нет поля имени");
         assert!(text.contains("код сервера"), "нет поля кода");
         assert!(text.contains("TUN-TEST-CODE"), "нет friend code");

@@ -2,15 +2,36 @@
 name = "tunnel-client"
 version = "0.2.0"
 edition = "2024"
+publish = false
+
+[lib]
+name = "tunnel_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tunnel-client"
+path = "src/main.rs"
 
 [dependencies]
-tunnel-protocol = { path = "../protocol" }
+tunnel-protocol = { path = "../protocol", features = ["serde"] }
+# IPC с демоном (PLAN.md 7.4): IpcEngine, CLI через демон, замок single-instance.
+tunnel-ipc = { path = "../ipc" }
 anyhow.workspace = true
+blake3.workspace = true
+chacha20poly1305.workspace = true
+rand.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
 wintun.workspace = true
+windows-sys = { version = "0.61", features = ["Win32_System_Time", "Win32_Foundation"] }
+
+[target.'cfg(unix)'.dependencies]
+# TUN на Linux/macOS (tun_linux.rs, tun_macos.rs), часы (tui/clock.rs).
+libc = "0.2"
 
 [dev-dependencies]
 # e2e-тесты движка: настоящий сервер в том же процессе.
