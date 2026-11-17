@@ -313,6 +313,19 @@ fn main() -> Result<()> {
 
     // Демон или чужой движок — до любых правок client.json (PLAN.md 7.4).
     let cmd0 = args.first().cloned().unwrap_or_else(|| "tui".into());
+    // export-identity локальная, но при работающем демоне выгрузила бы не ту
+    // identity, что держит туннель (служба Windows — своя, в ProgramData).
+    if cmd0 == "export-identity"
+        && let Route::Daemon(c) = remote_cli::route(&dir)?
+    {
+        let local = store::Store::new(&dir)
+            .load()
+            .ok()
+            .filter(|c| c.identity.is_some())
+            .map(|mut c| store::ensure_identity(&mut c).ed_pub());
+        let me = tunnel_client::api::Me::from_json(c.me());
+        remote_cli::export_guard(me.as_ref(), local, &dir)?;
+    }
     if remote_cli::is_engine_cmd(&cmd0) {
         match remote_cli::route(&dir)? {
             Route::Daemon(mut c) => {

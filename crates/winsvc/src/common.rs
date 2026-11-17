@@ -303,10 +303,105 @@ pub fn wintun_dll_beside(exe: &Path) -> Result<PathBuf> {
     Ok(dll)
 }
 
-/// Путь к `wintun.dll` для службы: только `current_exe().parent()`.
+/// Путь к `wintun.dll` для службы: только `current_exe().parent()`. На
+/// Windows каталог, exe и DLL должны быть доступны на запись только
+/// администраторам ([`verify_install_dir`]) — иначе DLL не грузится.
 pub fn service_wintun_dll() -> Result<PathBuf> {
     let exe = std::env::current_exe().context("не удалось узнать путь exe")?;
+    #[cfg(windows)]
+    crate::acl::verify_install_dir(&exe)?;
     wintun_dll_beside(&exe)
+}
+
+// ---------- ACL: кому можно писать в каталог установки ----------
+
+/// TrustedInstaller (`NT SERVICE\TrustedInstaller`).
+pub const TRUSTED_INSTALLER_SID: &str =
+    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+/// Кому разрешено владеть и писать в каталог установки службы и её файлы.
+pub const TRUSTED_WRITER_SIDS: [&str; 3] = ["S-1-5-18", "S-1-5-32-544", TRUSTED_INSTALLER_SID];
+
+/// Права, дающие подменить содержимое файла/каталога: `FILE_WRITE_DATA`
+/// (`ADD_FILE`), `FILE_APPEND_DATA` (`ADD_SUBDIRECTORY`), `FILE_DELETE_CHILD`,
+/// `DELETE`, `WRITE_DAC`, `WRITE_OWNER`, `GENERIC_ALL`, `GENERIC_WRITE`,
+/// `MAXIMUM_ALLOWED`.
+pub const WRITE_MASK: u32 =
+    0x2 | 0x4 | 0x40 | 0x1_0000 | 0x4_0000 | 0x8_0000 | 0x1000_0000 | 0x4000_0000 | 0x0200_0000;
+/// Для каталогов-предков: права, дающие переименовать/удалить потомка или
+/// сам каталог (подменить путь целиком): `FILE_DELETE_CHILD`, `DELETE`,
+/// `WRITE_DAC`, `WRITE_OWNER`, `GENERIC_ALL`, `MAXIMUM_ALLOWED`. Создавать
+/// новые подкаталоги (как в `C:\` у Users) — можно.
+pub const REPLACE_MASK: u32 = 0x40 | 0x1_0000 | 0x4_0000 | 0x8_0000 | 0x1000_0000 | 0x0200_0000;
+
+/// Тип ACE в DACL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AceKind {
+    Allow,
+    Deny,
+    /// Разрешающий ACE, SID которого не разобран (объектные ACE и т. п.) —
+    /// считается разрешением неизвестному.
+    UnknownAllow,
+    /// Аудит, метки и прочее — на доступ не влияет.
+    Other,
+}
+
+/// ACE в разобранном виде.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ace {
+    pub kind: AceKind,
+    /// Строковый SID (`S-1-…`), пусто для `UnknownAllow`.
+    pub sid: String,
+    pub mask: u32,
+    /// `INHERIT_ONLY_ACE`: к самому объекту не применяется.
+    pub inherit_only: bool,
+}
+
+/// Владелец и DACL объекта не дают записи никому, кроме SYSTEM,
+/// Administrators и TrustedInstaller (по маске `mask`). `dacl = None` —
+/// NULL DACL (полный доступ всем). Ошибка — с причиной.
+pub fn check_admin_only(path: &Path, owner: &str, dacl: Option<&[Ace]>, mask: u32) -> Result<()> {
+    if !TRUSTED_WRITER_SIDS.contains(&owner) {
+        bail!(
+            "владелец {} — {owner}, а не SYSTEM/Administrators/TrustedInstaller",
+            path.display()
+        );
+    }
+    let Some(dacl) = dacl else {
+        bail!("у {} нет DACL — запись разрешена всем", path.display());
+    };
+    for ace in dacl {
+        if ace.inherit_only || ace.mask & mask == 0 {
+            continue;
+        }
+        match ace.kind {
+            AceKind::Allow if TRUSTED_WRITER_SIDS.contains(&ace.sid.as_str()) => {}
+            AceKind::Allow => bail!(
+                "{} доступен на запись {} (права {:#x})",
+                path.display(),
+                ace.sid,
+                ace.mask
+            ),
+            AceKind::UnknownAllow => bail!(
+                "{}: неразобранный разрешающий ACE (права {:#x})",
+                path.display(),
+                ace.mask
+            ),
+            AceKind::Deny | AceKind::Other => {}
+        }
+    }
+    Ok(())
+}
+
+/// Текст отказа установки/запуска из небезопасного каталога.
+pub fn unsafe_install_dir_msg(dir: &Path, why: &str) -> String {
+    format!(
+        "каталог {} небезопасен для службы: {why}. Служба работает от SYSTEM и грузит \
+отсюда exe и {WINTUN_DLL} — подмена файла обычным пользователем = его код от SYSTEM. \
+Установите через infrastructure\\windows\\install.ps1 (копирует файлы в %ProgramFiles%\\Tunnel) \
+или скопируйте {DAEMON_EXE} и {WINTUN_DLL} в %ProgramFiles%\\Tunnel и запустите \
+«tunnel-daemon install» оттуда",
+        dir.display()
+    )
 }
 
 /// Строка PowerShell в одинарных кавычках (подстановок нет). Удваиваются
@@ -562,6 +657,69 @@ mod tests {
         assert!(wintun_dll_beside(Path::new("tunnel-daemon.exe")).is_err());
         assert!(wintun_dll_beside(Path::new("rel/tunnel-daemon.exe")).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn ace(kind: AceKind, sid: &str, mask: u32, inherit_only: bool) -> Ace {
+        Ace {
+            kind,
+            sid: sid.into(),
+            mask,
+            inherit_only,
+        }
+    }
+
+    #[test]
+    fn admin_only_acl() {
+        let p = Path::new(r"C:\Program Files\Tunnel");
+        const FA: u32 = 0x1f_01ff;
+        const RX: u32 = 0x12_00a9;
+        let users = "S-1-5-32-545";
+        let me = "S-1-5-21-1-2-3-1001";
+        // Раскладка install.ps1: SY/BA — всё, Users — чтение; CREATOR OWNER
+        // только наследуемый.
+        let good = vec![
+            ace(AceKind::Allow, "S-1-5-18", FA, false),
+            ace(AceKind::Allow, "S-1-5-32-544", FA, false),
+            ace(AceKind::Allow, users, RX, false),
+            ace(AceKind::Allow, "S-1-3-0", 0x1000_0000, true),
+            ace(AceKind::Allow, TRUSTED_INSTALLER_SID, FA, false),
+            ace(AceKind::Deny, "", FA, false),
+        ];
+        check_admin_only(p, "S-1-5-32-544", Some(&good), WRITE_MASK).unwrap();
+        check_admin_only(p, TRUSTED_INSTALLER_SID, Some(&good), WRITE_MASK).unwrap();
+        // Владелец — пользователь (неявный WRITE_DAC).
+        let e = check_admin_only(p, me, Some(&good), WRITE_MASK).unwrap_err();
+        assert!(e.to_string().contains(me), "{e}");
+        // NULL DACL.
+        assert!(check_admin_only(p, "S-1-5-18", None, WRITE_MASK).is_err());
+        // Запись для Users / Authenticated Users / Everyone / самого пользователя.
+        for (sid, mask) in [
+            (users, 0x2),
+            ("S-1-5-11", 0x1_0000),
+            ("S-1-1-0", 0x4000_0000),
+            (me, 0x4_0000),
+        ] {
+            let mut bad = good.clone();
+            bad.push(ace(AceKind::Allow, sid, mask, false));
+            let e = check_admin_only(p, "S-1-5-18", Some(&bad), WRITE_MASK).unwrap_err();
+            assert!(e.to_string().contains(sid), "{e}");
+        }
+        let mut bad = good.clone();
+        bad.push(ace(AceKind::UnknownAllow, "", 0x2, false));
+        assert!(check_admin_only(p, "S-1-5-18", Some(&bad), WRITE_MASK).is_err());
+        // Предок: создавать подкаталоги (как Users в C:\) можно, удалять детей — нет.
+        let mut root = good.clone();
+        root.push(ace(AceKind::Allow, users, 0x4 | 0x2, false));
+        check_admin_only(Path::new(r"C:\"), "S-1-5-18", Some(&root), REPLACE_MASK).unwrap();
+        root.push(ace(AceKind::Allow, users, 0x40, false));
+        assert!(
+            check_admin_only(Path::new(r"C:\"), "S-1-5-18", Some(&root), REPLACE_MASK).is_err()
+        );
+        let m = unsafe_install_dir_msg(p, "x");
+        assert!(
+            m.contains("install.ps1") && m.contains("%ProgramFiles%"),
+            "{m}"
+        );
     }
 
     #[test]

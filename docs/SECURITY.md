@@ -367,8 +367,23 @@ Identity машины, а не пользователя: `%APPDATA%` у LocalSys
   `winsvc::service_wintun_dll` (✅, её использует служба) берёт только `current_exe().parent()`:
   без `PATH`, без системных каталогов, без относительных путей. Если DLL рядом
   нет, служба возвращает ошибку, а не ищет в других местах.
+- **Каталог установки — только для администраторов** (✅). `tunnel-daemon install`
+  и служба при старте (`winsvc::verify_install_dir`) проверяют владельца и DACL
+  каталога exe, самого exe и `wintun.dll`: писать может только SYSTEM,
+  Administrators или TrustedInstaller (без ACE на запись для Users,
+  Authenticated Users, Everyone и самого пользователя), а каталоги выше не дают
+  переименовать или удалить потомка. Иначе `install` отказывает с подсказкой
+  (`install.ps1`, `%ProgramFiles%\Tunnel`), а служба не загружает DLL.
+  `install.ps1` выставляет каталогу явный DACL.
 - **Флаг `--dll` в службе запрещён** для пути из пользовательского каталога.
-  Иначе подмена DLL давала бы код от SYSTEM.
+  Иначе подмена DLL давала бы код от SYSTEM. `console` тоже берёт DLL только
+  рядом с exe и не читает `dll` из `client.json` (конфиг правится по IPC).
+- **`console` на Windows** создаёт каталог данных с ACL службы, а незащищённый
+  существующий каталог отказывается использовать (✅).
+- **Мьютекс single-instance** `Global\TunnelEngine` может создать любой
+  пользователь, поэтому учитывается только мьютекс с владельцем SYSTEM,
+  Administrators или текущим пользователем; захват имени посторонним не
+  блокирует ни службу, ни CLI (✅, `crates/ipc/src/lock.rs`).
 - **Фолбэк на голое имя.** В `crates/client/src/tun.rs` (`load_wintun_dll`) остаётся загрузка по имени `wintun.dll` для CLI и TUI; служба использует `service_wintun_dll`.
 - **Восстановление службы.** Заданы failure actions (перезапуск через 5, 10 и 30 с).
 - **Удаление.** `tunnel-daemon uninstall` снимает службу; данные удаляются только с `--purge`.
@@ -434,4 +449,6 @@ Identity машины, а не пользователя: `%APPDATA%` у LocalSys
 | Права на `client.json` (явные) | ⏳ | раздел 12 |
 | IPC-пайп: SDDL, FIRST_PIPE_INSTANCE, проверка SYSTEM | ✅ (транспорт) | `crates/ipc/src/transport/windows.rs`; служба подключена |
 | Wintun DLL: только рядом с exe (`service_wintun_dll`) | ✅ | `crates/winsvc/src/common.rs`, `crates/daemon/src/service.rs` |
+| Каталог установки службы: запись только администраторам (`verify_install_dir`) | ✅ | `crates/winsvc/src/acl.rs`, `install.rs` |
+| Замок single-instance: владелец мьютекса (Windows), `O_NOFOLLOW` и каталог без записи для других (Unix) | ✅ | `crates/ipc/src/lock.rs` |
 | ACL каталога данных службы | ✅ | `crates/winsvc/src/install.rs`, `DATA_DIR_SDDL` |

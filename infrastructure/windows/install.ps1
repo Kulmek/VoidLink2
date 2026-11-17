@@ -4,8 +4,10 @@
     Установка/обновление клиента VoidLink на Windows: служба tunnel-daemon + трей.
 .DESCRIPTION
     Копирует tunnel-daemon.exe, tunnel-client.exe, tunnel-tray.exe и wintun.dll
-    в %ProgramFiles%\Tunnel (каталог, куда пишет только администратор — DLL
-    грузится службой только оттуда), регистрирует службу командой
+    в %ProgramFiles%\Tunnel и выставляет каталогу явные права (запись — только
+    SYSTEM и администраторы: DLL грузится службой только оттуда, а служба и
+    "tunnel-daemon install" отказываются работать из каталога, куда может
+    писать обычный пользователь), регистрирует службу командой
     "tunnel-daemon install", запускает её и трей. Повторный запуск — обновление:
     служба останавливается, exe заменяются, служба стартует снова.
 .PARAMETER Source
@@ -75,7 +77,6 @@ Get-Process -Name 'tunnel-tray', 'tunnel-client' -ErrorAction SilentlyContinue |
 Start-Sleep -Milliseconds 500
 
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-# Каталог установки: наследуемые права Program Files (запись — только админы/SYSTEM)
 foreach ($f in $Files) {
     Copy-Item -LiteralPath (Join-Path $Source $f) -Destination (Join-Path $InstallDir $f) -Force
 }
@@ -84,6 +85,22 @@ if (Test-Path -LiteralPath $uninst) {
     Copy-Item -LiteralPath $uninst -Destination (Join-Path $InstallDir 'uninstall.ps1') -Force
 }
 Write-Host "Файлы скопированы в $InstallDir"
+
+# Явные права каталога установки: служба (SYSTEM) грузит отсюда exe и
+# wintun.dll, и "tunnel-daemon install" / старт службы отказываются, если
+# писать сюда может кто-то кроме SYSTEM/Administrators/TrustedInstaller
+# (в т.ч. сам установивший пользователь — через CREATOR OWNER Program Files).
+# Каталог: без наследования, SYSTEM и Administrators — полный доступ,
+# Users — чтение и запуск; файлы — сброс на наследуемые права; владелец везде
+# — Administrators.
+function Invoke-Icacls {
+    & icacls.exe @args | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "icacls $($args -join ' ') завершился с кодом $LASTEXITCODE" }
+}
+Invoke-Icacls $InstallDir '/inheritance:r' '/grant:r' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' '/C' '/Q'
+Invoke-Icacls (Join-Path $InstallDir '*') '/reset' '/T' '/C' '/Q'
+Invoke-Icacls $InstallDir '/setowner' '*S-1-5-32-544' '/T' '/C' '/Q'
+Write-Host "Права ${InstallDir}: запись — только SYSTEM и администраторы"
 
 $daemon = Join-Path $InstallDir 'tunnel-daemon.exe'
 if (-not $svc) {

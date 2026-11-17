@@ -40,20 +40,13 @@ pub const ADAPTER_NAME: &str = "TunnelVPN";
 /// команд — тот же код, что у embedded TUI) в JSON-обёртке.
 pub struct EngineBackend {
     local: LocalEngine,
-    /// Что ещё живёт вместе с движком (tun-поток демона).
-    _guard: Mutex<Option<Box<dyn Send>>>,
 }
 
 impl EngineBackend {
     /// Обернуть запущенный движок.
     pub fn new(eng: Engine) -> Self {
-        Self::with_guard(eng, None)
-    }
-
-    fn with_guard(eng: Engine, guard: Option<Box<dyn Send>>) -> Self {
         EngineBackend {
             local: LocalEngine::new(eng),
-            _guard: Mutex::new(guard),
         }
     }
 
@@ -140,15 +133,29 @@ pub struct EngineStart {
 /// Запуск движка: настоящий TUN ([`real_start`]) или тестовый.
 pub type StartFn = Arc<dyn Fn(EngineStart) -> anyhow::Result<EngineBackend> + Send + Sync>;
 
-/// Откуда брать `wintun.dll` (только Windows).
+/// Откуда брать `wintun.dll` (только Windows; на других ОС не используется).
+/// `dll` из `client.json` демон не читает: конфиг правится по IPC без прав
+/// администратора, а DLL грузится в процесс с правами администратора/SYSTEM.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WintunDll {
-    /// `console`: `dll` из конфига, иначе рядом с exe, иначе поиск ОС.
-    Search,
-    /// Служба: только этот путь (защищённый резолвер `tunnel-winsvc`).
+    /// Только этот путь (рядом с exe; у службы — защищённый резолвер
+    /// `tunnel-winsvc`).
     Only(PathBuf),
-    /// Служба: DLL рядом с exe не нашлась — TUN не поднять (причина).
+    /// DLL нет (или каталог небезопасен) — TUN не поднять (причина).
     Missing(String),
+}
+
+impl WintunDll {
+    /// `console`: `wintun.dll` только рядом с exe демона.
+    pub fn beside_current_exe() -> Self {
+        let r = std::env::current_exe()
+            .map_err(anyhow::Error::from)
+            .and_then(|exe| tunnel_winsvc::wintun_dll_beside(&exe));
+        match r {
+            Ok(p) => WintunDll::Only(p),
+            Err(e) => WintunDll::Missing(format!("{e:#}")),
+        }
+    }
 }
 
 /// Параметры настоящего TUN.
@@ -158,26 +165,33 @@ pub struct TunOpts {
 }
 
 /// Настоящий TUN платформы (Wintun / utun / Linux TUN; нужны права
-/// администратора). Адаптер — `adapter` из конфига, пусто — по умолчанию.
+/// администратора) через [`engine::start`] — тот же путь, что у embedded TUI
+/// и `run`: адрес, маршруты, DNS для `.vl`, чтение из TUN. Адаптер —
+/// `adapter` из конфига, пусто — по умолчанию.
 pub fn real_start(tun: TunOpts) -> StartFn {
     Arc::new(move |a: EngineStart| platform_start(a, &tun))
 }
 
-#[cfg(windows)]
-fn platform_start(a: EngineStart, tun: &TunOpts) -> anyhow::Result<EngineBackend> {
-    let (adapter, cfg_dll) = {
-        let c = a.cfg.lock().unwrap_or_else(|p| p.into_inner());
-        (c.adapter.clone(), c.dll.clone())
-    };
-    let adapter = if adapter.trim().is_empty() {
+/// Имя адаптера для [`engine::start`]: из конфига, пусто — [`ADAPTER_NAME`]
+/// (на Linux движок сам заменит его на `voidlink0`, macOS имя игнорирует).
+fn adapter_name(cfg: &Config) -> String {
+    let n = cfg.adapter.trim();
+    if n.is_empty() {
         ADAPTER_NAME.to_string()
     } else {
-        adapter
-    };
-    let dll = match &tun.wintun {
-        WintunDll::Search => (!cfg_dll.trim().is_empty()).then_some(cfg_dll),
-        WintunDll::Only(p) => Some(p.to_string_lossy().into_owned()),
-        WintunDll::Missing(why) => anyhow::bail!("wintun.dll: {why}"),
+        n.to_string()
+    }
+}
+
+fn platform_start(a: EngineStart, tun: &TunOpts) -> anyhow::Result<EngineBackend> {
+    let adapter = adapter_name(&a.cfg.lock().unwrap_or_else(|p| p.into_inner()));
+    let dll = if cfg!(windows) {
+        match &tun.wintun {
+            WintunDll::Only(p) => Some(p.to_string_lossy().into_owned()),
+            WintunDll::Missing(why) => anyhow::bail!("wintun.dll: {why}"),
+        }
+    } else {
+        None
     };
     let eng = engine::start(
         a.cfg,
@@ -189,95 +203,6 @@ fn platform_start(a: EngineStart, tun: &TunOpts) -> anyhow::Result<EngineBackend
         a.save,
     )?;
     Ok(EngineBackend::new(eng))
-}
-
-#[cfg(target_os = "macos")]
-fn platform_start(a: EngineStart, _tun: &TunOpts) -> anyhow::Result<EngineBackend> {
-    use tunnel_client::tun_macos::Utun;
-
-    struct Dev(Arc<Utun>);
-    impl engine::TunDev for Dev {
-        fn inject(&self, packet: &[u8]) -> anyhow::Result<()> {
-            self.0.write(packet)?;
-            Ok(())
-        }
-        fn ensure_address(&self, ip: u32) -> anyhow::Result<()> {
-            self.0.ensure_address(ip)
-        }
-    }
-
-    let mtu = a.cfg.lock().unwrap_or_else(|p| p.into_inner()).mtu();
-    let tun = Arc::new(Utun::open(mtu)?);
-    let eng = engine::start_with_tun(
-        a.cfg,
-        a.server,
-        a.server_pub,
-        a.identity,
-        Arc::new(Dev(tun.clone())),
-        a.save,
-    )?;
-    let sink = eng.ip_sink();
-    // read() блокирующий: поток живёт до конца процесса демона.
-    std::thread::Builder::new()
-        .name("tun".into())
-        .spawn(move || {
-            let mut buf = vec![0u8; 65536];
-            loop {
-                match tun.read(&mut buf) {
-                    Ok(n) => sink(&buf[..n]),
-                    Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {}
-                    Err(_) => break,
-                }
-            }
-        })?;
-    Ok(EngineBackend::new(eng))
-}
-
-#[cfg(target_os = "linux")]
-fn platform_start(a: EngineStart, _tun: &TunOpts) -> anyhow::Result<EngineBackend> {
-    use tunnel_client::tun_linux::{LinuxTun, spawn_reader};
-
-    struct Dev(Arc<LinuxTun>);
-    impl engine::TunDev for Dev {
-        fn inject(&self, packet: &[u8]) -> anyhow::Result<()> {
-            self.0.write(packet)
-        }
-        fn ensure_address(&self, ip: u32) -> anyhow::Result<()> {
-            self.0.ensure_address(ip)
-        }
-    }
-
-    let (mtu, name) = {
-        let c = a.cfg.lock().unwrap_or_else(|p| p.into_inner());
-        let n = c.adapter.trim();
-        // Виндовое имя по умолчанию Linux-интерфейсу не годится.
-        let n = if n.is_empty() || n == ADAPTER_NAME {
-            "tunnel0".to_string()
-        } else {
-            n.to_string()
-        };
-        (c.mtu(), n)
-    };
-    let tun = Arc::new(LinuxTun::open(&name, mtu)?);
-    let eng = engine::start_with_tun(
-        a.cfg,
-        a.server,
-        a.server_pub,
-        a.identity,
-        Arc::new(Dev(tun.clone())),
-        a.save,
-    )?;
-    let sink = eng.ip_sink();
-    let reader = spawn_reader(tun, move |p| {
-        sink(p);
-        true
-    })?;
-    Ok(EngineBackend::with_guard(eng, Some(Box::new(reader))))
-}
-
-#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
-fn platform_start(_a: EngineStart, _tun: &TunOpts) -> anyhow::Result<EngineBackend> {
-    anyhow::bail!("TUN на этой ОС не поддерживается")
 }
 
 // ---------- демон: «нет сервера» → движок ----------
@@ -616,11 +541,12 @@ fn apply_offline(c: &mut Config, cmd: Cmd) {
         Cmd::SetPrimaryServer { idx } if idx < c.servers.len() => {
             let s = c.servers.remove(idx);
             // Первый в списке и активный — его возьмёт запуск движка.
-            c.active_server = s
-                .addr
-                .parse::<SocketAddr>()
-                .map(|a| a.to_string())
-                .unwrap_or_default();
+            // `activate_server`: автовход прежнего сервера уходит в
+            // `autojoin_by_server`, восстанавливается список нового (gid у
+            // каждого сервера свои) — как при `SwitchServer` движка.
+            if let Ok(a) = s.addr.parse::<SocketAddr>() {
+                c.activate_server(a);
+            }
             c.servers.insert(0, s);
         }
         _ => {}
@@ -708,7 +634,10 @@ impl DaemonBackend {
     pub fn service(env: crate::service::ServiceEnv) -> Self {
         let wintun = match env.wintun_dll {
             Some(p) => WintunDll::Only(p),
-            None => WintunDll::Missing("нет wintun.dll рядом с exe службы (см. лог)".to_string()),
+            None => WintunDll::Missing(
+                "нет wintun.dll рядом с exe службы или каталог установки небезопасен (см. лог)"
+                    .to_string(),
+            ),
         };
         match DaemonEngine::open(
             &env.data_dir,
@@ -772,5 +701,55 @@ impl Backend for DaemonBackend {
             DaemonBackend::Ready(b) => b.changed(),
             DaemonBackend::Failed(_) => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn server(addr: &str) -> store::StoredServer {
+        store::StoredServer {
+            addr: addr.into(),
+            pubkey: "00".repeat(32),
+            label: String::new(),
+        }
+    }
+
+    /// Смена сервера по умолчанию без движка переносит автовход: список
+    /// прежнего сервера откладывается в `autojoin_by_server`, у нового —
+    /// свой (gid у каждого сервера свои).
+    #[test]
+    fn offline_primary_server_moves_autojoin() {
+        let mut c = Config {
+            servers: vec![server("10.0.0.1:7000"), server("10.0.0.2:7000")],
+            active_server: "10.0.0.1:7000".into(),
+            autojoin: vec![3, 5],
+            ..Config::default()
+        };
+        apply_offline(&mut c, Cmd::SetPrimaryServer { idx: 1 });
+        assert_eq!(c.servers[0].addr, "10.0.0.2:7000");
+        assert_eq!(c.active_server, "10.0.0.2:7000");
+        assert!(
+            c.autojoin.is_empty(),
+            "автовход первого сервера не переехал"
+        );
+        assert_eq!(c.autojoin_by_server.get("10.0.0.1:7000"), Some(&vec![3, 5]));
+        c.autojoin.push(9);
+        apply_offline(&mut c, Cmd::SetPrimaryServer { idx: 1 });
+        assert_eq!(c.active_server, "10.0.0.1:7000");
+        assert_eq!(c.autojoin, vec![3, 5]);
+        assert_eq!(c.autojoin_by_server.get("10.0.0.2:7000"), Some(&vec![9]));
+        // Тот же сервер — ничего не меняется.
+        apply_offline(&mut c, Cmd::SetPrimaryServer { idx: 0 });
+        assert_eq!(c.autojoin, vec![3, 5]);
+    }
+
+    #[test]
+    fn adapter_default() {
+        let mut c = Config::default();
+        assert_eq!(adapter_name(&c), ADAPTER_NAME);
+        c.adapter = " vl1 ".into();
+        assert_eq!(adapter_name(&c), "vl1");
     }
 }

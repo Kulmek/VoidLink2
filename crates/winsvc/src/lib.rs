@@ -6,7 +6,9 @@
 //!   5/10/30 с), `%ProgramData%\tunnel` с ACL, импорт `client.json`
 //!   пользователя, `owner.sid` для SDDL пайпа, `Run`-ключ трея, ярлык с AUMID;
 //! - [`uninstall`] — обратное (конфиг — только с `purge`);
-//! - [`service_wintun_dll`] — `wintun.dll` только рядом с exe.
+//! - [`service_wintun_dll`] — `wintun.dll` только рядом с exe и только из
+//!   каталога, куда пишет лишь администратор (`verify_install_dir`; та же
+//!   проверка — при `install`).
 //!
 //! Настоящий код — под `cfg(windows)`; на остальных ОС функции службы
 //! возвращают ошибку, а чистая часть (пути, SDDL, скрипты) работает везде.
@@ -15,9 +17,13 @@ mod common;
 pub use common::*;
 
 #[cfg(windows)]
+mod acl;
+#[cfg(windows)]
 mod install;
 #[cfg(windows)]
 mod service;
+#[cfg(windows)]
+pub use acl::{check_path, secure_data_dir, verify_install_dir};
 #[cfg(windows)]
 pub use install::{install, uninstall};
 #[cfg(windows)]

@@ -27,14 +27,13 @@ pub use service::{IpcMode, ResumeSignal, RunOpts, ServiceEnv, run_daemon};
 use std::path::{Path, PathBuf};
 
 /// Каталог данных демона: `%ProgramData%\tunnel` (Windows — identity
-/// принадлежит машине, см. PLAN.md 7), иначе `~/.tunnel-client` — тот же
-/// каталог, что у клиента, чтобы фронтенды на Unix нашли сокет.
+/// принадлежит машине, см. PLAN.md 7; путь — known folder, а не переменная
+/// окружения, которую пользователь может переопределить), иначе
+/// `~/.tunnel-client` — тот же каталог, что у клиента, чтобы фронтенды на
+/// Unix нашли сокет.
 pub fn default_data_dir() -> PathBuf {
     if cfg!(windows) {
-        if let Ok(pd) = std::env::var("ProgramData") {
-            return Path::new(&pd).join("tunnel");
-        }
-        return PathBuf::from(r"C:\ProgramData\tunnel");
+        return tunnel_winsvc::data_dir();
     }
     if let Ok(home) = std::env::var("HOME") {
         return Path::new(&home).join(".tunnel-client");

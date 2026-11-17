@@ -236,9 +236,10 @@ pub fn socket_path(data_dir: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// Каталог данных: создать с `0700` или закрыть существующий (если он наш) —
-/// иначе `Listener::bind` откажет. Чужой каталог не трогаем.
+/// иначе `Listener::bind` откажет. Чужой каталог не трогаем. Вызывается и
+/// в начале [`crate::run_daemon`] — до замка и до записи `client.json`.
 #[cfg(unix)]
-fn prepare_private_dir(dir: &std::path::Path, log: Option<&LogFn>) -> io::Result<()> {
+pub(crate) fn prepare_private_dir(dir: &std::path::Path, log: Option<&LogFn>) -> io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     if !dir.exists() {
         std::fs::DirBuilder::new()

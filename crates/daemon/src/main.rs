@@ -43,6 +43,12 @@ fn main() -> ExitCode {
                 // выход с ней (как раньше).
                 tunnel_client::engine::set_debug(debug);
                 let dir = dir(data_dir);
+                // Windows: движок с правами администратора доверяет каталогу
+                // данных — он должен быть закрыт, как у службы.
+                if let Err(e) = service::secure_console_data_dir(&dir) {
+                    eprintln!("ошибка: {e}");
+                    return ExitCode::FAILURE;
+                }
                 let failed = Arc::new(std::sync::Mutex::new(None::<String>));
                 let (f, s, d) = (failed.clone(), stop.clone(), dir.clone());
                 let r = service::run_console(
@@ -53,8 +59,10 @@ fn main() -> ExitCode {
                             *f.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
                             s.store(true, std::sync::atomic::Ordering::SeqCst);
                         };
+                        // wintun.dll — только рядом с exe (dll из client.json
+                        // не используется: конфиг правится по IPC).
                         let tun = TunOpts {
-                            wintun: WintunDll::Search,
+                            wintun: WintunDll::beside_current_exe(),
                         };
                         match DaemonEngine::open(&d, log.clone(), real_start(tun), None) {
                             Ok(e) => {

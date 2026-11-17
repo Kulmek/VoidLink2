@@ -980,6 +980,12 @@ impl TunDev for crate::tun_macos::Utun {
         // ifconfig inet + route add на /24 группы.
         crate::tun_macos::Utun::ensure_address(self, ip)
     }
+
+    fn ensure_dns_route(&self) -> Result<()> {
+        // 100.66.0.53 вне /24 групп: без host-маршрута запросы `.vl` из
+        // /etc/resolver ушли бы мимо utun.
+        crate::tun_macos::Utun::ensure_dns_route(self)
+    }
 }
 
 // ---------- общий контекст потоков ----------

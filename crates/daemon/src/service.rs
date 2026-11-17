@@ -125,6 +125,14 @@ pub fn run_daemon<B: Backend + 'static>(
     stop: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let data_dir = opts.data_dir.as_path();
+    // Unix: каталог закрывается (0700) до замка и до бэкенда, который пишет
+    // client.json с identity.
+    #[cfg(unix)]
+    crate::server::prepare_private_dir(data_dir, None)
+        .map_err(|e| format!("каталог данных {}: {e}", data_dir.display()))?;
+    // Windows: замок исключает только службу vs embedded TUI / run / console
+    // (единственность службы — SCM, сервера пайпа — FIRST_PIPE_INSTANCE);
+    // мьютекс постороннего владельца замок игнорирует.
     let _lock = InstanceLock::acquire(data_dir).map_err(|e| e.to_string())?;
     let level = if opts.debug {
         Level::Debug
@@ -399,7 +407,25 @@ pub(crate) fn install_options(
     Ok((o, warnings))
 }
 
+/// Каталог данных `console` на Windows: нет — создаётся с ACL службы
+/// (SYSTEM и Administrators), есть — должен быть так же закрыт (иначе
+/// отказ: client.json и identity мог подложить обычный пользователь).
+/// На других ОС каталог закрывает [`run_daemon`] (`0700`).
+pub fn secure_console_data_dir(dir: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        tunnel_winsvc::secure_data_dir(dir).map_err(|e| format!("{e:#}"))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
 /// `tunnel-daemon install`: установить (обновить) и запустить службу.
+/// Каталог exe должен быть доступен на запись только администраторам
+/// (проверяет `tunnel_winsvc::install`), иначе отказ.
 pub fn install() -> Result<(), String> {
     #[cfg(windows)]
     {
@@ -577,6 +603,32 @@ mod service_tests {
                 .unwrap()
                 .contains("svc")
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Unix: каталог данных закрыт (0700) уже к созданию бэкенда, который
+    /// пишет client.json с identity, — а не только к подъёму сокета.
+    #[cfg(unix)]
+    #[test]
+    fn data_dir_private_before_backend() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp("priv");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let seen = Arc::new(Mutex::new(None::<u32>));
+        let (s2, d2) = (seen.clone(), dir.clone());
+        run_daemon(
+            &RunOpts::service(&dir, IpcMode::None),
+            move |_log| {
+                let m = std::fs::metadata(&d2).unwrap().permissions().mode() & 0o777;
+                *s2.lock().unwrap() = Some(m);
+                crate::FakeBackend::new()
+            },
+            Arc::new(AtomicBool::new(true)),
+        )
+        .unwrap();
+        assert_eq!(*seen.lock().unwrap(), Some(0o700));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

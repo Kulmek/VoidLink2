@@ -59,7 +59,8 @@ pub fn route_to(ep: &Endpoint, dir: &Path) -> Result<Route> {
 }
 
 /// Команды, которые идут через демона, если он есть (остальные — локальные:
-/// `help`, `export-identity`; `tui` решает сам).
+/// `help`; `export-identity` — локальная, но сверяется с identity демона
+/// ([`export_guard`]); `tui` решает сам).
 pub fn is_engine_cmd(cmd: &str) -> bool {
     matches!(
         cmd,
@@ -93,6 +94,33 @@ pub fn is_engine_cmd(cmd: &str) -> bool {
             | "dns"
             | "invisible"
             | "run"
+    )
+}
+
+/// `export-identity` при работающем демоне: выгружается identity этого
+/// каталога данных, а туннель держит демон — со своей identity (на Windows
+/// служба хранит её в `%ProgramData%\tunnel`, не в профиле пользователя).
+/// Совпадают — можно; нет (или демон не назвал свою) — отказ с объяснением,
+/// как `id` через демона показывает identity демона.
+pub fn export_guard(daemon: Option<&Me>, local_pub: Option<[u8; 32]>, dir: &Path) -> Result<()> {
+    let Some(d) = daemon else {
+        bail!(
+            "export-identity: демон работает, но не сообщил свою identity — остановите демон и повторите"
+        );
+    };
+    if local_pub == Some(d.my_pub) {
+        return Ok(());
+    }
+    let local = local_pub
+        .map(|p| proto::friend_code_of(&p))
+        .unwrap_or_else(|| "нет".into());
+    bail!(
+        "export-identity: туннель держит демон с identity {} (её показывает `id`), а эта команда \
+выгрузила бы другую — локальную identity каталога {} ({local}). Identity демона лежит в его каталоге \
+данных (Windows: %ProgramData%\\tunnel, только администраторы): выгрузите её оттуда от \
+администратора — tunnel-client --dir <каталог данных демона> export-identity <файл>",
+        d.my_code,
+        dir.display()
     )
 }
 
@@ -663,4 +691,34 @@ pub fn run(c: &mut IpcClient, cmd: &str, rest: &[String], out: &mut dyn Write) -
         other => bail!("неизвестная команда: {other:?}"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `export-identity` при демоне: та же identity — можно; другая (служба
+    /// Windows со своей identity в ProgramData) или нет локальной — отказ,
+    /// в тексте — friend code демона.
+    #[test]
+    fn export_guard_checks_daemon_identity() {
+        let dir = Path::new("/tmp/profile");
+        let a = proto::Identity::generate();
+        let b = proto::Identity::generate();
+        let me = Me {
+            my_pub: a.ed_pub(),
+            my_code: a.friend_code(),
+        };
+        export_guard(Some(&me), Some(a.ed_pub()), dir).unwrap();
+        let e = export_guard(Some(&me), Some(b.ed_pub()), dir)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains(&a.friend_code()) && e.contains(&b.friend_code()),
+            "{e}"
+        );
+        assert!(export_guard(Some(&me), None, dir).is_err());
+        assert!(export_guard(None, Some(a.ed_pub()), dir).is_err());
+        assert!(!is_engine_cmd("export-identity"));
+    }
 }

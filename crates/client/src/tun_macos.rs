@@ -8,6 +8,9 @@
 //! Адреса групп: `ifconfig utunN inet <ip> <ip> netmask 255.255.255.0 [alias]`
 //! плюс маршрут `route -n add -net 100.66.<gid>.0/24 -interface utunN`.
 //! Повторный вызов для того же IP ничего не делает.
+//!
+//! Встроенный DNS (`100.66.0.53`, вне /24 групп) — отдельный маршрут
+//! `route -n add -host 100.66.0.53 -interface utunN` ([`Utun::ensure_dns_route`]).
 
 // подключается при интеграции
 #![allow(dead_code)]
@@ -20,6 +23,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::process::Command;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
 
@@ -39,6 +43,8 @@ pub struct Utun {
     v4: Mutex<HashSet<u32>>,
     /// Уже назначенные IPv6-адреса.
     v6: Mutex<HashSet<Ipv6Addr>>,
+    /// Маршрут на встроенный DNS уже стоит.
+    dns_route: AtomicBool,
 }
 
 impl Utun {
@@ -52,6 +58,7 @@ impl Utun {
             name,
             v4: Mutex::new(HashSet::new()),
             v6: Mutex::new(HashSet::new()),
+            dns_route: AtomicBool::new(false),
         };
         dev.set_mtu(mtu)?;
         run(&ifconfig_up_args(&dev.name)).context("ifconfig up")?;
@@ -178,6 +185,23 @@ impl Utun {
         }
         used.insert(ip);
         eprintln!("[tun] {} += {}", self.name, Ipv4Addr::from(ip));
+        Ok(())
+    }
+
+    /// Маршрут на встроенный DNS (`100.66.0.53`) через этот utun:
+    /// `/etc/resolver/vl` шлёт туда запросы `.vl`, а /24 групп его не
+    /// покрывают. Идемпотентно (уже стоит — «File exists» не ошибка); после
+    /// неудачи следующий вызов пробует снова.
+    pub fn ensure_dns_route(&self) -> Result<()> {
+        if self.dns_route.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        if let Err(e) = run(&dns_route_args(&self.name))
+            && !route_exists_error(&e.to_string())
+        {
+            return Err(e).context("route add DNS");
+        }
+        self.dns_route.store(true, Ordering::Relaxed);
         Ok(())
     }
 
@@ -357,6 +381,19 @@ fn route_add_args(ifname: &str, ip: u32) -> Vec<String> {
     ]
 }
 
+/// `route -n add -host 100.66.0.53 -interface utunN`.
+fn dns_route_args(ifname: &str) -> Vec<String> {
+    vec![
+        s("route"),
+        s("-n"),
+        s("add"),
+        s("-host"),
+        crate::dns::DNS_ADDR.to_string(),
+        s("-interface"),
+        s(ifname),
+    ]
+}
+
 fn ifconfig_inet6_args(ifname: &str, ip: Ipv6Addr, prefix: u8) -> Vec<String> {
     vec![
         s("ifconfig"),
@@ -420,6 +457,10 @@ mod tests {
             "route -n add -net 100.66.3.0/24 -interface utun4"
         );
         assert_eq!(mtu_args("utun4", 1280).join(" "), "ifconfig utun4 mtu 1280");
+        assert_eq!(
+            dns_route_args("utun4").join(" "),
+            "route -n add -host 100.66.0.53 -interface utun4"
+        );
         assert_eq!(
             ifconfig_inet6_args("utun4", "fd00::1".parse().unwrap(), 64).join(" "),
             "ifconfig utun4 inet6 fd00::1 prefixlen 64 alias"

@@ -47,7 +47,8 @@ fn win_err(code: i32) -> impl Fn(&windows_service::Error) -> bool {
     move |e| matches!(e, windows_service::Error::Winapi(io) if io.raw_os_error() == Some(code))
 }
 
-/// Устанавливает (или обновляет) службу и всё окружение. Порядок: каталог
+/// Устанавливает (или обновляет) службу и всё окружение. Порядок: проверка
+/// каталога установки ([`crate::acl::verify_install_dir`]) → каталог
 /// данных (владелец и ACL) → импорт конфига → SID владельца → служба → Run →
 /// ярлык → старт. Ошибки Run-ключа, ярлыка и старта некритичны: служба уже
 /// установлена, они попадают в [`InstallReport::warnings`].
@@ -58,6 +59,9 @@ pub fn install(opts: &InstallOptions) -> Result<InstallReport> {
             opts.daemon_exe.display()
         );
     }
+    // Служба (SYSTEM) грузит exe и wintun.dll из этого каталога: писать туда
+    // может только администратор, иначе отказ.
+    crate::acl::verify_install_dir(&opts.daemon_exe)?;
     let dir = data_dir();
     prepare_data_dir(&dir)?;
 
@@ -136,7 +140,7 @@ fn prepare_data_dir(dir: &Path) -> Result<()> {
 
 /// `create_dir` (не `_all`): если каталог успели создать между удалением и
 /// созданием — это ошибка, а не молчаливое использование чужого каталога.
-fn create_fresh_dir(dir: &Path) -> Result<()> {
+pub(crate) fn create_fresh_dir(dir: &Path) -> Result<()> {
     if let Some(parent) = dir.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("создание {}", parent.display()))?;
@@ -349,7 +353,7 @@ fn write_secure(path: &PathBuf, data: &[u8]) -> Result<()> {
 /// Ставит владельца и защищённый DACL из SDDL на каталог и сбрасывает их
 /// на всех детей (`TREE_SEC_INFO_RESET`: явные ACE детей заменяются
 /// унаследованными).
-fn set_dir_acl(dir: &Path, sddl: &str) -> Result<()> {
+pub(crate) fn set_dir_acl(dir: &Path, sddl: &str) -> Result<()> {
     let sddl_w = wide(sddl);
     let path_w = wide(dir);
     let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
@@ -434,7 +438,7 @@ fn is_trusted_owner(dir: &Path) -> Result<bool> {
 ///
 /// # Safety
 /// `sid` — валидный SID.
-unsafe fn sid_to_string(sid: PSID) -> Result<String> {
+pub(crate) unsafe fn sid_to_string(sid: PSID) -> Result<String> {
     let mut s: windows_sys::core::PWSTR = std::ptr::null_mut();
     // SAFETY: по контракту функции; s освобождается LocalFree.
     unsafe {
