@@ -1808,6 +1808,7 @@ dependencies = [
  "rand 0.10.4",
  "serde",
  "serde_json",
+ "signal-hook",
  "tunnel-protocol",
 ]
 
