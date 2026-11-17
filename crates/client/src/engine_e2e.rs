@@ -1347,14 +1347,15 @@ fn e2e_запоздавший_group_state_не_возвращает_отозва
     });
     std::thread::sleep(Duration::from_millis(300));
 
-    // B и C просят полное состояние (фрейм «новой эпохи» — сигнал
-    // GET_GROUP), а ответы задерживаются в сети.
+    // B и C просят полное состояние (фрейм «новой эпохи» с адреса A —
+    // сигнал GET_GROUP принимается только от релея или известного адреса
+    // заявленного отправителя), а ответы задерживаются в сети.
     let (epoch, c_key, _) = c.eng.group_key(gid).unwrap();
     let (ia, ib, ic) = (a.my_ip(gid), b.my_ip(gid), c.my_ip(gid));
     for (n, p, ip) in [(&b, &proxy, ib), (&c, &proxy_c, ic)] {
         p.hold(ctrl::GROUP_STATE, 1);
         let h = proto::GroupHeader { gid, src: ia, dst: ip, epoch: epoch + 1 };
-        n.eng.send_raw(&proto::seal_group(&[7; 32], proto::grp::DATA, &h, 1, b"x"), n.addr());
+        a.eng.send_raw(&proto::seal_group(&[7; 32], proto::grp::DATA, &h, 1, b"x"), n.addr());
         wait_until("ответ GET_GROUP придержан", T, || p.held() == 1);
     }
 
@@ -1463,6 +1464,49 @@ fn e2e_открытые_ответы_не_обрывают_подключени�
 
     stop.store(true, Ordering::Relaxed);
     thread.join().unwrap();
+/// Кикнутый с отстающей ревизией (дельта не дошла — повод для GET_GROUP):
+/// ответ с ревизией новее его своей, но не новее кика, группу не возвращает —
+/// граница запоздания берётся из KICKED, а не из своей ревизии.
+#[test]
+fn e2e_кик_при_отстающей_ревизии_не_возвращает_группу() {
+    let dir = temp_dir("stale-lag");
+    let server = start_server(&dir, 0);
+    let proxy_c = LossyProxy::start(local(server.addr), Box::new(|_, _, _| false));
+    let mut a = Node::start("alpha", &server);
+    let mut c = Node::start_via("charlie", proxy_c.addr, server.pubkey, proto::Identity::generate());
+    for n in [&mut a, &mut c] {
+        n.wait("подключён", T, |e| matches!(e, Event::Connected(_)));
+    }
+    let gid = a.create("lag", false);
+    c.join(gid);
+    wait_until("видят друг друга", T, || a.sees_online(gid, 1) && c.sees_online(gid, 1));
+    std::thread::sleep(Duration::from_millis(300));
+    let c_rev = c.eng.groups.lock().unwrap()[&gid].rev;
+
+    // Дельта переименования до C не доходит: его ревизия отстаёт.
+    proxy_c.hold(ctrl::GROUP_UPDATE, 1);
+    a.eng.cmds.send(Cmd::Rename(gid, "lag2".into())).unwrap();
+    wait_until("дельта придержана", T, || proxy_c.held() == 1);
+
+    // GET_GROUP от C, ответ (ревизия новее его) задерживается.
+    let (epoch, _, _) = c.eng.group_key(gid).unwrap();
+    let (ia, ic) = (a.my_ip(gid), c.my_ip(gid));
+    proxy_c.hold(ctrl::GROUP_STATE, 1);
+    let h = proto::GroupHeader { gid, src: ia, dst: ic, epoch: epoch + 1 };
+    a.eng.send_raw(&proto::seal_group(&[7; 32], proto::grp::DATA, &h, 1, b"x"), c.addr());
+    wait_until("ответ GET_GROUP придержан", T, || proxy_c.held() == 2);
+    assert_eq!(c.eng.groups.lock().unwrap()[&gid].rev, c_rev, "ревизия C не должна была сдвинуться");
+
+    a.eng.cmds.send(Cmd::Kick(gid, c.eng.my_pub)).unwrap();
+    c.wait("C кикнут", T, |e| matches!(e, Event::Kicked { .. }));
+    let mark = c.seen.len();
+    proxy_c.release();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!c.has_group(gid), "запоздавшее состояние вернуло группу кикнутому");
+    assert!(!c.saw_since(mark, |e| matches!(e, Event::GroupJoined { .. })), "{:?}", &c.seen[mark..]);
+
+    drop((a, c));
+    drop(proxy_c);
     server.stop();
     let _ = std::fs::remove_dir_all(&dir);
 }
