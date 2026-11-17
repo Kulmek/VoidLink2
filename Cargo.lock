@@ -1780,11 +1780,13 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "crossterm",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",
  "tunnel-protocol",
  "tunnel-server",
+ "windows-sys 0.61.2",
  "wintun",
 ]
 

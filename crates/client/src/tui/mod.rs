@@ -5,7 +5,10 @@
 //! события (`Engine::events`).
 
 pub mod app;
+pub mod clipboard;
+pub mod clock;
 pub mod identicon;
+pub mod keymap;
 pub mod setup;
 pub mod theme;
 pub mod ui;
