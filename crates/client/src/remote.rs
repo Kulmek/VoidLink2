@@ -468,12 +468,29 @@ mod tests {
     mod fake {
         use super::super::*;
         use crate::snapshot::{CfgServer, GroupSnap, MetaSnap};
+        use std::os::unix::fs::PermissionsExt;
         use tunnel_ipc::{ClientMsg, Listener, read_msg, write_msg};
+
+        /// Свежий приватный каталог (0700) под сокет: `check_private_dir`
+        /// требует, чтобы каталог сокета принадлежал нам и был закрыт от
+        /// группы и остальных — `/tmp` (0777, root) не подходит.
+        fn private_dir(tag: &str) -> PathBuf {
+            let d = std::env::temp_dir().join(format!(
+                "vlf-{tag}-{}-{}",
+                std::process::id(),
+                rand::random::<u16>()
+            ));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir(&d).unwrap();
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
+            d
+        }
 
         /// Демон, который отвечает `Welcome`, на `Subscribe` — историей и
         /// снимком, на `Req` — `Ack` (Err для `Join`) и событием `Notice`.
         pub struct FakeDaemon {
             pub path: PathBuf,
+            dir: PathBuf,
             pub snap: Arc<Mutex<Snapshot>>,
             conns: Arc<Mutex<Vec<Conn>>>,
             pub reqs: Arc<Mutex<Vec<serde_json::Value>>>,
@@ -512,15 +529,12 @@ mod tests {
         impl FakeDaemon {
             pub fn start(tag: &str) -> FakeDaemon {
                 // Короткий путь: лимит sun_path ~104 байта на macOS.
-                let path = std::env::temp_dir().join(format!(
-                    "vlf-{tag}-{}-{}.sock",
-                    std::process::id(),
-                    rand::random::<u16>()
-                ));
-                let _ = std::fs::remove_file(&path);
+                let dir = private_dir(tag);
+                let path = dir.join("d.sock");
                 let listener = Listener::bind(&path).unwrap();
                 let d = FakeDaemon {
                     path,
+                    dir,
                     snap: Arc::new(Mutex::new(snapshot("alpha"))),
                     conns: Arc::new(Mutex::new(Vec::new())),
                     reqs: Arc::new(Mutex::new(Vec::new())),
@@ -552,6 +566,7 @@ mod tests {
             fn drop(&mut self) {
                 self.kill_conns();
                 let _ = std::fs::remove_file(&self.path);
+                let _ = std::fs::remove_dir_all(&self.dir);
             }
         }
 
