@@ -1789,6 +1789,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tunnel-daemon"
+version = "0.2.0"
+dependencies = [
+ "serde_json",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "tunnel-protocol"
 version = "0.2.0"
 dependencies = [
