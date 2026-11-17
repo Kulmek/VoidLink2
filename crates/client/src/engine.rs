@@ -99,6 +99,10 @@ const MAX_KEYSETS: usize = 4;
 const KEY_LOG_LEN: usize = 256;
 /// Предел паузы сигнала «эпоха новее» после неподтвердившихся сигналов.
 const HINT_GAP_MAX: Duration = Duration::from_secs(60);
+/// Жёсткий предел сигналов «эпоха новее» на группу за `HINT_WINDOW`
+/// (поверх паузы: она сбрасывается каждой подтвердившейся эпохой).
+const HINT_MAX_PER_WINDOW: usize = 8;
+const HINT_WINDOW: Duration = Duration::from_secs(60);
 /// RESET, пришедший раньше этого после подлинного фрейма сервера, —
 /// подделка или запоздалый: сервер нашу сессию явно знает.
 const RESET_GRACE: Duration = Duration::from_secs(2);
@@ -235,6 +239,8 @@ pub struct GroupSess {
     sync_hint: Option<Instant>,
     hint_epoch: u32,
     hint_gap: Duration,
+    /// Моменты последних сигналов (не больше `HINT_MAX_PER_WINDOW` за `HINT_WINDOW`).
+    hint_log: VecDeque<Instant>,
     /// Серверная сессия последнего принятого GROUP_STATE (0 — принять
     /// следующий без сверки ревизии): в пределах сессии ревизии сервера
     /// только растут, и запоздавшее состояние с меньшей ревизией — откат
@@ -269,6 +275,7 @@ impl GroupSess {
             sync_hint: None,
             hint_epoch: 0,
             hint_gap: GET_GROUP_EVERY,
+            hint_log: VecDeque::new(),
             state_sess: 0,
         }
     }
@@ -346,11 +353,32 @@ impl GroupSess {
         }
     }
 
+    /// Фрейм с эпохой, которой у нас нет: сигналить ли GET_GROUP.
+    /// Заголовок открыт, расшифровать нечем — значит, только правдоподобно
+    /// подлинные: через релей или с адреса заявленного отправителя, известного
+    /// от сервера (правило 5 — до расшифровки). Иначе любой, кто знает наш
+    /// адрес и gid, заставлял бы нас тянуть GROUP_STATE целиком (а сервер —
+    /// слать его). Поверх — пауза с удвоением и предел в минуту.
+    fn epoch_hint(&mut self, h: &proto::GroupHeader, src: SocketAddr, is_relay: bool, now: Instant) -> bool {
+        if h.epoch <= self.epoch {
+            return false;
+        }
+        let from_peer = h.src != self.my_ip && self.members.get(&h.src).is_some_and(|p| p.knows(src));
+        (is_relay || from_peer) && self.hint_due(h.epoch, now)
+    }
+
     /// Пора ли сигналить «эпоха `epoch` новее нашей» (GET_GROUP).
     fn hint_due(&mut self, epoch: u32, now: Instant) -> bool {
         if self.sync_hint.is_some_and(|t| now.duration_since(t) < self.hint_gap) {
             return false;
         }
+        while self.hint_log.front().is_some_and(|t| now.duration_since(*t) >= HINT_WINDOW) {
+            self.hint_log.pop_front();
+        }
+        if self.hint_log.len() >= HINT_MAX_PER_WINDOW {
+            return false;
+        }
+        self.hint_log.push_back(now);
         if self.sync_hint.is_some() && self.hint_epoch > self.epoch {
             self.hint_gap = (self.hint_gap * 2).min(HINT_GAP_MAX);
         }
@@ -2353,13 +2381,8 @@ fn handle_group_frame(env: &Env, src: SocketAddr, datagram: &[u8]) -> Option<u32
         match gs.rx_key(h.epoch, now) {
             Some(k) => k,
             None => {
-                // Заголовок открыт: сигнал «эпоха новее» — только от релея или
-                // с адреса заявленного отправителя, известного от сервера
-                // (правило 5 — до расшифровки, которой тут нет). Иначе любой,
-                // кто знает наш адрес и gid, раз в секунду заставлял бы нас
-                // тянуть GROUP_STATE целиком (а сервер — слать его).
-                let from_peer = gs.members.get(&h.src).is_some_and(|p| p.knows(src));
-                if h.epoch > gs.epoch && (is_relay || from_peer) && gs.hint_due(h.epoch, now) {
+                // Сигнал «эпоха новее» — только от правдоподобно подлинных.
+                if gs.epoch_hint(&h, src, is_relay, now) {
                     return Some(h.gid);
                 }
                 return None;
@@ -2864,6 +2887,80 @@ mod tests {
         g.set_key(7, [3; 32], true, now);
         assert_eq!(g.rx_key(6, now), None);
         assert_eq!(g.rx_key(7, now), Some([3; 32]));
+    }
+
+    #[test]
+    fn сигнал_эпохи_только_от_подлинных_и_с_пределом() {
+        let t0 = Instant::now();
+        let mut g = GroupSess::new(&state(1, 5, 1), t0, KeyLog::default());
+        let peer_addr: SocketAddr = "10.0.0.2:4000".parse().unwrap();
+        let stranger: SocketAddr = "203.0.113.9:4000".parse().unwrap();
+        g.members.insert(
+            0x6442_0103,
+            PeerSess {
+                pubkey: [2; 32],
+                name: "p".into(),
+                status: String::new(),
+                online: true,
+                ip: 0x6442_0103,
+                endpoint: None,
+                candidates: vec![peer_addr],
+                direct_addr: None,
+                last_rx: t0,
+                last_direct: None,
+                rtt_ms: None,
+            },
+        );
+        let h = |src, epoch| proto::GroupHeader { gid: 1, src, dst: 0x6442_0102, epoch };
+        // Посторонний адрес, неизвестный src, сам клиент как src — не повод.
+        for i in 0..100 {
+            let t = t0 + Duration::from_secs(i);
+            assert!(!g.epoch_hint(&h(0x6442_0103, 9), stranger, false, t));
+            assert!(!g.epoch_hint(&h(0x6442_0199, 9), peer_addr, false, t));
+            assert!(!g.epoch_hint(&h(0x6442_0102, 9), peer_addr, false, t));
+        }
+        // Эпоха не новее — тоже нет.
+        assert!(!g.epoch_hint(&h(0x6442_0103, 5), peer_addr, false, t0));
+        // С кандидата участника — да; не чаще паузы.
+        assert!(g.epoch_hint(&h(0x6442_0103, 9), peer_addr, false, t0));
+        assert!(!g.epoch_hint(&h(0x6442_0103, 9), peer_addr, false, t0 + Duration::from_millis(500)));
+        // Эпоха так и не пришла: паузы растут (1, 2, 4, … с), не каждую секунду.
+        let mut fired = 1;
+        for ms in (0..600_000).step_by(100) {
+            if g.epoch_hint(&h(0x6442_0103, 9), "10.9.9.9:1".parse().unwrap(), true, t0 + Duration::from_millis(ms)) {
+                fired += 1;
+            }
+        }
+        assert!(fired <= 16, "сигналов за 10 минут: {fired}");
+        // Эпоха подтвердилась — пауза сбрасывается.
+        let t1 = t0 + Duration::from_secs(700);
+        g.set_key(9, [9; 32], false, t1);
+        assert!(g.epoch_hint(&h(0x6442_0103, 10), peer_addr, true, t1));
+        g.set_key(10, [10; 32], false, t1);
+        assert!(g.epoch_hint(&h(0x6442_0103, 11), peer_addr, true, t1 + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn сигнал_эпохи_жёсткий_предел_в_минуту() {
+        // Даже если каждая эпоха подтверждается (пауза всё время сбрасывается),
+        // сигналов за минуту — не больше HINT_MAX_PER_WINDOW.
+        let t0 = Instant::now();
+        let mut g = GroupSess::new(&state(1, 1, 1), t0, KeyLog::default());
+        let relay: SocketAddr = "198.51.100.1:7000".parse().unwrap();
+        let mut fired = 0;
+        for i in 0..60u32 {
+            let t = t0 + Duration::from_secs(i as u64);
+            let e = g.epoch + 1;
+            if g.epoch_hint(&proto::GroupHeader { gid: 1, src: 7, dst: 0x6442_0102, epoch: e }, relay, true, t) {
+                fired += 1;
+            }
+            g.set_key(e, [(e % 250) as u8 + 2; 32], false, t);
+        }
+        assert_eq!(fired, HINT_MAX_PER_WINDOW);
+        // Окно сдвинулось — снова можно.
+        let t = t0 + HINT_WINDOW + Duration::from_secs(1);
+        let e = g.epoch + 1;
+        assert!(g.epoch_hint(&proto::GroupHeader { gid: 1, src: 7, dst: 0x6442_0102, epoch: e }, relay, true, t));
     }
 
     #[test]
