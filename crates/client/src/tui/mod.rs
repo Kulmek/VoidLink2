@@ -4,6 +4,7 @@
 //! `Engine::meta`, `Engine::stats`), шлёт команды (`Engine::cmds`) и слушает
 //! события (`Engine::events`).
 
+pub mod admin;
 pub mod app;
 pub mod identicon;
 pub mod setup;
