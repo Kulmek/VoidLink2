@@ -1,7 +1,7 @@
 //! Установка и удаление службы (запуск от администратора).
 
 use std::ffi::{OsStr, OsString};
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -17,16 +17,22 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
+    GetNamedSecurityInfoW, ProgressInvokeNever, SDDL_REVISION_1, SE_FILE_OBJECT,
+    TREE_SEC_INFO_RESET, TreeSetNamedSecurityInfoW,
 };
 use windows_sys::Win32::Security::{
-    ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetTokenInformation,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
+    GetTokenInformation, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::System::Registry::{
-    HKEY_CURRENT_USER, REG_SZ, RegDeleteKeyValueW, RegSetKeyValueW,
+    HKEY, HKEY_CURRENT_USER, HKEY_USERS, REG_SZ, RegDeleteKeyValueW, RegSetKeyValueW,
 };
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
 
 use crate::common::*;
 
@@ -42,41 +48,90 @@ fn win_err(code: i32) -> impl Fn(&windows_service::Error) -> bool {
 }
 
 /// Устанавливает (или обновляет) службу и всё окружение. Порядок: каталог
-/// данных и ACL → импорт конфига → SID владельца → служба → Run → ярлык →
-/// старт. Ошибка ярлыка/Run-ключа не валит установку службы — она в отчёте
-/// не нужна, но и туннель без неё работает; ошибку возвращаем в конце.
+/// данных (владелец и ACL) → импорт конфига → SID владельца → служба → Run →
+/// ярлык → старт. Ошибки Run-ключа, ярлыка и старта некритичны: служба уже
+/// установлена, они попадают в [`InstallReport::warnings`].
 pub fn install(opts: &InstallOptions) -> Result<InstallReport> {
     if !opts.daemon_exe.is_absolute() {
         bail!("путь службы должен быть абсолютным: {}", opts.daemon_exe.display());
     }
     let dir = data_dir();
-    std::fs::create_dir_all(&dir).with_context(|| format!("создание {}", dir.display()))?;
-    set_dir_acl(&dir, DATA_DIR_SDDL).with_context(|| format!("ACL на {}", dir.display()))?;
+    prepare_data_dir(&dir)?;
 
-    let config_imported = import_user_config(&dir)?;
-    let owner_sid = current_user_sid()?;
+    // только после смены владельца/ACL: подложенный заранее файл к этому
+    // моменту удалён вместе с чужим каталогом
+    let config_imported = import_user_config(&dir, opts.user_appdata.as_deref())?;
+    let owner_sid = match &opts.owner_sid {
+        Some(sid) => {
+            validate_sid(sid)?;
+            sid.clone()
+        }
+        None => interactive_user_sid()?,
+    };
     write_secure(&owner_sid_path(&dir), format!("{owner_sid}\n").as_bytes())?;
 
     let service_updated = install_service(opts)?;
 
-    let mut soft_errors = Vec::new();
+    let mut warnings = Vec::new();
     if let Some(tray) = &opts.tray_exe
-        && let Err(e) = set_run_value(&run_value(tray))
+        && let Err(e) = set_run_value(Some(&owner_sid), &run_value(tray))
     {
-        soft_errors.push(format!("Run-ключ трея: {e:#}"));
+        warnings.push(format!("Run-ключ трея: {e:#}"));
     }
     if let Some(sc) = &opts.shortcut
         && let Err(e) = create_shortcut(sc)
     {
-        soft_errors.push(format!("ярлык {}: {e:#}", sc.lnk.display()));
+        warnings.push(format!("ярлык {}: {e:#}", sc.lnk.display()));
     }
-    if opts.start {
-        start_service(&opts.service_name)?;
+    if opts.start
+        && let Err(e) = start_service(&opts.service_name)
+    {
+        warnings.push(format!("запуск службы: {e:#}"));
     }
-    if !soft_errors.is_empty() {
-        bail!("служба установлена, но: {}", soft_errors.join("; "));
+    Ok(InstallReport { data_dir: dir, config_imported, owner_sid, service_updated, warnings })
+}
+
+/// Каталог данных, которому можно доверять. Существующий каталог
+/// пересоздаётся, если это ссылка, его владелец не SYSTEM/Administrators
+/// или в нём нет `owner.sid` прошлой установки (его мог заранее создать
+/// обычный пользователь — `%ProgramData%` это разрешает — и подложить
+/// туда `client.json`). Затем владелец BA и защищённый DACL ставятся на
+/// каталог и сбрасываются на всех детей.
+fn prepare_data_dir(dir: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) => {
+            let trusted = !meta.file_type().is_symlink()
+                && meta.is_dir()
+                && owner_sid_path(dir).is_file()
+                && is_trusted_owner(dir)?;
+            if !trusted {
+                let rm = if meta.file_type().is_symlink() || !meta.is_dir() {
+                    // ссылку/файл удаляем сами по себе, не заходя внутрь
+                    std::fs::remove_dir(dir).or_else(|_| std::fs::remove_file(dir))
+                } else {
+                    std::fs::remove_dir_all(dir)
+                };
+                rm.with_context(|| format!("удаление чужого {}", dir.display()))?;
+                create_fresh_dir(dir)?;
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => create_fresh_dir(dir)?,
+        Err(e) => return Err(e).with_context(|| format!("{}", dir.display())),
     }
-    Ok(InstallReport { data_dir: dir, config_imported, owner_sid, service_updated })
+    set_dir_acl(dir, DATA_DIR_SDDL).with_context(|| format!("ACL на {}", dir.display()))?;
+    if !is_trusted_owner(dir)? {
+        bail!("не удалось сменить владельца {}", dir.display());
+    }
+    Ok(())
+}
+
+/// `create_dir` (не `_all`): если каталог успели создать между удалением и
+/// созданием — это ошибка, а не молчаливое использование чужого каталога.
+fn create_fresh_dir(dir: &Path) -> Result<()> {
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("создание {}", parent.display()))?;
+    }
+    std::fs::create_dir(dir).with_context(|| format!("создание {}", dir.display()))
 }
 
 /// Удаляет службу: стоп → `remove_adapter` (Wintun-адаптер) → удаление из
@@ -91,8 +146,10 @@ where
         Ok(errs) => errors.extend(errs),
         Err(e) => errors.push(format!("служба: {e:#}")),
     }
+    // SID из owner.sid — до purge; без него — HKCU установщика
+    let owner = read_owner_sid(&data_dir()).ok();
     if opts.remove_run_key
-        && let Err(e) = delete_run_value()
+        && let Err(e) = delete_run_value(owner.as_deref())
     {
         errors.push(format!("Run-ключ: {e:#}"));
     }
@@ -188,40 +245,70 @@ where
         Err(e) if win_err(ERROR_SERVICE_DOES_NOT_EXIST)(&e) => None,
         Err(e) => return Err(e).context("OpenService"),
     };
-    if let Some(svc) = &svc
-        && svc.query_status()?.current_state != ServiceState::Stopped
-    {
-        let _ = svc.stop();
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while svc.query_status()?.current_state != ServiceState::Stopped {
-            if Instant::now() > deadline {
-                errs.push("служба не остановилась за 20 с".to_string());
-                break;
+    // ошибки опроса статуса не прерывают шаг: адаптер и DeleteService ниже
+    let stopped = |svc: &windows_service::service::Service| -> std::result::Result<bool, String> {
+        svc.query_status()
+            .map(|st| st.current_state == ServiceState::Stopped)
+            .map_err(|e| format!("QueryServiceStatus: {e}"))
+    };
+    if let Some(svc) = &svc {
+        match stopped(svc) {
+            Ok(true) => {}
+            first => {
+                if let Err(e) = first {
+                    errs.push(e);
+                }
+                let _ = svc.stop();
+                let deadline = Instant::now() + Duration::from_secs(20);
+                loop {
+                    match stopped(svc) {
+                        Ok(true) => break,
+                        Ok(false) => {}
+                        Err(e) => {
+                            // временная ошибка — пробуем дальше до дедлайна
+                            if Instant::now() > deadline {
+                                errs.push(e);
+                                break;
+                            }
+                        }
+                    }
+                    if Instant::now() > deadline {
+                        errs.push("служба не остановилась за 20 с".to_string());
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
             }
-            std::thread::sleep(Duration::from_millis(250));
         }
     }
     // адаптер — после остановки службы (она держит его открытым)
     if let Err(e) = remove_adapter() {
         errs.push(format!("адаптер: {e:#}"));
     }
-    if let Some(svc) = svc {
-        svc.delete().context("DeleteService")?;
+    if let Some(svc) = svc
+        && let Err(e) = svc.delete()
+    {
+        errs.push(format!("DeleteService: {e}"));
     }
     Ok(errs)
 }
 
-/// Импорт `%APPDATA%\tunnel\client.json` установившего пользователя, если
-/// у службы конфига ещё нет. Возвращает, был ли импорт.
-fn import_user_config(dir: &Path) -> Result<bool> {
+/// Импорт `%APPDATA%\tunnel\client.json` пользователя (из
+/// [`InstallOptions::user_appdata`] или окружения), если у службы конфига
+/// ещё нет. Возвращает, был ли импорт.
+fn import_user_config(dir: &Path, appdata: Option<&Path>) -> Result<bool> {
     let dst = service_config_path(dir);
     if dst.exists() {
         return Ok(false);
     }
-    let Some(appdata) = std::env::var_os("APPDATA") else {
-        return Ok(false);
+    let appdata = match appdata {
+        Some(a) => a.to_path_buf(),
+        None => match std::env::var_os("APPDATA") {
+            Some(a) => PathBuf::from(a),
+            None => return Ok(false),
+        },
     };
-    let src = user_config_path(Path::new(&appdata));
+    let src = user_config_path(&appdata);
     let data = match std::fs::read(&src) {
         Ok(d) => d,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -239,7 +326,9 @@ fn write_secure(path: &PathBuf, data: &[u8]) -> Result<()> {
     std::fs::rename(&tmp, path).with_context(|| format!("запись {}", path.display()))
 }
 
-/// Ставит защищённый DACL из SDDL на каталог (дети получат наследуемые ACE).
+/// Ставит владельца и защищённый DACL из SDDL на каталог и сбрасывает их
+/// на всех детей (`TREE_SEC_INFO_RESET`: явные ACE детей заменяются
+/// унаследованными).
 fn set_dir_acl(dir: &Path, sddl: &str) -> Result<()> {
     let sddl_w = wide(sddl);
     let path_w = wide(dir);
@@ -255,40 +344,126 @@ fn set_dir_acl(dir: &Path, sddl: &str) -> Result<()> {
         {
             return Err(std::io::Error::last_os_error()).context("разбор SDDL");
         }
-        let mut present = 0;
-        let mut defaulted = 0;
-        let mut dacl: *mut ACL = std::ptr::null_mut();
-        let ok = GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted);
-        let res = if ok == 0 || present == 0 {
-            Err(anyhow!("в SDDL нет DACL"))
-        } else {
-            let rc = SetNamedSecurityInfoW(
+        let res = (|| {
+            let mut present = 0;
+            let mut defaulted = 0;
+            let mut dacl: *mut ACL = std::ptr::null_mut();
+            if GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted) == 0
+                || present == 0
+            {
+                bail!("в SDDL нет DACL");
+            }
+            let mut owner: PSID = std::ptr::null_mut();
+            if GetSecurityDescriptorOwner(sd, &mut owner, &mut defaulted) == 0 || owner.is_null()
+            {
+                bail!("в SDDL нет владельца");
+            }
+            let rc = TreeSetNamedSecurityInfoW(
                 path_w.as_ptr(),
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
+                OWNER_SECURITY_INFORMATION
+                    | DACL_SECURITY_INFORMATION
+                    | PROTECTED_DACL_SECURITY_INFORMATION,
+                owner,
                 std::ptr::null_mut(),
                 dacl,
                 std::ptr::null(),
+                TREE_SEC_INFO_RESET,
+                None,
+                ProgressInvokeNever,
+                std::ptr::null(),
             );
-            if rc == ERROR_SUCCESS {
-                Ok(())
-            } else {
-                Err(std::io::Error::from_raw_os_error(rc as i32)).context("SetNamedSecurityInfo")
+            if rc != ERROR_SUCCESS {
+                return Err(std::io::Error::from_raw_os_error(rc as i32))
+                    .context("TreeSetNamedSecurityInfo");
             }
-        };
+            Ok(())
+        })();
         LocalFree(sd as HLOCAL);
         res
     }
 }
 
-/// Строковый SID пользователя текущего процесса (установщик под UAC
-/// работает с тем же пользователем, что и его сеанс).
-fn current_user_sid() -> Result<String> {
+/// Владелец каталога — SYSTEM или Administrators.
+fn is_trusted_owner(dir: &Path) -> Result<bool> {
+    let path_w = wide(dir);
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: owner указывает внутрь sd, sd освобождается LocalFree.
+    unsafe {
+        let rc = GetNamedSecurityInfoW(
+            path_w.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut sd,
+        );
+        if rc != ERROR_SUCCESS {
+            return Err(std::io::Error::from_raw_os_error(rc as i32))
+                .with_context(|| format!("владелец {}", dir.display()));
+        }
+        let res = sid_to_string(owner);
+        LocalFree(sd as HLOCAL);
+        Ok(TRUSTED_OWNER_SIDS.contains(&res?.as_str()))
+    }
+}
+
+/// SID → строка `S-1-…`.
+///
+/// # Safety
+/// `sid` — валидный SID.
+unsafe fn sid_to_string(sid: PSID) -> Result<String> {
+    let mut s: windows_sys::core::PWSTR = std::ptr::null_mut();
+    // SAFETY: по контракту функции; s освобождается LocalFree.
+    unsafe {
+        if ConvertSidToStringSidW(sid, &mut s) == 0 {
+            return Err(std::io::Error::last_os_error()).context("ConvertSidToStringSid");
+        }
+        let n = (0..).take_while(|&i| *s.add(i) != 0).count();
+        let out = String::from_utf16_lossy(std::slice::from_raw_parts(s, n));
+        LocalFree(s as HLOCAL);
+        Ok(out)
+    }
+}
+
+/// SID пользователя рабочего стола: владелец процесса оболочки
+/// (`GetShellWindow` → explorer.exe). Токен самого установщика не годится:
+/// при over-the-shoulder UAC (обычный пользователь вводит пароль админа)
+/// это SID админа. Без оболочки — SID токена установщика.
+fn interactive_user_sid() -> Result<String> {
+    // SAFETY: хэндлы процесса закрываются; HWND только читается.
+    unsafe {
+        let hwnd = GetShellWindow();
+        if !hwnd.is_null() {
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            if pid != 0 {
+                let proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+                if !proc.is_null() {
+                    let sid = token_user_sid(proc);
+                    CloseHandle(proc);
+                    if let Ok(sid) = sid {
+                        return Ok(sid);
+                    }
+                }
+            }
+        }
+        token_user_sid(GetCurrentProcess())
+    }
+}
+
+/// Строковый SID пользователя токена процесса.
+///
+/// # Safety
+/// `process` — валидный хэндл процесса с правом запроса информации.
+unsafe fn token_user_sid(process: HANDLE) -> Result<String> {
     // SAFETY: буфер достаточного размера, хэндл токена закрывается.
     unsafe {
         let mut token: HANDLE = std::ptr::null_mut();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+        if OpenProcessToken(process, TOKEN_QUERY, &mut token) == 0 {
             return Err(std::io::Error::last_os_error()).context("OpenProcessToken");
         }
         let mut len = 0u32;
@@ -302,26 +477,29 @@ fn current_user_sid() -> Result<String> {
             return Err(err).context("GetTokenInformation(TokenUser)");
         }
         let user = &*(buf.as_ptr() as *const TOKEN_USER);
-        let mut s: windows_sys::core::PWSTR = std::ptr::null_mut();
-        if ConvertSidToStringSidW(user.User.Sid, &mut s) == 0 {
-            return Err(std::io::Error::last_os_error()).context("ConvertSidToStringSid");
-        }
-        let n = (0..).take_while(|&i| *s.add(i) != 0).count();
-        let sid = String::from_utf16_lossy(std::slice::from_raw_parts(s, n));
-        LocalFree(s as HLOCAL);
+        let sid = sid_to_string(user.User.Sid)?;
         validate_sid(&sid)?;
         Ok(sid)
     }
 }
 
-fn set_run_value(value: &str) -> Result<()> {
-    let key = wide(RUN_KEY);
+/// Куст реестра пользователя: `HKEY_USERS\<sid>` (при установке с чужими
+/// учётными данными HKCU — куст админа), без SID — HKCU.
+fn user_run_key(sid: Option<&str>) -> (HKEY, Vec<u16>) {
+    match sid {
+        Some(sid) => (HKEY_USERS, wide(format!("{sid}\\{RUN_KEY}"))),
+        None => (HKEY_CURRENT_USER, wide(RUN_KEY)),
+    }
+}
+
+fn set_run_value(sid: Option<&str>, value: &str) -> Result<()> {
+    let (root, key) = user_run_key(sid);
     let name = wide(RUN_VALUE);
     let data = wide(value);
     // SAFETY: буферы с нулём на конце живут до конца вызова.
     let rc = unsafe {
         RegSetKeyValueW(
-            HKEY_CURRENT_USER,
+            root,
             key.as_ptr(),
             name.as_ptr(),
             REG_SZ,
@@ -335,11 +513,11 @@ fn set_run_value(value: &str) -> Result<()> {
     Ok(())
 }
 
-fn delete_run_value() -> Result<()> {
-    let key = wide(RUN_KEY);
+fn delete_run_value(sid: Option<&str>) -> Result<()> {
+    let (root, key) = user_run_key(sid);
     let name = wide(RUN_VALUE);
     // SAFETY: буферы с нулём на конце живут до конца вызова.
-    let rc = unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, key.as_ptr(), name.as_ptr()) };
+    let rc = unsafe { RegDeleteKeyValueW(root, key.as_ptr(), name.as_ptr()) };
     if rc != ERROR_SUCCESS && rc != ERROR_FILE_NOT_FOUND {
         return Err(std::io::Error::from_raw_os_error(rc as i32)).context("RegDeleteKeyValue");
     }
@@ -347,7 +525,7 @@ fn delete_run_value() -> Result<()> {
 }
 
 fn create_shortcut(spec: &ShortcutSpec) -> Result<()> {
-    let out = Command::new("powershell.exe")
+    let out = Command::new(powershell_exe()?)
         .args(powershell_args(&shortcut_script(spec)))
         .output()
         .context("запуск powershell.exe")?;
@@ -358,4 +536,17 @@ fn create_shortcut(spec: &ShortcutSpec) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Абсолютный путь к `powershell.exe` из системного каталога: поиск по
+/// PATH из повышенного процесса мог бы найти подложенный exe.
+fn powershell_exe() -> Result<PathBuf> {
+    let mut buf = [0u16; 512];
+    // SAFETY: буфер и его длина корректны.
+    let n = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    if n == 0 || n >= buf.len() {
+        return Err(std::io::Error::last_os_error()).context("GetSystemDirectory");
+    }
+    let sys = PathBuf::from(OsString::from_wide(&buf[..n]));
+    Ok(sys.join(r"WindowsPowerShell\v1.0\powershell.exe"))
 }

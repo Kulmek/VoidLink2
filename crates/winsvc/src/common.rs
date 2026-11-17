@@ -50,7 +50,11 @@ pub const SHORTCUT_NAME: &str = "Tunnel";
 /// DACL каталога данных: SYSTEM и Administrators — полный доступ
 /// (наследуется файлами и подкаталогами), остальным — ничего; `P` — без
 /// наследования от `%ProgramData%`.
-pub const DATA_DIR_SDDL: &str = "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+/// Владелец — Administrators (`O:BA`): иначе создавший каталог заранее
+/// обычный пользователь остался бы владельцем с неявным WRITE_DAC.
+pub const DATA_DIR_SDDL: &str = "O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+/// Владельцы каталога данных, которым можно доверять (SYSTEM, Administrators).
+pub const TRUSTED_OWNER_SIDS: [&str; 2] = ["S-1-5-18", "S-1-5-32-544"];
 
 /// Событие SCM, переданное телу службы.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +94,13 @@ pub struct InstallOptions {
     pub shortcut: Option<ShortcutSpec>,
     /// Запустить службу сразу после установки.
     pub start: bool,
+    /// SID настоящего пользователя рабочего стола (пайп, `Run`-ключ).
+    /// `None` — определить по владельцу оболочки (explorer.exe); при
+    /// over-the-shoulder UAC токен установщика — это админ, а не он.
+    pub owner_sid: Option<String>,
+    /// `%APPDATA%` этого пользователя (импорт `client.json`); `None` —
+    /// переменная окружения установщика.
+    pub user_appdata: Option<PathBuf>,
 }
 
 impl InstallOptions {
@@ -115,6 +126,8 @@ impl InstallOptions {
             tray_exe: Some(tray),
             shortcut,
             start: true,
+            owner_sid: None,
+            user_appdata: appdata.map(Path::to_path_buf),
         }
     }
 }
@@ -128,6 +141,9 @@ pub struct InstallReport {
     pub owner_sid: String,
     /// `true` — служба уже была и её конфигурация обновлена.
     pub service_updated: bool,
+    /// Некритичные ошибки (Run-ключ, ярлык, старт службы): служба при этом
+    /// установлена.
+    pub warnings: Vec<String>,
 }
 
 /// Параметры удаления.
@@ -162,7 +178,31 @@ pub fn data_dir_from(programdata: Option<&OsStr>) -> PathBuf {
     base.join(DATA_DIR_NAME)
 }
 
-/// Каталог данных службы по текущему окружению.
+/// Каталог данных службы. В Windows — через `SHGetKnownFolderPath`
+/// (переменную `ProgramData` пользователь может переопределить в
+/// `HKCU\Environment`, и повышенный установщик её унаследует).
+#[cfg(windows)]
+pub fn data_dir() -> PathBuf {
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramData, SHGetKnownFolderPath};
+    let mut p: windows_sys::core::PWSTR = std::ptr::null_mut();
+    // SAFETY: p выделяет shell, освобождаем CoTaskMemFree в любом случае.
+    unsafe {
+        let hr = SHGetKnownFolderPath(&FOLDERID_ProgramData, 0, std::ptr::null_mut(), &mut p);
+        let base = if hr >= 0 && !p.is_null() {
+            let n = (0..).take_while(|&i| *p.add(i) != 0).count();
+            Some(String::from_utf16_lossy(std::slice::from_raw_parts(p, n)))
+        } else {
+            None
+        };
+        CoTaskMemFree(p as *const _);
+        // без known folder — системный путь, но не переменная окружения
+        data_dir_from(base.as_deref().map(OsStr::new))
+    }
+}
+
+/// Каталог данных службы по текущему окружению (не Windows).
+#[cfg(not(windows))]
 pub fn data_dir() -> PathBuf {
     data_dir_from(std::env::var_os("ProgramData").as_deref())
 }
@@ -261,9 +301,20 @@ pub fn service_wintun_dll() -> Result<PathBuf> {
     wintun_dll_beside(&exe)
 }
 
-/// Строка PowerShell в одинарных кавычках (подстановок нет, `'` удваивается).
+/// Строка PowerShell в одинарных кавычках (подстановок нет). Удваиваются
+/// все символы, которые PowerShell считает одинарной кавычкой: `'` и
+/// U+2018..U+201B (иначе `O’Brien` закрыл бы строку раньше).
 pub fn ps_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            out.push(c);
+        }
+        out.push(c);
+    }
+    out.push('\'');
+    out
 }
 
 /// C#-код создания `.lnk` с `System.AppUserModel.ID` (IShellLinkW +
@@ -480,6 +531,11 @@ mod tests {
     fn ps_quoting() {
         assert_eq!(ps_quote("a"), "'a'");
         assert_eq!(ps_quote("O'Brien $x"), "'O''Brien $x'");
+        assert_eq!(ps_quote("O\u{2019}Brien"), "'O\u{2019}\u{2019}Brien'");
+        assert_eq!(
+            ps_quote("\u{2018}a\u{201A}b\u{201B}"),
+            "'\u{2018}\u{2018}a\u{201A}\u{201A}b\u{201B}\u{201B}'"
+        );
     }
 
     #[test]
@@ -534,6 +590,8 @@ mod tests {
         let sc = o.shortcut.unwrap();
         assert_eq!(sc.aumid, AUMID);
         assert_eq!(sc.lnk, start_menu_shortcut(Path::new("/ad"), SHORTCUT_NAME));
+        assert_eq!(o.user_appdata.as_deref(), Some(Path::new("/ad")));
+        assert!(o.owner_sid.is_none());
         assert!(InstallOptions::for_layout(Path::new("/pf"), None).shortcut.is_none());
         let u = UninstallOptions::standard(true, Some(Path::new("/ad")));
         assert!(u.purge && u.remove_run_key);
