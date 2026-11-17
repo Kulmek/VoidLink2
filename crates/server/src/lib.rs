@@ -20,6 +20,7 @@
 //! - мусор и чужие фреймы отбрасываются молча, без записи в лог.
 
 pub mod persist;
+pub mod tcp;
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr, UdpSocket};

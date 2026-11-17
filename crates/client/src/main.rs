@@ -35,6 +35,7 @@ mod engine;
 #[cfg(test)]
 mod engine_e2e;
 mod store;
+mod tcp_link;
 mod tun;
 mod tui;
 
