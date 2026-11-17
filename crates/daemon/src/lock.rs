@@ -7,7 +7,8 @@
 //!   замок само. Устаревший сокет удаляется только под этим замком.
 //! - Windows — именованный мьютекс `Global\TunnelEngine`: занятость —
 //!   `ERROR_ALREADY_EXISTS` при создании (владение потоком не нужно, важен
-//!   сам объект, живущий, пока открыт хоть один хэндл).
+//!   сам объект, живущий, пока открыт хоть один хэндл). `ERROR_ACCESS_DENIED`
+//!   при существующем объекте (его держит служба) — тоже занятость.
 
 use std::fmt;
 use std::path::Path;
@@ -91,13 +92,38 @@ impl InstanceLock {
     /// Windows: замок на именованном мьютексе (для тестов — своё имя).
     #[cfg(windows)]
     pub fn acquire_named(name: &str) -> Result<Self, LockError> {
-        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError};
-        use windows_sys::Win32::System::Threading::CreateMutexW;
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, GetLastError,
+        };
+        use windows_sys::Win32::System::Threading::{CreateMutexW, OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
         let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
         // SAFETY: строка нуль-терминирована, атрибуты безопасности по умолчанию.
         let handle = unsafe { CreateMutexW(std::ptr::null(), 0, wide.as_ptr()) };
         if handle.is_null() {
-            return Err(LockError::Io(std::io::Error::last_os_error()));
+            // SAFETY: GetLastError сразу после CreateMutexW в том же потоке.
+            let err = unsafe { GetLastError() };
+            if err != ERROR_ACCESS_DENIED {
+                return Err(LockError::Io(std::io::Error::from_raw_os_error(err as i32)));
+            }
+            // ACCESS_DENIED: мьютекс держит служба (LocalSystem, DACL по
+            // умолчанию) — или у нас нет SeCreateGlobalPrivilege. Различаем
+            // попыткой открыть существующий объект.
+            // SAFETY: строка нуль-терминирована.
+            let h = unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, 0, wide.as_ptr()) };
+            if !h.is_null() {
+                // SAFETY: хэндл получен выше и больше нигде не используется.
+                unsafe { CloseHandle(h) };
+                return Err(LockError::Busy);
+            }
+            // SAFETY: GetLastError сразу после OpenMutexW в том же потоке.
+            return Err(match unsafe { GetLastError() } {
+                ERROR_ACCESS_DENIED => LockError::Busy,
+                ERROR_FILE_NOT_FOUND => LockError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "нужны права администратора (создание Global\\-мьютекса)",
+                )),
+                e => LockError::Io(std::io::Error::from_raw_os_error(e as i32)),
+            });
         }
         // SAFETY: GetLastError сразу после CreateMutexW в том же потоке.
         if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {

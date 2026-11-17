@@ -20,10 +20,10 @@ fn main() -> ExitCode {
             Ok(())
         }
         Mode::Console { debug, data_dir } => {
-            // Остановка — Ctrl+C (процесс завершается целиком); флаг для
-            // интеграции с обработчиком сигналов/консоли.
+            // Остановка — Ctrl+C / SIGTERM: флаг, хаб выходит штатно.
             let stop = Arc::new(AtomicBool::new(false));
-            service::run_console(&dir(data_dir), debug, service::NullBackend, stop)
+            service::install_ctrl_handler(stop.clone());
+            service::run_console(&dir(data_dir), debug, |_log| service::NullBackend, stop)
         }
         Mode::Service { data_dir } => service::run_service(&dir(data_dir)),
         Mode::Install => service::install(),

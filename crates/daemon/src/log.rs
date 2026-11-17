@@ -96,8 +96,11 @@ impl Logger {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if st.size > 0 && st.size + line.len() as u64 > self.max_bytes {
             st.file = None; // закрыть перед переименованием (Windows)
-            self.rotate();
-            st.size = 0;
+            let rotated = self.rotate();
+            st.file = OpenOptions::new().create(true).append(true).open(&self.path).ok();
+            // Не вышло (файл держит другой процесс без FILE_SHARE_DELETE) —
+            // пишем дальше в тот же файл, следующая попытка через max_bytes.
+            st.size = if rotated { st.file.as_ref().and_then(|f| f.metadata().ok()).map_or(0, |m| m.len()) } else { 0 };
         }
         if st.file.is_none() {
             st.file = OpenOptions::new().create(true).append(true).open(&self.path).ok();
@@ -122,17 +125,31 @@ impl Logger {
         PathBuf::from(s)
     }
 
-    /// daemon.log.(N-1) удаляется, остальные сдвигаются на один номер.
-    fn rotate(&self) {
+    /// Временное имя текущего файла на время сдвига архивов.
+    fn rotating(&self) -> PathBuf {
+        let mut s = self.path.as_os_str().to_owned();
+        s.push(".rotating");
+        PathBuf::from(s)
+    }
+
+    /// Сначала текущий файл уводится во временное имя; только если это
+    /// удалось — daemon.log.(N-1) удаляется, остальные сдвигаются на один
+    /// номер, временный становится `.1`. `false` — ротация не удалась,
+    /// архивы не тронуты.
+    fn rotate(&self) -> bool {
         if self.max_files == 1 {
-            let _ = std::fs::remove_file(&self.path);
-            return;
+            return std::fs::remove_file(&self.path).is_ok();
+        }
+        let tmp = self.rotating();
+        if std::fs::rename(&self.path, &tmp).is_err() {
+            return false;
         }
         let _ = std::fs::remove_file(self.archived(self.max_files - 1));
         for n in (1..self.max_files - 1).rev() {
             let _ = std::fs::rename(self.archived(n), self.archived(n + 1));
         }
-        let _ = std::fs::rename(&self.path, self.archived(1));
+        let _ = std::fs::rename(&tmp, self.archived(1));
+        true
     }
 }
 
@@ -202,6 +219,33 @@ mod tests {
         let log = Logger::open_with(&dir, "daemon.log", 200, 3, Level::Debug, false).unwrap();
         (log.callback())(Level::Debug, "через колбэк");
         assert!(std::fs::read_to_string(log.path()).unwrap().contains("через колбэк"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_rotation_keeps_archives() {
+        let dir = tmp("logrotfail");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("daemon.log.1"), "архив 1\n").unwrap();
+        std::fs::write(dir.join("daemon.log.2"), "архив 2\n").unwrap();
+        // Каталог на месте временного имени — переименование текущего
+        // файла не удаётся (как на Windows, когда файл держит редактор).
+        std::fs::create_dir_all(dir.join("daemon.log.rotating")).unwrap();
+        let log = Logger::open_with(&dir, "daemon.log", 100, 3, Level::Info, false).unwrap();
+        for i in 0..30 {
+            log.log(Level::Info, &format!("строка {i:03} xxxxxxxxxxxxxxxxxxxx"));
+        }
+        assert_eq!(std::fs::read_to_string(dir.join("daemon.log.1")).unwrap(), "архив 1\n");
+        assert_eq!(std::fs::read_to_string(dir.join("daemon.log.2")).unwrap(), "архив 2\n");
+        let cur = std::fs::read_to_string(dir.join("daemon.log")).unwrap();
+        assert!(cur.contains("строка 000") && cur.contains("строка 029"));
+        // Препятствие ушло — ротация снова работает.
+        std::fs::remove_dir(dir.join("daemon.log.rotating")).unwrap();
+        for i in 0..10 {
+            log.log(Level::Info, &format!("после {i:03} xxxxxxxxxxxxxxxxxxxxxxxxxxx"));
+        }
+        assert!(!std::fs::read_to_string(dir.join("daemon.log")).unwrap().contains("строка 000"));
+        assert!(!dir.join("daemon.log.rotating").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

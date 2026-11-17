@@ -9,6 +9,11 @@
 //! - снимок рассылается раз в [`SNAPSHOT_EVERY`] и сразу после изменений
 //!   (`Backend::changed`); подписчику, у которого был пропуск, снимок
 //!   досылается на ближайшем такте, пока не влезет в очередь;
+//! - пока подписчик ждёт снимок, события ему не шлются (считаются
+//!   потерянными): снимок с `seq` этого такта их покрывает, а место в очереди
+//!   остаётся под сам снимок — иначе ровный поток событий его вытесняет;
+//! - снимок бэкенда строится вне мьютекса хаба (IPC-потоки не ждут движок);
+//!   [`Hub::pump`] вызывается из одного потока (цикл [`Hub::run`]);
 //! - кольцо последних [`RING_CAP`] событий — новый подписчик сразу получает
 //!   историю лога и текущий снимок вне очереди (в [`Subscription`]).
 
@@ -19,6 +24,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+
+use crate::log::{Level, LogFn};
 
 /// Сколько последних событий хранит кольцо для новых подписчиков.
 pub const RING_CAP: usize = 500;
@@ -92,6 +99,7 @@ struct Inner {
 pub struct Hub<B: Backend> {
     backend: B,
     inner: Mutex<Inner>,
+    log: Option<LogFn>,
 }
 
 impl<B: Backend> Hub<B> {
@@ -106,7 +114,15 @@ impl<B: Backend> Hub<B> {
                 last_snap: None,
                 snap: None,
             }),
+            log: None,
         }
+    }
+
+    /// Хаб с логом (первое переполнение подписчика пишется в лог).
+    pub fn with_log(backend: B, log: LogFn) -> Self {
+        let mut h = Self::new(backend);
+        h.log = Some(log);
+        h
     }
 
     pub fn backend(&self) -> &B {
@@ -138,14 +154,16 @@ impl<B: Backend> Hub<B> {
     /// Новый подписчик с очередью `queue` сообщений (минимум 1).
     pub fn subscribe(&self, queue: usize) -> Subscription {
         let (tx, rx) = mpsc::sync_channel(queue.max(1));
+        // Снимок бэкенда — вне мьютекса хаба.
+        let fresh = if self.lock().snap.is_none() { Some(Arc::new(self.backend.snapshot())) } else { None };
         let mut g = self.lock();
-        let snap = match &g.snap {
-            Some(s) => s.clone(),
-            None => {
-                let s = Arc::new(self.backend.snapshot());
+        let snap = match (&g.snap, fresh) {
+            (Some(s), _) => s.clone(),
+            (None, Some(s)) => {
                 g.snap = Some(s.clone());
                 s
             }
+            (None, None) => unreachable!("снимок был в кэше, а кэш не очищается"),
         };
         let id = g.next_id;
         g.next_id += 1;
@@ -173,21 +191,35 @@ impl<B: Backend> Hub<B> {
     pub fn pump_at(&self, now: Instant) {
         let events = self.backend.poll_events();
         let changed = self.backend.changed();
+        let mut overflowed = Vec::new();
+        let need = {
+            let mut g = self.lock();
+            let g = &mut *g;
+            for ev in events {
+                g.seq += 1;
+                let ev = Arc::new(ev);
+                if g.ring.len() == RING_CAP {
+                    g.ring.pop_front();
+                }
+                g.ring.push_back((g.seq, ev.clone()));
+                let seq = g.seq;
+                g.subs.retain_mut(|s| deliver(s, HubMsg::Event { seq, ev: ev.clone() }, &mut overflowed));
+            }
+            let due = g.last_snap.is_none_or(|t| now.saturating_duration_since(t) >= SNAPSHOT_EVERY);
+            changed || due || g.snap.is_none()
+        };
+        if let Some(log) = &self.log {
+            for id in overflowed {
+                log(Level::Warn, &format!("подписчик {id}: очередь переполнена, события теряются до снимка"));
+            }
+        }
+        // Снимок строится без мьютекса хаба; он не старше событий этого такта
+        // (взят после poll_events), поэтому его seq = последний выданный.
+        let fresh = need.then(|| Arc::new(self.backend.snapshot()));
         let mut g = self.lock();
         let g = &mut *g;
-        for ev in events {
-            g.seq += 1;
-            let ev = Arc::new(ev);
-            if g.ring.len() == RING_CAP {
-                g.ring.pop_front();
-            }
-            g.ring.push_back((g.seq, ev.clone()));
-            let seq = g.seq;
-            g.subs.retain_mut(|s| deliver(s, HubMsg::Event { seq, ev: ev.clone() }));
-        }
-        let due = g.last_snap.is_none_or(|t| now.saturating_duration_since(t) >= SNAPSHOT_EVERY);
-        if changed || due || g.snap.is_none() {
-            g.snap = Some(Arc::new(self.backend.snapshot()));
+        if let Some(s) = fresh {
+            g.snap = Some(s);
             g.last_snap = Some(now);
             for s in &mut g.subs {
                 s.need_snapshot = true;
@@ -219,11 +251,20 @@ impl<B: Backend> Hub<B> {
     }
 }
 
-/// Доставить сообщение; `false` — подписчик ушёл.
-fn deliver(s: &mut Sub, msg: HubMsg) -> bool {
+/// Доставить событие; `false` — подписчик ушёл. Подписчику, ждущему снимок,
+/// событие не шлётся (его покроет снимок конца такта). Первое переполнение
+/// подписчика — его id в `overflowed` (для лога).
+fn deliver(s: &mut Sub, msg: HubMsg, overflowed: &mut Vec<u64>) -> bool {
+    if s.need_snapshot {
+        s.dropped += 1;
+        return true;
+    }
     match s.tx.try_send(msg) {
         Ok(()) => true,
         Err(TrySendError::Full(_)) => {
+            if s.dropped == 0 {
+                overflowed.push(s.id);
+            }
             s.dropped += 1;
             s.need_snapshot = true;
             true
@@ -330,15 +371,49 @@ mod tests {
         let first = drain(&sub.rx);
         assert_eq!(event_seqs(&first), vec![1, 2, 3]);
         assert_eq!(hub.dropped(sub.id), Some(7));
-        // Очередь свободна: досылается снимок с seq последнего события.
+        // Очередь свободна: события, пока ждём снимок, не шлются; снимок
+        // с seq последнего события покрывает дырку 4..=12.
         hub.backend().push(2);
         hub.pump_at(now + Duration::from_millis(20));
         let next = drain(&sub.rx);
-        assert_eq!(event_seqs(&next), vec![11, 12]); // дырка 4..=10
-        match next.last().unwrap() {
-            HubMsg::Snapshot { seq, .. } => assert_eq!(*seq, 12),
-            m => panic!("ждали снимок, пришло {m:?}"),
+        assert!(event_seqs(&next).is_empty());
+        match next.as_slice() {
+            [HubMsg::Snapshot { seq, .. }] => assert_eq!(*seq, 12),
+            m => panic!("ждали один снимок, пришло {m:?}"),
         }
+        assert_eq!(hub.dropped(sub.id), Some(9));
+        // После снимка события идут как обычно.
+        hub.backend().push(1);
+        hub.pump_at(now + Duration::from_millis(30));
+        assert_eq!(event_seqs(&drain(&sub.rx)), vec![13]);
+    }
+
+    #[test]
+    fn snapshot_not_starved_by_steady_stream() {
+        let logged = Arc::new(Mutex::new(Vec::<String>::new()));
+        let l = logged.clone();
+        let log: LogFn = Arc::new(move |_, m| l.lock().unwrap().push(m.to_string()));
+        let hub = Hub::with_log(Fake::default(), log);
+        let now = Instant::now();
+        hub.pump_at(now);
+        let sub = hub.subscribe(3);
+        hub.backend().push(10); // переполнение
+        hub.pump_at(now + Duration::from_millis(10));
+        let mut got_snap = None;
+        for tick in 1..=3u64 {
+            // Клиент читает 3 сообщения за такт, движок шлёт 3 события за такт.
+            let read: Vec<HubMsg> = sub.rx.try_iter().take(3).collect();
+            if let Some(m) = read.iter().find(|m| matches!(m, HubMsg::Snapshot { .. })) {
+                got_snap = Some((tick, m.seq()));
+                break;
+            }
+            hub.backend().push(3);
+            hub.pump_at(now + Duration::from_millis(10 + 10 * tick));
+        }
+        let (tick, seq) = got_snap.expect("снимок не дошёл за 3 такта");
+        assert!(tick <= 2, "снимок пришёл только на такте {tick}");
+        assert_eq!(seq, hub.seq());
+        assert_eq!(logged.lock().unwrap().len(), 1, "переполнение логируется один раз");
     }
 
     #[test]
