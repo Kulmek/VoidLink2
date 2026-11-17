@@ -38,6 +38,8 @@ mod engine_e2e;
 mod ipv6;
 mod store;
 mod tun;
+#[cfg(target_os = "linux")]
+mod tun_linux;
 mod tui;
 
 use std::net::SocketAddr;
