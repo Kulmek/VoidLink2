@@ -171,7 +171,7 @@ Hello:
 Welcome:
 
 ```json
-{"t": "welcome", "proto": 1, "daemon_ver": "0.4.2", "me": {"my_pub": "9f3a…(64 hex)…", "my_code": "ABCD-1234"}}
+{"t": "welcome", "proto": 1, "daemon_ver": "0.4.2", "me": {"my_pub": "9f3a…(64 hex)…", "my_code": "TUN-…"}}
 ```
 
 Reject (версия не совпала):
@@ -332,17 +332,23 @@ sequenceDiagram
 | `SwitchServer { addr, pubkey, label }` | `{"SwitchServer": {"addr": "203.0.113.5:7000", "pubkey": [ …32 числа… ], "label": "main"}}` | |
 | `ToggleAutojoin(gid)` | `{"ToggleAutojoin": 2}` | |
 | `FriendGroups(pubkey)` | `{"FriendGroups": [ …32 числа… ]}` | |
-| `Quit` | `"Quit"` | фейковый бэкенд такую команду отвергает; остановки демона через IPC протокол не предусматривает |
+| `AddFriend { pubkey, alias }` | `{"AddFriend": {"pubkey": [ …32 числа… ], "alias": "вася"}}` | правка конфига на стороне демона |
+| `DelFriend(pubkey)` | `{"DelFriend": [ …32 числа… ]}` | |
+| `SetAlias { pubkey, alias }` | `{"SetAlias": {"pubkey": [ …32 числа… ], "alias": "вася"}}` | |
+| `AddServer { addr, pubkey, label }` | `{"AddServer": {"addr": "203.0.113.5:5555", "pubkey": [ …32 числа… ], "label": "main"}}` | `addr` — строка `ip:port` |
+| `DelServer { idx }` | `{"DelServer": {"idx": 1}}` | текущий сервер движка не удаляется |
+| `SetPrimaryServer { idx }` | `{"SetPrimaryServer": {"idx": 0}}` | |
+| `Quit` | `"Quit"` | демон отвечает `ack` с ошибкой «демон не завершается по команде фронтенда»: остановки демона через IPC протокол не предусматривает |
 
 Замечания:
 
-- Форма `[u8; 32]` и `SocketAddr` здесь описана по умолчанию serde (массив из 32 чисел и строка `ip:port`). Сами derive `Serialize`/`Deserialize` для `Cmd` ещё добавляются в рамках задачи `w5-daemon-engine` (см. [PLAN.md](PLAN.md), этап 7.3). Перед написанием клиента сверьтесь с `crates/client/src/engine.rs`.
-- Команды для изменения конфига (`AddFriend`, `DelFriend`, `AddServer`, `DelServer`, `SetPrimaryServer`, `SetAlias`) запланированы в этапе 7.1, в `Cmd` ещё не добавлены.
+- Форма `[u8; 32]` и `SocketAddr` — по умолчанию serde: массив из 32 чисел и строка `ip:port`. `Cmd` и `Event` имеют derive `Serialize`/`Deserialize`; точный список вариантов — в `crates/client/src/engine.rs`.
+- Бэкенд на живом движке (`EngineBackend`) разбирает `cmd` в `Cmd`; неразобранная команда — `ack` с ошибкой «неверная команда: …». Команды правки конфига (`AddFriend`, `DelFriend`, `SetAlias`, `AddServer`, `DelServer`, `SetPrimaryServer`) проверяются до отправки движку (`check_cfg_cmd`), отказ приходит в `ack`.
 - Рабочий пример формы команд есть в `crates/daemon/src/fake.rs`: `FakeBackend` разбирает `"RefreshList"`, `{"Join": gid}`, `{"Leave": gid}`, `{"Create": {...}}`, `{"SetName": "…"}`.
 
 ### События (`ev`)
 
-`ev` — это `Event` движка, в той же внешне помеченной форме. Примеры из фейкового бэкенда и `Event`:
+`ev` — это `Event` движка, в той же внешне помеченной форме. Основные варианты (остальные — в `enum Event`):
 
 | Вариант `Event` | JSON |
 |---|---|
@@ -351,6 +357,13 @@ sequenceDiagram
 | `GroupLeft { gid, name }` | `{"GroupLeft": {"gid": 2, "name": "dev"}}` |
 | `Notice(text)` | `{"Notice": "список групп обновлён"}` |
 | `Error(text)` | `{"Error": "уже в группе 2"}` |
+| `Disconnected(reason)` | `{"Disconnected": "нет ответа"}` |
+| `GroupDeleted { gid, name }` | `{"GroupDeleted": {"gid": 2, "name": "dev"}}` |
+| `Kicked { gid, name, banned }` | `{"Kicked": {"gid": 2, "name": "dev", "banned": false}}` |
+| `Invite { gid, group_name, from_pubkey, from_name, expires_in }` | приглашение в группу |
+| `InviteDeclined`, `InviteRevoked`, `InvitesSynced`, `AdminInfo`, `FriendGroups` | ответы на приглашения, `GroupAdmin`, `FriendGroups` |
+| `PeerOnline`, `PeerOffline`, `Direct`, `DirectLost` | состояние участников и p2p-каналов |
+| `ServerKeyRotated`, `ServerSwitched` | смена ключа или сервера |
 
 Полный список вариантов — `enum Event` в `crates/client/src/engine.rs`. Новые варианты добавляются без смены версии протокола: старый клиент их не знает, но разбирает `ev` как JSON. Интерфейс должен показывать неизвестные события как нейтральную строку, а не падать.
 

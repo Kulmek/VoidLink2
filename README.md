@@ -12,8 +12,6 @@ VoidLink работает по схеме Hamachi и ZeroTier: участник�
 
 **Содержание:** [Что это](#что-это) · [Возможности](#возможности) · [Интерфейс](#интерфейс) · [Быстрый старт](#быстрый-старт) · [Команды](#команды) · [Структура](#структура-проекта) · [Документация](#документация) · [Статус](#статус-и-дорожная-карта) · [Участие](#участие-в-разработке)
 
----
-
 ## Что это
 
 Сервер VoidLink — точка встречи: хранит группы, выдаёт IP, принимает приглашения
@@ -28,12 +26,11 @@ flowchart LR
     A <-.->|"прямой UDP после hole punching"| B
 ```
 
-Полезная нагрузка группы шифруется ключом группы, который выдаёт сервер. Релей
-видит только открытый заголовок `gid | src_ip | dst_ip`. Список друзей хранится
-у клиента, а не на сервере. IP закреплён за ключом участника и возвращается с ним
-после офлайна.
-
----
+Полезная нагрузка группы шифруется ключом группы, который создаёт и раздаёт
+сервер, поэтому оператор сервера считается доверенным (см. [SECURITY](docs/SECURITY.md)).
+Посторонние в сети видят только открытый заголовок `gid | src_ip | dst_ip`.
+Список друзей хранится у клиента, а не на сервере. IP закреплён за ключом
+участника и возвращается с ним после офлайна.
 
 ## Возможности
 
@@ -44,14 +41,18 @@ flowchart LR
 - Автовход в выбранные группы при запуске, поиск LAN-адресов, переподключение
   за секунды после перезапуска сервера.
 - Приглашения не теряются, даже если адресат был офлайн. Режим невидимки.
-- Резервный TCP-путь на случай блокировки UDP (встраивается в движок клиента).
+- Резервный TCP-путь до сервера на случай блокировки UDP (`set-transport auto|udp|tcp`).
+- Встроенный DNS: имена пиров `<участник>.vl` и `<участник>.<группа>.vl`
+  (`100.66.0.53`); IPv6-оверлей `fd66:766c:696e::/48`.
 
 ### Безопасность
 
 - Identity на ed25519 (подписи) и x25519 (ключи канала). Friend code выглядит как `TUN-XXXX…`.
-- Сквозное шифрование ChaCha20-Poly1305. HELLO подписан, клиент закрепляет ключ сервера (pinning).
+- Шифрование ChaCha20-Poly1305: ключ группы для трафика, сеансовые ключи для управления.
+  HELLO подписан, клиент закрепляет ключ сервера (pinning).
 - Cookie и CHALLENGE на рукопожатие, окно повторов для шифрованных фреймов.
 - Лимиты скорости на сессию, IP, группу и сервер. Ротация ключа: `tunnel-server rotate-key`.
+- Перенос identity между машинами: `export-identity` / `import-identity`.
 
 Подробнее: [SECURITY](docs/SECURITY.md).
 
@@ -61,7 +62,8 @@ flowchart LR
 - **TUI** на ratatui: группы, друзья, участники, лог, приглашения, мышь, поиск,
   командная строка `:`, пять тем (тёмная, светлая, контрастная, янтарная, фьорд).
 - **Служба Windows** `tunnel-daemon`: туннель поднимается до входа пользователя.
-  TUI и CLI подключаются к ней по именованному каналу без прав администратора.
+  Трей подключается к ней по именованному каналу; TUI и CLI поверх службы
+  (без прав администратора) в разработке, см. [DAEMON](docs/DAEMON.md).
 - **Трей** `tunnel-tray`: состояние соединения и уведомления.
 
 ### Платформы
@@ -70,10 +72,8 @@ flowchart LR
 |---|:---:|:---:|:---:|
 | Сервер `tunnel-server` | отладка | да | отладка |
 | Клиент: CLI и TUI | да | да | да |
-| Туннель (TUN-адаптер) | да (Wintun) | в доработке | в доработке |
+| Туннель (TUN-адаптер) | да (Wintun) | да (`/dev/net/tun`) | да (`utun`) |
 | Служба и трей | да | — | — |
-
----
 
 ## Интерфейс
 
@@ -94,18 +94,17 @@ TUI работает в терминале. Слева группы и друз�
 
 Клавиши, мышь и темы: [TUI](docs/TUI.md).
 
----
-
 ## Быстрый старт
 
 ### Сервер на Linux
 
-Нужен VPS с белым IP и открытым UDP-портом (по умолчанию `5555`).
+Нужен VPS с белым IP и открытым портом `5555` (UDP; TCP на том же порту — для
+фолбэка).
 
 ```bash
 cargo build --release -p tunnel-server
 sudo infrastructure/linux/install-server.sh target/release/tunnel-server --listen 0.0.0.0:5555
-sudo ufw allow 5555/udp
+sudo ufw allow 5555/udp && sudo ufw allow 5555/tcp
 ```
 
 Установщик создаёт службу `tunnel-server` и печатает **Server code** (`TUN-…`):
@@ -119,13 +118,14 @@ sudo ufw allow 5555/udp
    powershell -ExecutionPolicy Bypass -File .\install.ps1
    ```
 
-2. Добавьте сервер из `%ProgramFiles%\Tunnel`:
+2. Добавьте сервер (команды — из `%ProgramFiles%\Tunnel`):
 
    ```powershell
    .\tunnel-client.exe add-server 203.0.113.10:5555 TUN-XXXX… mysrv
    ```
 
-3. Задайте имя и откройте интерфейс:
+3. Задайте имя и откройте интерфейс (пока TUI поднимает туннель сам, нужна
+   консоль администратора):
 
    ```powershell
    .\tunnel-client.exe set-name alpha
@@ -136,18 +136,17 @@ sudo ufw allow 5555/udp
 
 ### Клиент на Linux и macOS
 
-Сборка, CLI и TUI работают. TUN-адаптер для этих систем в доработке.
+Нужен root (или `CAP_NET_ADMIN` на Linux); адаптер — `voidlink0` (Linux) или `utunN` (macOS).
+Подробнее: [INSTALL](docs/INSTALL.md).
 
 ```bash
 cargo build --release -p tunnel-client
 ./target/release/tunnel-client add-server 203.0.113.10:5555 TUN-XXXX… mysrv
 ./target/release/tunnel-client create mynet --private
-./target/release/tunnel-client tui
+sudo ./target/release/tunnel-client --dir "$HOME/.tunnel-client" tui
 ```
 
 Когда оба участника в группе, проверка связи: `ping 100.66.<gid>.3`.
-
----
 
 ## Команды
 
@@ -167,16 +166,16 @@ cargo build --release -p tunnel-client
 | `run` | поднять туннель, лог в консоль |
 | `tui` (`ui`) | интерфейс |
 
-`peer` — friend code (`TUN-…`), hex-ключ или alias. Полный список и остальные
-команды: `tunnel-client` без аргументов и [CLIENT](docs/CLIENT.md). Глобальные
-флаги: `--dir`, `--debug`, `--server`, для `run` ещё `--adapter` и `--dll`.
+`peer` — friend code (`TUN-…`), hex-ключ или alias. Остальные команды
+(`bans`, `transfer`, `rename`, `alias`, `set-transport`, `set-mtu`, `dns`,
+`invisible`, `export-identity` и др.): `tunnel-client help` и [CLIENT](docs/CLIENT.md).
+Глобальные флаги: `--dir`, `--profile`, `--debug`, `--server`, для `run`/`tui`
+ещё `--adapter` и `--dll` (только Windows).
 
 ### Служба и сервер
 
 - `tunnel-daemon console|service|install|uninstall [--purge]`: консоль, режим SCM, установка и удаление службы. См. [DAEMON](docs/DAEMON.md).
-- `tunnel-server [адрес=0.0.0.0:5555] [--data <dir>] [--workers N] [-q]`, а также лимиты `--relay-rate`, `--join-rate`, `--max-owned-groups` и другие. Подкоманда `rotate-key`. См. [SERVER](docs/SERVER.md).
-
----
+- `tunnel-server [адрес=0.0.0.0:5555] [--data <dir>] [--workers N] [-q] [--tcp|--no-tcp] [--metrics <addr>]`, а также лимиты (`--relay-rate`, `--join-rate`, `--max-owned-groups` и др.). Подкоманда `rotate-key`. См. [SERVER](docs/SERVER.md).
 
 ## Структура проекта
 
@@ -186,7 +185,7 @@ Cargo-workspace на Rust 2024:
 |---|---|
 | `crates/protocol` | протокол v3: фреймы, рукопожатие, identity, шифрование, фрагментация |
 | `crates/server` | `tunnel-server`: рандеву, группы, IP, приглашения, релей, метрики, персистентность |
-| `crates/client` | `tunnel-client`: движок, CLI, TUI, Wintun, DNS, IPv6, TCP-путь |
+| `crates/client` | `tunnel-client`: движок, CLI, TUI, TUN (Wintun, Linux, macOS), DNS, IPv6, TCP-путь |
 | `crates/ipc` | протокол и транспорт между службой и интерфейсами |
 | `crates/daemon` | `tunnel-daemon`: служба, владеющая туннелем |
 | `crates/winsvc` | установка и запуск службы Windows (SCM) |
@@ -195,9 +194,9 @@ Cargo-workspace на Rust 2024:
 Прочее: `docs/` (документация), `infrastructure/` (systemd, NAT-стенд, скрипты
 Windows), `vendor/wintun/` (подписанный `wintun.dll`, который сборка кладёт рядом с exe).
 
----
-
 ## Документация
+
+Карта и порядок чтения по ролям: [docs/README](docs/README.md).
 
 | Документ | О чём |
 |---|---|
@@ -220,18 +219,15 @@ Windows), `vendor/wintun/` (подписанный `wintun.dll`, который 
 | [PLAN](docs/PLAN.md) | план развития по этапам |
 | [CHANGELOG](docs/CHANGELOG.md) | история изменений |
 
----
-
 ## Статус и дорожная карта
 
-- **Готово:** протокол v3, группы и lease IP, движок клиента, TUI с мышью и темами,
-  многопоточный сервер с лимитами, приглашения, надёжный выход из группы.
-- **В доработке:** служба Windows и трей, TUN-адаптер для Linux и macOS, DNS и IPv6
-  через туннель, TCP-путь при блокировке UDP, административное окно владельца группы.
+- **Готово:** протокол v3, группы и lease IP, движок клиента (Windows, Linux, macOS),
+  TUI с мышью, темами, экранами серверов и управления группой, многопоточный сервер
+  с лимитами, метриками и TCP-фолбэком, ротация ключа сервера, DNS и IPv6,
+  служба Windows и трей.
+- **В разработке:** TUI и CLI поверх службы (`--remote` / `--embedded`, PLAN 7.4).
 
 Подробно по этапам: [PLAN](docs/PLAN.md).
-
----
 
 ## Участие в разработке
 

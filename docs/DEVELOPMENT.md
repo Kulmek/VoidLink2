@@ -29,10 +29,10 @@
 
 | Что нужно | Зачем |
 |-----------|-------|
-| Rust **stable** (не ниже 1.85) | Workspace на **edition 2024**; используются let-цепочки (`if let … && let …`) |
+| Rust **stable** (не ниже 1.88) | Workspace на **edition 2024**; используются let-цепочки (`if let … && let …`) |
 | `rustup` с компонентами `rustfmt`, `clippy` | Форматирование и линт, как в CI |
-| Windows (MSVC) | Сборка и запуск клиента, трея, службы, Wintun-драйвера |
-| Linux или macOS | Сервер, протокол, IPC и демон без Windows-зависимостей |
+| Windows (MSVC) | Сборка и запуск трея, службы и Wintun-драйвера; клиент и демон с реальным туннелем |
+| Linux или macOS | Сервер, протокол, IPC, демон, клиент (TUN через `tun_linux.rs` / `tun_macos.rs`) |
 | `cargo-deny`, `cargo-audit` | Опционально, локальная проверка зависимостей (см. [раздел 9](#9-зависимости-cargo-deny-и-cargo-audit)) |
 
 Установка тулчейна:
@@ -40,7 +40,7 @@
 ```bash
 rustup toolchain install stable
 rustup component add rustfmt clippy
-rustc --version    # должно быть 1.85 или новее
+rustc --version    # должно быть 1.88 или новее
 ```
 
 Что собирается на каком хосте:
@@ -49,16 +49,15 @@ rustc --version    # должно быть 1.85 или новее
 |-------|:-------------:|:-------:|
 | `tunnel-protocol` | да | да |
 | `tunnel-server` | да | да |
-| `tunnel-ipc` | да | да (именованный пайп) |
-| `tunnel-daemon` | да (Unix-сокет, `--fake`) | да (служба) |
-| `tunnel-client` | нет (зависит от `wintun` безусловно) | да |
+| `tunnel-ipc` | да (Unix-сокет) | да (именованный пайп) |
+| `tunnel-client` | да (TUN: `tun_linux.rs`, `tun_macos.rs`) | да (Wintun) |
+| `tunnel-daemon` | да (Unix-сокет, `--fake`, реальный движок) | да (служба) |
 | `tunnel-tray` | нет | да |
 | `tunnel-winsvc` | нет (только Windows-код) | да |
 
-Крейт `tunnel-client` на Linux и macOS сейчас не собирается: зависимость `wintun`
-подключена без `cfg`. Поэтому e2e-тесты движка запускаются только на Windows.
-Перенос `wintun` в `[target.'cfg(windows)'.dependencies]` запланирован вместе с
-выделением движка в отдельный крейт (см. [PLAN.md, этап 7.1](PLAN.md)).
+`wintun` и `windows-sys` подключены в `tunnel-client` только под `cfg(windows)`, на Unix
+используется `libc`. Реальный TUN на Linux и macOS требует root (или `CAP_NET_ADMIN` на Linux);
+e2e-тесты движка подставляют заглушку вместо адаптера и прав не требуют.
 
 ---
 
@@ -81,21 +80,25 @@ graph LR
 
     client --> protocol
     server --> protocol
-    client -. dev-dependency .-> server
+    ipc --> protocol
+    daemon --> client
     daemon --> ipc
+    daemon --> winsvc
     tray --> ipc
+    client -. dev-dependency .-> server
+    daemon -. dev-dependency .-> server
 ```
 
-Пунктир — зависимость только для тестов: `engine_e2e.rs` поднимает настоящий
-сервер в том же процессе.
+Пунктир — зависимость только для тестов: e2e-тесты движка поднимают настоящий
+сервер в том же процессе. Демон владеет движком из `tunnel-client` через `EngineBackend`.
 
 | Крейт | Путь | Роль | Версия |
 |-------|------|------|--------|
 | `tunnel-protocol` | `crates/protocol` | Проводной формат v3: заголовок, рукопожатие, ctrl-фреймы, FRAG, окно повторов, кодеки payload | 0.2.0 |
 | `tunnel-server` | `crates/server` | Сервер: UDP-релей, группы, выдача IP, лимиты, персистентность `server.json`, TCP-фолбэк (`tcp.rs`) | 0.2.0 |
-| `tunnel-client` | `crates/client` | Движок (`engine.rs`), хранилище (`store.rs`), TUN (`tun.rs`, `tun_linux.rs`, `tun_macos.rs`), CLI (`main.rs`), TUI (`tui/`) | 0.2.0 |
-| `tunnel-ipc` | `crates/ipc` | Протокол локального IPC между демоном и фронтендами: кодек, транспорт (пайп на Windows, Unix-сокет на Unix) | 0.1.0 |
-| `tunnel-daemon` | `crates/daemon` | Демон: замок (`lock.rs`), лог, хаб подписчиков (`hub.rs`), IPC-сервер (`server.rs`), `FakeBackend` для разработки | 0.2.0 |
+| `tunnel-client` | `crates/client` | Библиотека (`lib.rs`: движок `engine.rs`, хранилище `store.rs`, DNS `dns.rs`, IPv6 `ipv6.rs`, TCP-канал `tcp_link.rs`, TUN `tun.rs` / `tun_linux.rs` / `tun_macos.rs`, TUI `tui/`) и CLI (`main.rs`) | 0.2.0 |
+| `tunnel-ipc` | `crates/ipc` | Протокол локального IPC между демоном и фронтендами: сообщения (`proto.rs`), кодек (`codec.rs`), клиент (`client.rs`), транспорт (пайп на Windows, Unix-сокет на Unix) | 0.1.0 |
+| `tunnel-daemon` | `crates/daemon` | Демон: замок (`lock.rs`), лог (`log.rs`), хаб подписчиков (`hub.rs`), IPC-сервер (`server.rs`), `EngineBackend` (`engine_backend.rs`) и `FakeBackend` для разработки, режимы в `cli.rs` | 0.2.0 |
 | `tunnel-winsvc` | `crates/winsvc` | Установка, запуск и удаление службы Windows (SCM) | 0.2.0 |
 | `tunnel-tray` | `crates/tray` | Иконка в трее Windows, меню, уведомления | 0.2.0 |
 
@@ -108,7 +111,7 @@ graph LR
 | `infrastructure/windows/` | `install.ps1`, `uninstall.ps1` |
 | `infrastructure/netns/nat-lab.sh` | Лаборатория NAT на сетевых пространствах имён Linux |
 | `infrastructure/scripts/` | Вспомогательные скрипты для лаборатории и ожидания хостов |
-| `vendor/wintun/` | Подписанный `wintun.dll` (0.14.1). Сборка клиента копирует его рядом с exe |
+| `vendor/wintun/` | Подписанный `wintun.dll`. Сборка клиента копирует его рядом с exe |
 | `.github/workflows/ci.yml` | Единственный workflow CI |
 
 ---
@@ -129,13 +132,13 @@ cargo build --release --workspace        # релиз, как в CI
 | `cargo build -p tunnel-protocol` | везде |
 | `cargo build --release -p tunnel-server` | Linux, macOS, Windows |
 | `cargo build -p tunnel-ipc` | везде |
-| `cargo build -p tunnel-daemon` | Linux, macOS (`--fake`), Windows (служба) |
-| `cargo build --release -p tunnel-client` | только Windows |
+| `cargo build --release -p tunnel-client` | Linux, macOS, Windows |
+| `cargo build -p tunnel-daemon` | Linux, macOS (`--fake` и реальный движок), Windows (служба) |
 | `cargo build --release -p tunnel-tray` | только Windows |
 | `cargo build -p tunnel-winsvc` | только Windows |
 
 Статический сервер для VPS (кросс-сборка с macOS или Windows) описан в
-[docs/SERVER.md](SERVER.md#сборка):
+[docs/SERVER.md](SERVER.md#сборка-под-linux):
 
 ```bash
 cargo zigbuild --release -p tunnel-server --target x86_64-unknown-linux-musl
@@ -160,16 +163,19 @@ cargo run -p tunnel-server -- 127.0.0.1:5555 --data ./tunnel-data
 
 | Флаг | По умолчанию | Смысл |
 |------|--------------|-------|
-| `[адрес]` | `0.0.0.0:5555` | адрес прослушивания (UDP) |
+| `[адрес]` | `0.0.0.0:5555` | адрес прослушивания (UDP, и TCP на том же порту) |
 | `--data <dir>` | `tunnel-data` | каталог состояния (`server.json`) |
 | `--workers N` | `0` (по ядрам, не больше 8) | число потоков-воркеров |
 | `-q`, `--quiet` | — | не печатать события и сводку |
+| `--tcp` / `--no-tcp` | включён | TCP-фолбэк |
+| `--metrics <addr>` | выключены | HTTP `/metrics` и `/healthz` |
+| `--relay-rate` / `--relay-burst`, `--ctrl-rate` / `--ctrl-burst`, `--hello-rate` / `--hello-burst`, `--plain-rate` / `--plain-burst`, `--join-rate` / `--join-burst` | 4000/8000, 50/100, 5/20, 2000/4000, 1/10 | лимиты (`Limits` в `crates/server/src/lib.rs`) |
+| `--session-timeout <сек>` | 30 | сессия без пакетов считается офлайн |
+| `--max-owned-groups`, `--invite-ttl-days`, `--max-invites-per-group`, `--max-bans-per-group`, `--max-invites-per-target` | 16, 7, 256, 1024, 64 | лимиты групп и приглашений |
 
-Полный список флагов и инструкции для VPS — в [docs/SERVER.md](SERVER.md).
-Лимиты (`Limits` в `crates/server/src/lib.rs`) по умолчанию: релей 4000 фреймов/с
-(burst 8000), ctrl 50/с (burst 100), HELLO 5/с с IP (burst 20). Для нагрузочных
-экспериментов их можно менять в коде через `Config::limits`, в e2e-тестах это
-делается функцией `start_server_with`.
+Отдельная подкоманда `tunnel-server rotate-key [--data <dir>]` меняет ключ сервера. Полный
+список флагов и инструкции для VPS — в [docs/SERVER.md](SERVER.md). В e2e-тестах лимиты меняют
+через `Config::limits` (функция `start_server_with`).
 
 ### 4.2. Демон без движка (`--fake`)
 
@@ -185,10 +191,10 @@ cargo run -p tunnel-daemon -- console --fake --debug --data-dir /tmp/vl-a
 берите другой `--data-dir`: одновременный запуск двух демонов на один каталог
 отвергается замком (`flock`).
 
-### 4.3. Клиент (Windows)
+### 4.3. Клиент
 
-Клиент с реальным туннелем работает только на Windows и требует прав
-администратора (Wintun). Типичный сценарий из командной строки:
+Клиент с реальным туннелем требует прав: администратор на Windows (Wintun), root или
+`CAP_NET_ADMIN` на Linux, `sudo` на macOS. Типичный сценарий из командной строки:
 
 ```powershell
 tunnel-client.exe --dir C:\vl-a add-server 127.0.0.1:5555 <код-сервера> local
@@ -197,14 +203,14 @@ tunnel-client.exe --dir C:\vl-a create "тестовая группа"
 tunnel-client.exe --dir C:\vl-a run
 ```
 
-Флаги `--dir`, `--debug`, `--server <N|addr|label>`, `--adapter`, `--dll`
-перечислены в выводе `tunnel-client help`. Для второго клиента на той же машине
+Глобальные флаги `--dir`, `--profile <имя>`, `--debug`, `--server <N|addr|label>`, `--adapter`,
+`--dll` (только Windows) перечислены в выводе `tunnel-client help`. Для второго клиента на той же машине
 используйте другой `--dir` и другой адаптер (`--adapter`).
 
 Пути хранилища: каталог из `--dir` содержит `client.json` с полями `Config`
 (`crates/client/src/store.rs`): `identity`, `name`, `status`, `servers`, `friends`,
 `autojoin`, `theme`, `lan_discovery`, `mtu`, `invisible`, `active_server`,
-`autojoin_by_server`. Ключи identity лежат в этом же файле в виде hex-строк
+`autojoin_by_server`, `dns`, `transport`, `adapter`, `dll`. Ключи identity лежат в этом же файле в виде hex-строк
 (`StoredIdentity`).
 
 ---
@@ -216,10 +222,10 @@ tunnel-client.exe --dir C:\vl-a run
 | Крейт | Тесты | Где запускаются |
 |-------|-------|-----------------|
 | `tunnel-protocol` | юнит-тесты кодеков, рукопожатия, `ReplayWindow`, FRAG; фаззинг-подобный тест `fuzz_tests.rs` (мутации и мусор, декодеры не паникуют) | Linux, macOS, Windows |
-| `tunnel-server` | юнит-тесты состояния групп, лимитов, персистентности | Linux, macOS, Windows |
+| `tunnel-server` | юнит-тесты состояния групп, лимитов, персистентности; `tests/sigterm.rs` — корректная остановка по сигналу (Unix) | Linux, macOS, Windows |
 | `tunnel-ipc` | `tests/unix_socket.rs` — транспорт поверх Unix-сокета | Linux, macOS |
-| `tunnel-daemon` | `tests/ipc_e2e.rs` — демон с `FakeBackend` на настоящем Unix-сокете (13 тестов), модуль `cli.rs` | Linux, macOS |
-| `tunnel-client` | `src/engine_e2e.rs` — 15 e2e-тестов движка: настоящий сервер и движки на loopback, TUN заменён заглушкой | Windows (в CI) |
+| `tunnel-daemon` | `tests/ipc_e2e.rs` — демон с `FakeBackend` на настоящем Unix-сокете; `tests/engine_e2e.rs` — демон с настоящим движком; модуль `cli.rs` | Linux, macOS |
+| `tunnel-client` | `src/engine_e2e.rs` — e2e-тесты движка: настоящий сервер и движки на loopback, TUN заменён заглушкой; юнит-тесты CLI, TUI, DNS, IPv6 | везде (в CI — на Windows) |
 
 Сводка по командам:
 
@@ -232,7 +238,7 @@ cargo test -p tunnel-server
 cargo test -p tunnel-ipc
 cargo test -p tunnel-daemon
 
-# клиент и движок — только Windows
+# клиент и движок
 cargo test -p tunnel-client
 cargo test -p tunnel-client engine_e2e          # только e2e-тесты движка
 
@@ -240,7 +246,7 @@ cargo test -p tunnel-client engine_e2e          # только e2e-тесты д
 cargo test -p tunnel-daemon --test ipc_e2e -- --nocapture <имя_теста>
 ```
 
-Весь workspace на Linux без клиента, как в CI:
+Весь workspace на Linux, как в CI (клиент там исключён, см. раздел 8):
 
 ```bash
 cargo test --workspace --exclude tunnel-client --exclude tunnel-tray --exclude tunnel-winsvc
@@ -302,14 +308,9 @@ cargo clippy --workspace --target x86_64-pc-windows-msvc --all-targets -- -D war
 CARGO_FEATURE_PURE=1 cargo check --workspace --target x86_64-pc-windows-msvc --all-targets
 ```
 
-Так же запускается локальный скрипт проверки: он выставляет `CARGO_FEATURE_PURE=1`
-и отдельный `CARGO_TARGET_DIR`, чтобы не смешивать артефакты с нативной сборкой.
-Переменную стоит ставить только для кросс-проверок. Нативная сборка на Windows
-использует стандартный путь `blake3`.
-
-Если `wintun` не проходит проверку вне Windows, его можно временно заменить
-заглушкой через `[patch.crates-io]` в **копии** репозитория. Сам `Cargo.toml`
-в репозитории менять не нужно и нельзя коммитить такие правки.
+Для кросс-проверки задайте отдельный `CARGO_TARGET_DIR`, чтобы не смешивать артефакты с
+нативной сборкой. Переменную `CARGO_FEATURE_PURE` стоит ставить только для кросс-проверок:
+нативная сборка на Windows использует стандартный путь `blake3`.
 
 Итоговая проверка перед пушем Windows-правок — всё равно `windows` job в CI
 (полная сборка и тесты на `windows-latest`).
@@ -365,10 +366,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 Замечания о расхождениях, которые стоит знать:
 
-* В `linux` клиент исключён из тестов. [PLAN.md, этап 7.7](PLAN.md) описывает
-  более широкую матрицу (ubuntu должен гонять `tunnel-engine`, `tunnel-ipc`,
-  `tunnel-daemon`, `tunnel-client`). Пока этого нет: до выделения движка
-  клиент на Linux не собирается. Изменения в ci.yml делаются вместе с этапом 7.1.
+* В `linux` клиент исключён из тестов (`--exclude tunnel-client`), хотя код клиента уже
+  собирается на Linux. [PLAN.md, этап 7.7](PLAN.md) описывает более широкую матрицу; `ci.yml`
+  под неё ещё не обновлён.
 * Задача nat-lab из [TESTING.md](TESTING.md) в `ci.yml` пока не заведена.
 * Шаг `smoke` службы Windows (`install` → `sc query` → `uninstall`) пока не
   добавлен.
@@ -476,12 +476,11 @@ cargo audit
 8. **Документы.** Обновите `docs/TESTING.md` (строки чек-листа), при
    необходимости `docs/PLAN.md`.
 
-9. **Проверка.** `cargo test -p tunnel-protocol -p tunnel-server`, на Windows
-   `cargo test -p tunnel-client`, кросс-проверка `cargo check --target
+9. **Проверка.** `cargo test -p tunnel-protocol -p tunnel-server`, `cargo test -p tunnel-client`, кросс-проверка `cargo check --target
    x86_64-pc-windows-msvc` с `CARGO_FEATURE_PURE=1`, `cargo fmt --all`, clippy.
 
 Для IPC-сообщений между демоном и фронтендами порядок такой же, но спецификация
-лежит в коде `crates/ipc/src/proto.rs` и `codec.rs`, и менять её нужно совместно
+описана в [IPC.md](IPC.md), а источник истины — код `crates/ipc/src/proto.rs` и `codec.rs`, и менять её нужно совместно
 с `PROTO_VERSION` в том же крейте.
 
 ---
@@ -509,7 +508,7 @@ cargo audit
    | `tunnel-windows-x64` | `tunnel-client.exe`, `tunnel-server.exe`, `tunnel-daemon.exe`, `tunnel-tray.exe` (те, что собрались), `wintun.dll`, `*.ps1` |
 
 5. **Установка.** Инструкции для пользователей — [docs/INSTALL.md](INSTALL.md)
-   (Windows: служба и трей; Linux/macOS: переносной режим), для сервера —
+   (Windows: служба и трей; Linux/macOS: клиент из сборки), для сервера —
    [docs/SERVER.md](SERVER.md).
 6. **Обновление сервера.** Перед заменой бинарника сохраните `server.json`
    (см. раздел «Резервная копия» в [docs/SERVER.md](SERVER.md)).
@@ -526,4 +525,5 @@ cargo audit
 * [docs/PROTOCOL.md](PROTOCOL.md) — спецификация протокола v3
 * [docs/SERVER.md](SERVER.md) — сервер: сборка, флаги, systemd
 * [docs/INSTALL.md](INSTALL.md) — установка клиента
+* [docs/IPC.md](IPC.md) — IPC между демоном и фронтендами
 * [docs/TESTING.md](TESTING.md) — план тестирования и критерии релиза
