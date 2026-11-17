@@ -22,6 +22,7 @@
 pub mod metrics;
 pub mod persist;
 pub mod signals;
+pub mod tcp;
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
