@@ -13,6 +13,8 @@ use tunnel_protocol as proto;
 
 use crate::engine::{Cmd, Engine};
 use crate::store::{self, Config, StoredFriend, StoredServer};
+use crate::tui::admin::{self, AdminAction, AdminView, BanEntry, InviteEntry, MemberEntry};
+use crate::tui::servers::{ServerEntry, ServersAction, ServersView};
 use crate::tui::theme::ThemeKind;
 
 pub const TOAST_TTL: Duration = Duration::from_secs(5);
@@ -217,7 +219,6 @@ pub struct ListItem {
 }
 
 pub enum ListAction {
-    PickServer,
     ToggleAutojoin,
 }
 
@@ -280,6 +281,10 @@ pub enum Popup {
     Settings(SettingsPopup),
     Profile,
     Invite(InvitePopup),
+    /// Управление своей группой: баны, приглашения, передача владения.
+    Admin(AdminView),
+    /// Экран «Серверы»: переключение, добавление/удаление, адаптер.
+    Servers(ServersView),
 }
 
 // ---------------------------------------------------------------- мышь
@@ -430,6 +435,9 @@ pub struct App {
     /// `Connected`/`ServerSwitched`): gid — номер группы на конкретном
     /// сервере, на другом сервере тот же gid — чужая группа.
     pub invites_server: Option<std::net::SocketAddr>,
+    /// Адаптер и dll, с которыми запущен клиент (экран «Серверы»).
+    pub adapter_name: String,
+    pub dll_path: String,
 }
 
 impl App {
@@ -474,6 +482,8 @@ impl App {
             later_invites: Vec::new(),
             declined: Vec::new(),
             invites_server: None,
+            adapter_name: cfg.adapter.clone(),
+            dll_path: cfg.dll.clone(),
         }
     }
 
@@ -715,8 +725,14 @@ impl App {
                     };
                     self.log(MsgKind::Info, msg.clone());
                     self.toast(MsgKind::Info, msg);
+                    self.server_addr = addr.to_string();
+                    self.on_server_switched(addr);
                 }
-                // Экран администрирования — позже; пока сводка в журнал.
+                // Открыт экран администрирования этой группы — заполняем его,
+                // иначе сводка в журнал.
+                E::AdminInfo { gid, bans, invites } if self.admin_open(gid) => {
+                    self.on_admin_info(gid, bans, invites);
+                }
                 E::AdminInfo { gid, bans, invites } => {
                     let names = |v: Vec<String>| if v.is_empty() { "—".to_string() } else { v.join(", ") };
                     let bans = names(bans.into_iter().map(|(_, n)| n).collect());
@@ -1202,6 +1218,7 @@ impl App {
             KeyCode::F(3) | KeyCode::F(10) => {
                 self.stack.push(Popup::Settings(SettingsPopup { sel: 0 }))
             }
+            KeyCode::F(4) => self.open_servers(eng),
             KeyCode::F(6) => self.open_rename(),
             KeyCode::F(8) => self.open_delete_group(),
             KeyCode::Char('?') => self.stack.push(Popup::Help),
@@ -1231,6 +1248,11 @@ impl App {
             KeyCode::Char('c') => self.copy_context(),
             KeyCode::Char('p') => self.stack.push(Popup::Profile),
             KeyCode::Char('o') => self.reopen_invites(),
+            KeyCode::Char('m') => {
+                if let Some(cmd) = self.open_admin() {
+                    let _ = eng.cmds.send(cmd);
+                }
+            }
             KeyCode::Char('s') => {
                 self.sort = self.sort.next();
                 self.status_msg = format!("сортировка: {}", self.sort.label());
@@ -1318,6 +1340,14 @@ impl App {
     // ---------- мышь ----------
 
     pub fn handle_mouse(&mut self, m: MouseEvent, eng: &Engine) {
+        // Экраны со своей геометрией (admin, servers) разбирают мышь сами;
+        // тост поверх них по-прежнему закрывает то, что под ним.
+        if matches!(self.stack.last(), Some(Popup::Admin(_) | Popup::Servers(_)))
+            && !inside(self.hits.toasts.get(), m.column, m.row)
+        {
+            self.screen_mouse(m, eng);
+            return;
+        }
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => self.click(m.column, m.row, eng),
             MouseEventKind::ScrollUp => self.wheel(m.column, m.row, -1),
@@ -1554,6 +1584,21 @@ impl App {
     // ---------- попапы ----------
 
     fn handle_popup_key(&mut self, key: KeyEvent, eng: &Engine) {
+        match self.stack.last() {
+            Some(Popup::Admin(_)) => {
+                for cmd in self.admin_key(key) {
+                    let _ = eng.cmds.send(cmd);
+                }
+                self.pump_invites();
+                return;
+            }
+            Some(Popup::Servers(_)) => {
+                self.servers_input(eng, |v| v.handle_key(key));
+                self.pump_invites();
+                return;
+            }
+            _ => {}
+        }
         let popup = match self.stack.pop() {
             Some(p) => p,
             None => return,
@@ -1641,32 +1686,6 @@ impl App {
                 }
                 KeyCode::Enter => {
                     match p.action {
-                        ListAction::PickServer => {
-                            // Выбранный сервер становится первым в client.json:
-                            // `run`/`tui` без --server берут первый. Раньше выбор
-                            // только показывал тост и нигде не сохранялся.
-                            let idx = p.items.get(p.sel).and_then(|i| i.value.parse::<usize>().ok());
-                            let mut cfg = eng.cfg.lock().unwrap().clone();
-                            match idx.filter(|i| *i < cfg.servers.len()) {
-                                Some(i) => {
-                                    let picked = cfg.servers.remove(i);
-                                    let addr = picked.addr.clone();
-                                    cfg.servers.insert(0, picked);
-                                    match save_cfg(eng, cfg) {
-                                        Ok(()) => {
-                                            self.status_msg = format!("сервер: {addr}");
-                                            self.toast(
-                                                MsgKind::Ok,
-                                                format!("сервер {addr} — применится после перезапуска"),
-                                            );
-                                        }
-                                        Err(e) => self
-                                            .toast(MsgKind::Error, format!("не сохранить сервер: {e}")),
-                                    }
-                                }
-                                None => self.toast(MsgKind::Warn, "сервер не выбран".into()),
-                            }
-                        }
                         ListAction::ToggleAutojoin => {
                             // gid берём из выбранной строки: в действии лежит
                             // заглушка 0, из-за которой переключалась «группа 0».
@@ -1712,6 +1731,8 @@ impl App {
                     let _ = eng.cmds.send(cmd);
                 }
             }
+            // Разобраны выше.
+            p @ (Popup::Admin(_) | Popup::Servers(_)) => self.stack.push(p),
         }
         // Закрыли окно — следующее приглашение из очереди.
         self.pump_invites();
@@ -2014,34 +2035,7 @@ impl App {
                 action: InputAction::SetStatus,
                 private: false,
             })),
-            SettingRow::Server => {
-                let items: Vec<ListItem> = self
-                    .servers
-                    .iter()
-                    .enumerate()
-                    .map(|(i, s)| ListItem {
-                        label: if s.label.is_empty() {
-                            format!("{}: {}", i, s.addr)
-                        } else {
-                            format!("{}: {} ({})", i, s.addr, s.label)
-                        },
-                        // Отмечен сервер, к которому подключены сейчас.
-                        checked: s.addr.parse::<std::net::SocketAddr>().ok()
-                            == Some(eng.meta.lock().unwrap().server),
-                        value: i.to_string(),
-                    })
-                    .collect();
-                if items.is_empty() {
-                    self.toast(MsgKind::Warn, "нет серверов".into());
-                    return;
-                }
-                self.stack.push(Popup::ListPick(ListPickPopup {
-                    title: "Сервер (влияет на перезапуск)".into(),
-                    items,
-                    sel: 0,
-                    action: ListAction::PickServer,
-                }));
-            }
+            SettingRow::Server => self.open_servers(eng),
             SettingRow::Autojoin => {
                 let items: Vec<ListItem> = self
                     .groups
@@ -2132,6 +2126,269 @@ impl App {
         }
     }
 
+    // ---------- управление группой ----------
+
+    /// Открыт ли экран управления группой `gid`.
+    pub fn admin_open(&self, gid: u32) -> bool {
+        self.stack.iter().any(|p| matches!(p, Popup::Admin(v) if v.gid == gid))
+    }
+
+    /// «m» на выбранной группе: экран управления (только своя группа).
+    /// Возвращает запрос данных для движка.
+    pub fn open_admin(&mut self) -> Option<Cmd> {
+        let Some(gid) = self.sel_group else {
+            self.toast(MsgKind::Warn, "не выбрана группа".into());
+            return None;
+        };
+        match self.open_admin_for(gid) {
+            Ok(cmd) => Some(cmd),
+            Err(e) => {
+                self.toast(MsgKind::Warn, e.to_string());
+                None
+            }
+        }
+    }
+
+    /// Открывает экран управления группой `gid` → `Cmd::GroupAdmin(gid)`.
+    pub fn open_admin_for(&mut self, gid: u32) -> Result<Cmd> {
+        let g = self
+            .groups
+            .iter()
+            .find(|g| g.gid == gid)
+            .ok_or_else(|| anyhow!("группа {gid} не найдена"))?;
+        if !g.owner_is_me {
+            return Err(anyhow!("управлять группой может только владелец"));
+        }
+        let mut v = AdminView::new(gid, g.name.clone());
+        v.members = admin_members(g);
+        self.stack.push(Popup::Admin(v));
+        Ok(Cmd::GroupAdmin(gid))
+    }
+
+    /// Ответ ADMIN_INFO: заполнить открытый экран группы `gid`.
+    pub fn on_admin_info(
+        &mut self,
+        gid: u32,
+        bans: Vec<([u8; 32], String)>,
+        invites: Vec<([u8; 32], String, u32)>,
+    ) {
+        let members = self.groups.iter().find(|g| g.gid == gid).map(admin_members);
+        let bans: Vec<BanEntry> = bans.into_iter().map(|(pk, name)| BanEntry { pk, name }).collect();
+        let invites: Vec<InviteEntry> = invites
+            .into_iter()
+            .map(|(pk, name, exp)| InviteEntry { pk, name, expires_in_secs: exp as u64 })
+            .collect();
+        for p in self.stack.iter_mut() {
+            if let Popup::Admin(v) = p
+                && v.gid == gid
+            {
+                let members = members.clone().unwrap_or_else(|| v.members.clone());
+                v.set_data(bans.clone(), invites.clone(), members);
+            }
+        }
+    }
+
+    /// Клавиша в экране управления (он сверху стека): команды движку.
+    pub fn admin_key(&mut self, key: KeyEvent) -> Vec<Cmd> {
+        let act = match self.stack.last_mut() {
+            Some(Popup::Admin(v)) => admin::handle_key(v, key),
+            _ => return Vec::new(),
+        };
+        self.admin_apply(act)
+    }
+
+    /// Действие экрана управления → команды движку. После UNBAN / KICK
+    /// данные запрашиваются заново; после передачи владения экран закрыт:
+    /// управлять группой мы больше не можем.
+    pub fn admin_apply(&mut self, act: Option<AdminAction>) -> Vec<Cmd> {
+        let name = |a: &App, pk: &[u8; 32]| match a.stack.last() {
+            Some(Popup::Admin(v)) => v
+                .bans
+                .iter()
+                .find(|e| &e.pk == pk)
+                .map(|e| e.name.clone())
+                .or_else(|| v.invites.iter().find(|e| &e.pk == pk).map(|e| e.name.clone()))
+                .or_else(|| v.members.iter().find(|e| &e.pk == pk).map(|e| e.name.clone()))
+                .unwrap_or_else(|| proto::hex_of(&pk[..4])),
+            _ => proto::hex_of(&pk[..4]),
+        };
+        match act {
+            None => Vec::new(),
+            Some(AdminAction::Close) => {
+                self.stack.pop();
+                Vec::new()
+            }
+            Some(AdminAction::Refresh(gid)) => vec![Cmd::GroupAdmin(gid)],
+            Some(AdminAction::Unban(gid, pk)) => {
+                let n = name(self, &pk);
+                self.toast(MsgKind::Ok, format!("бан снят: {n}"));
+                vec![Cmd::Unban(gid, pk), Cmd::GroupAdmin(gid)]
+            }
+            Some(AdminAction::RevokeInvite(gid, pk)) => {
+                let n = name(self, &pk);
+                self.toast(MsgKind::Ok, format!("приглашение отозвано: {n}"));
+                vec![Cmd::Kick(gid, pk), Cmd::GroupAdmin(gid)]
+            }
+            Some(AdminAction::Transfer(gid, pk)) => {
+                let n = name(self, &pk);
+                self.stack.pop();
+                self.toast(MsgKind::Warn, format!("группа {gid} передаётся: {n}"));
+                vec![Cmd::Transfer(gid, pk)]
+            }
+        }
+    }
+
+    // ---------- серверы ----------
+
+    /// Индекс текущего сервера в `cfg.servers` (по адресу из движка).
+    fn current_server(&self, cfg: &Config) -> usize {
+        cfg.servers
+            .iter()
+            .position(|s| {
+                s.addr == self.server_addr
+                    || resolve_addr(&s.addr).is_some_and(|a| a.to_string() == self.server_addr)
+            })
+            .unwrap_or(0)
+    }
+
+    /// Экран «Серверы» (F4, `:servers`, настройки).
+    pub fn open_servers(&mut self, eng: &Engine) {
+        let cfg = eng.cfg.lock().unwrap().clone();
+        self.open_servers_with(&cfg);
+    }
+
+    pub fn open_servers_with(&mut self, cfg: &Config) {
+        let v = ServersView::new(
+            server_entries(cfg),
+            self.current_server(cfg),
+            &self.adapter_name,
+            &self.dll_path,
+        );
+        self.stack.push(Popup::Servers(v));
+    }
+
+    /// Ввод в экран «Серверы» (клавиша или мышь — `f`): действие
+    /// применяется к копии конфига, изменённый конфиг сохраняется.
+    fn servers_input(
+        &mut self,
+        eng: &Engine,
+        f: impl FnOnce(&mut ServersView) -> Option<ServersAction>,
+    ) {
+        let act = match self.stack.last_mut() {
+            Some(Popup::Servers(v)) => f(v),
+            _ => return,
+        };
+        let Some(act) = act else { return };
+        let mut cfg = eng.cfg.lock().unwrap().clone();
+        let (cmd, save) = self.servers_apply(act, &mut cfg);
+        if save && let Err(e) = save_cfg(eng, cfg) {
+            self.toast(MsgKind::Error, format!("не сохранить конфиг: {e}"));
+        }
+        if let Some(cmd) = cmd {
+            let _ = eng.cmds.send(cmd);
+        }
+    }
+
+    /// Действие экрана «Серверы» над конфигом. Возвращает команду движку и
+    /// признак «конфиг изменён — сохранить».
+    pub fn servers_apply(&mut self, act: ServersAction, cfg: &mut Config) -> (Option<Cmd>, bool) {
+        match act {
+            ServersAction::Close => {
+                self.stack.pop();
+                (None, false)
+            }
+            ServersAction::Switch(i) => {
+                let Some(s) = cfg.servers.get(i) else { return (None, false) };
+                let Some(addr) = resolve_addr(&s.addr) else {
+                    self.toast(MsgKind::Error, format!("адрес {} не разрешается", s.addr));
+                    return (None, false);
+                };
+                let Some(pubkey) = hex32(&s.pubkey) else {
+                    self.toast(MsgKind::Error, format!("неверный ключ сервера {}", s.addr));
+                    return (None, false);
+                };
+                let label = s.label.clone();
+                if let Some(Popup::Servers(v)) = self.stack.last_mut() {
+                    v.notice = Some(format!("переключаемся на {addr}…"));
+                }
+                (Some(Cmd::SwitchServer { addr, pubkey, label }), false)
+            }
+            ServersAction::Add { addr, pubkey, label } => {
+                cfg.servers.push(StoredServer {
+                    addr: addr.clone(),
+                    pubkey: proto::hex_of(&pubkey),
+                    label,
+                });
+                self.servers = cfg.servers.clone();
+                let cur = self.current_server(cfg);
+                if let Some(Popup::Servers(v)) = self.stack.last_mut() {
+                    v.set_servers(server_entries(cfg), cur);
+                    v.sel = v.servers.len().saturating_sub(1);
+                    v.notice = Some(format!("сервер {addr} добавлен"));
+                }
+                (None, true)
+            }
+            ServersAction::Delete(i) => {
+                let cur = self.current_server(cfg);
+                if i >= cfg.servers.len() || i == cur {
+                    return (None, false);
+                }
+                let gone = cfg.servers.remove(i);
+                self.servers = cfg.servers.clone();
+                let cur = self.current_server(cfg);
+                if let Some(Popup::Servers(v)) = self.stack.last_mut() {
+                    v.set_servers(server_entries(cfg), cur);
+                    v.notice = Some(format!("сервер {} удалён", gone.addr));
+                }
+                (None, true)
+            }
+            ServersAction::SetAdapter { name, dll } => {
+                cfg.adapter = name.clone();
+                cfg.dll = dll.clone();
+                if let Some(Popup::Servers(v)) = self.stack.last_mut() {
+                    v.adapter_name = name;
+                    v.dll_path = dll;
+                    v.notice = Some("адаптер и dll сохранены — применится после перезапуска".into());
+                }
+                self.toast(MsgKind::Ok, "адаптер сохранён — применится после перезапуска".into());
+                (None, true)
+            }
+        }
+    }
+
+    /// Движок переключён на `addr`: отметить текущий в открытом экране.
+    pub fn on_server_switched(&mut self, addr: std::net::SocketAddr) {
+        for p in self.stack.iter_mut() {
+            if let Popup::Servers(v) = p
+                && let Some(i) = v
+                    .servers
+                    .iter()
+                    .position(|s| s.addr == addr.to_string() || resolve_addr(&s.addr) == Some(addr))
+            {
+                v.current = i;
+                v.sel = i;
+                v.notice = Some(format!("текущий сервер: {addr}"));
+            }
+        }
+    }
+
+    /// Мышь в экранах admin / servers (они сверху стека).
+    fn screen_mouse(&mut self, m: MouseEvent, eng: &Engine) {
+        match self.stack.last_mut() {
+            Some(Popup::Admin(v)) => {
+                let act = admin::handle_mouse(v, m);
+                for cmd in self.admin_apply(act) {
+                    let _ = eng.cmds.send(cmd);
+                }
+            }
+            Some(Popup::Servers(_)) => {
+                self.servers_input(eng, |v| v.handle_mouse(m.kind, m.column, m.row));
+            }
+            _ => return,
+        }
+        self.pump_invites();
+    }
+
     // ---------- командная строка ----------
 
     /// Выполняет команду из строки «:».
@@ -2183,8 +2440,11 @@ impl App {
                 let _ = eng.cmds.send(Cmd::Transfer(gid, pk));
             }
             Command::Admin(gid) => {
-                let _ = eng.cmds.send(Cmd::GroupAdmin(gid));
+                let gid = gid.or(self.sel_group).ok_or_else(|| anyhow!("не выбрана группа"))?;
+                let cmd = self.open_admin_for(gid)?;
+                let _ = eng.cmds.send(cmd);
             }
+            Command::Servers => self.open_servers(eng),
             Command::Invisible(on) => {
                 let _ = eng.cmds.send(Cmd::SetInvisible(on));
                 self.toast(MsgKind::Ok, format!("невидимка {}", if on { "включена" } else { "выключена" }));
@@ -2279,8 +2539,10 @@ pub enum Command {
     Ban(u32, String),
     Unban(u32, String),
     Transfer(u32, String),
-    /// Баны и неотвеченные приглашения группы (владелец).
-    Admin(u32),
+    /// Экран управления группой (владелец): gid или выбранная группа.
+    Admin(Option<u32>),
+    /// Экран «Серверы».
+    Servers,
     Invisible(bool),
     /// Переключиться на сервер из списка: номер, адрес или метка.
     Server(String),
@@ -2363,7 +2625,8 @@ pub fn parse_command(line: &str) -> Result<Command> {
                 .ok_or_else(|| anyhow!("нужен peer (friend code | hex | alias)"))?
                 .to_string(),
         ),
-        "admin" | "bans" => Command::Admin(gid_of(0)?),
+        "admin" | "bans" => Command::Admin(if rest.is_empty() { None } else { Some(gid_of(0)?) }),
+        "servers" => Command::Servers,
         "invisible" => Command::Invisible(match rest.first().map(|s| s.to_lowercase()).as_deref() {
             Some("on") => true,
             Some("off") => false,
@@ -2425,6 +2688,39 @@ pub fn hex32(s: &str) -> Option<[u8; 32]> {
         return None;
     }
     Some(v.try_into().unwrap())
+}
+
+/// Участники группы — кандидаты на передачу владения.
+fn admin_members(g: &GroupView) -> Vec<MemberEntry> {
+    g.peers
+        .iter()
+        .map(|p| MemberEntry {
+            pk: p.pubkey,
+            name: p.name.clone(),
+            ip: std::net::Ipv4Addr::from(p.ip),
+        })
+        .collect()
+}
+
+/// Серверы конфига для экрана «Серверы».
+fn server_entries(cfg: &Config) -> Vec<ServerEntry> {
+    cfg.servers
+        .iter()
+        .map(|s| ServerEntry {
+            label: s.label.clone(),
+            addr: s.addr.clone(),
+            pubkey: hex32(&s.pubkey).unwrap_or([0; 32]),
+        })
+        .collect()
+}
+
+/// `ip:port` или `host:port` → адрес (первый из разрешённых).
+fn resolve_addr(addr: &str) -> Option<std::net::SocketAddr> {
+    if let Ok(a) = addr.parse() {
+        return Some(a);
+    }
+    use std::net::ToSocketAddrs;
+    addr.to_socket_addrs().ok()?.next()
 }
 
 /// Сохраняет конфиг и обновляет его копию в движке (иначе UI откатит правку).
@@ -2968,5 +3264,218 @@ mod tests {
         assert_eq!(parse_command("decline 4").unwrap(), Command::Decline(4));
         assert_eq!(parse_command("invites").unwrap(), Command::Invites);
         assert!(parse_command("decline").is_err());
+    }
+
+    // ---------- экраны «Управление группой» и «Серверы» ----------
+
+    fn owner_app() -> App {
+        let mut a = app();
+        a.groups = vec![
+            GroupView {
+                gid: 1,
+                name: "gamers".into(),
+                private: false,
+                mine: true,
+                online: 2,
+                total: 2,
+                my_ip: Some(0x6442_0102),
+                owner_is_me: true,
+                peers: vec![PeerView {
+                    pubkey: [2; 32],
+                    name: "bravo".into(),
+                    ip: 0x6442_0103,
+                    online: true,
+                    direct: false,
+                    rtt_ms: None,
+                    status: String::new(),
+                }],
+            },
+            GroupView {
+                gid: 2,
+                name: "чужая".into(),
+                private: false,
+                mine: true,
+                online: 1,
+                total: 2,
+                my_ip: Some(0x6442_0202),
+                owner_is_me: false,
+                peers: vec![],
+            },
+        ];
+        a.sel_group = Some(1);
+        a
+    }
+
+    fn admin_view(a: &App) -> &AdminView {
+        match a.stack.last() {
+            Some(Popup::Admin(v)) => v,
+            _ => panic!("экран управления не открыт"),
+        }
+    }
+
+    #[test]
+    fn управление_группой_открыть_получить_снять_бан_отозвать_передать() {
+        let mut a = owner_app();
+        assert!(matches!(a.open_admin(), Some(Cmd::GroupAdmin(1))));
+        assert_eq!(admin_view(&a).members.len(), 1, "кандидаты на передачу — участники группы");
+        assert!(a.admin_open(1));
+
+        a.on_admin_info(1, vec![([3; 32], "charlie".into())], vec![([4; 32], "delta".into(), 3600)]);
+        let v = admin_view(&a);
+        assert_eq!(v.bans.len(), 1);
+        assert_eq!(v.invites[0].expires_in_secs, 3600);
+
+        // Разбанить → UNBAN и повторный запрос данных.
+        let cmds = a.admin_key(key(KeyCode::Enter));
+        assert!(matches!(cmds[..], [Cmd::Unban(1, pk), Cmd::GroupAdmin(1)] if pk == [3; 32]), "{cmds:?}");
+        // Отозвать приглашение → KICK приглашённого и обновление.
+        assert!(a.admin_key(key(KeyCode::Char('2'))).is_empty());
+        let cmds = a.admin_key(key(KeyCode::Enter));
+        assert!(matches!(cmds[..], [Cmd::Kick(1, pk), Cmd::GroupAdmin(1)] if pk == [4; 32]), "{cmds:?}");
+        // r — обновить.
+        assert!(matches!(a.admin_key(key(KeyCode::Char('r')))[..], [Cmd::GroupAdmin(1)]));
+        // Передача — только после явного «y».
+        assert!(a.admin_key(key(KeyCode::Char('3'))).is_empty());
+        assert!(a.admin_key(key(KeyCode::Enter)).is_empty(), "Enter лишь открывает подтверждение");
+        assert!(admin_view(&a).confirm.is_some());
+        assert!(a.admin_key(key(KeyCode::Enter)).is_empty(), "повторный Enter не передаёт");
+        let cmds = a.admin_key(key(KeyCode::Char('y')));
+        assert!(matches!(cmds[..], [Cmd::Transfer(1, pk)] if pk == [2; 32]), "{cmds:?}");
+        assert!(a.stack.is_empty(), "после передачи экран закрыт");
+    }
+
+    #[test]
+    fn управление_группой_только_владельцу_и_esc_закрывает() {
+        let mut a = owner_app();
+        a.sel_group = Some(2);
+        assert!(a.open_admin().is_none());
+        assert!(a.stack.is_empty());
+        assert!(a.toasts.iter().any(|t| t.text.contains("владелец")));
+        assert!(a.open_admin_for(7).is_err());
+
+        a.sel_group = Some(1);
+        a.open_admin().unwrap();
+        // Ответ по другой группе экран не трогает.
+        a.on_admin_info(2, vec![([3; 32], "x".into())], vec![]);
+        assert!(admin_view(&a).bans.is_empty());
+        assert!(a.admin_key(key(KeyCode::Esc)).is_empty());
+        assert!(a.stack.is_empty());
+    }
+
+    #[test]
+    fn парс_команд_экранов() {
+        assert_eq!(parse_command("admin").unwrap(), Command::Admin(None));
+        assert_eq!(parse_command("admin 5").unwrap(), Command::Admin(Some(5)));
+        assert_eq!(parse_command("bans 6").unwrap(), Command::Admin(Some(6)));
+        assert!(parse_command("admin x").is_err());
+        assert_eq!(parse_command("servers").unwrap(), Command::Servers);
+    }
+
+    fn servers_cfg() -> Config {
+        let mut cfg = Config::default();
+        cfg.servers = vec![
+            StoredServer { addr: "127.0.0.1:5599".into(), pubkey: proto::hex_of(&[1; 32]), label: "дом".into() },
+            StoredServer { addr: "127.0.0.2:5600".into(), pubkey: proto::hex_of(&[2; 32]), label: String::new() },
+        ];
+        cfg
+    }
+
+    /// Клавиша в экране «Серверы» и применение действия к конфигу.
+    fn srv_key(a: &mut App, cfg: &mut Config, code: KeyCode) -> (Option<Cmd>, bool) {
+        let act = match a.stack.last_mut() {
+            Some(Popup::Servers(v)) => v.handle_key(key(code)),
+            _ => panic!("экран серверов не открыт"),
+        };
+        match act {
+            Some(act) => a.servers_apply(act, cfg),
+            None => (None, false),
+        }
+    }
+
+    fn srv_type(a: &mut App, cfg: &mut Config, text: &str) {
+        for c in text.chars() {
+            srv_key(a, cfg, KeyCode::Char(c));
+        }
+    }
+
+    fn servers_view(a: &App) -> &ServersView {
+        match a.stack.last() {
+            Some(Popup::Servers(v)) => v,
+            _ => panic!("экран серверов не открыт"),
+        }
+    }
+
+    #[test]
+    fn серверы_переключение_без_перезапуска() {
+        let mut a = app();
+        let mut cfg = servers_cfg();
+        a.server_addr = "127.0.0.1:5599".into();
+        a.open_servers_with(&cfg);
+        assert_eq!(servers_view(&a).current, 0);
+        srv_key(&mut a, &mut cfg, KeyCode::Down);
+        let (cmd, save) = srv_key(&mut a, &mut cfg, KeyCode::Enter);
+        match cmd {
+            Some(Cmd::SwitchServer { addr, pubkey, .. }) => {
+                assert_eq!(addr.to_string(), "127.0.0.2:5600");
+                assert_eq!(pubkey, [2; 32]);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!save);
+        // Движок сообщил о переключении — текущий отмечен.
+        a.on_server_switched("127.0.0.2:5600".parse().unwrap());
+        assert_eq!(servers_view(&a).current, 1);
+        assert!(matches!(srv_key(&mut a, &mut cfg, KeyCode::Esc), (None, false)));
+        assert!(a.stack.is_empty());
+    }
+
+    #[test]
+    fn серверы_добавить_удалить_адаптер_сохраняются_в_конфиг() {
+        let mut a = app();
+        let mut cfg = servers_cfg();
+        a.server_addr = "127.0.0.1:5599".into();
+        a.adapter_name = "TunnelVPN".into();
+        a.open_servers_with(&cfg);
+
+        // Добавить.
+        srv_key(&mut a, &mut cfg, KeyCode::Char('a'));
+        srv_type(&mut a, &mut cfg, "10.0.0.1:7000");
+        srv_key(&mut a, &mut cfg, KeyCode::Tab);
+        srv_type(&mut a, &mut cfg, &proto::friend_code_of(&[9; 32]));
+        srv_key(&mut a, &mut cfg, KeyCode::Tab);
+        srv_type(&mut a, &mut cfg, "работа");
+        let (cmd, save) = srv_key(&mut a, &mut cfg, KeyCode::Enter);
+        assert!(cmd.is_none() && save);
+        assert_eq!(cfg.servers.len(), 3);
+        assert_eq!(cfg.servers[2].addr, "10.0.0.1:7000");
+        assert_eq!(cfg.servers[2].pubkey, proto::hex_of(&[9; 32]));
+        assert_eq!(cfg.servers[2].label, "работа");
+        assert_eq!(servers_view(&a).servers.len(), 3);
+
+        // Удалить (с подтверждением); текущий удалить нельзя.
+        srv_key(&mut a, &mut cfg, KeyCode::Home);
+        assert!(matches!(srv_key(&mut a, &mut cfg, KeyCode::Char('d')), (None, false)));
+        assert_eq!(cfg.servers.len(), 3);
+        srv_key(&mut a, &mut cfg, KeyCode::Down);
+        srv_key(&mut a, &mut cfg, KeyCode::Char('d'));
+        let (_, save) = srv_key(&mut a, &mut cfg, KeyCode::Char('y'));
+        assert!(save);
+        assert_eq!(cfg.servers.len(), 2);
+        assert!(cfg.servers.iter().all(|s| s.addr != "127.0.0.2:5600"));
+        assert_eq!(servers_view(&a).current, 0);
+
+        // Адаптер и dll — в конфиг, с пометкой о перезапуске.
+        srv_key(&mut a, &mut cfg, KeyCode::Char('e'));
+        for _ in 0.."TunnelVPN".len() {
+            srv_key(&mut a, &mut cfg, KeyCode::Backspace);
+        }
+        srv_type(&mut a, &mut cfg, "Game");
+        srv_key(&mut a, &mut cfg, KeyCode::Tab);
+        srv_type(&mut a, &mut cfg, "C:\\w.dll");
+        let (cmd, save) = srv_key(&mut a, &mut cfg, KeyCode::Enter);
+        assert!(cmd.is_none() && save);
+        assert_eq!(cfg.adapter, "Game");
+        assert_eq!(cfg.dll, "C:\\w.dll");
+        assert!(servers_view(&a).notice.as_deref().unwrap_or("").contains("после перезапуска"));
     }
 }

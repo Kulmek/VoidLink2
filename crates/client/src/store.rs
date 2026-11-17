@@ -66,6 +66,14 @@ pub struct Config {
     /// Транспорт до сервера: auto (UDP, при молчании — TCP) | udp | tcp.
     #[serde(default)]
     pub transport: TransportMode,
+    /// Имя Wintun-адаптера (экран «Серверы» TUI; пусто — по умолчанию,
+    /// флаг `--adapter` важнее). Применяется после перезапуска.
+    #[serde(default)]
+    pub adapter: String,
+    /// Путь к `wintun.dll` (пусто — рядом с exe или из PATH; флаг `--dll`
+    /// важнее). Применяется после перезапуска.
+    #[serde(default)]
+    pub dll: String,
 }
 
 /// Выбор транспорта до сервера.
@@ -98,6 +106,8 @@ impl Default for Config {
             autojoin_by_server: BTreeMap::new(),
             dns: true,
             transport: TransportMode::Auto,
+            adapter: String::new(),
+            dll: String::new(),
         }
     }
 }

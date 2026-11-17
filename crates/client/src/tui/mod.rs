@@ -45,6 +45,7 @@ pub fn run(
     dll: Option<String>,
     store: Arc<Store>,
 ) -> Result<()> {
+    let dll_path = dll.clone().unwrap_or_default();
     let shared = Arc::new(Mutex::new((*cfg).clone()));
     let save_store = store.clone();
     let save = move |c: &Config| {
@@ -63,6 +64,9 @@ pub fn run(
     let mut term = setup_terminal(true)?;
     let cfg_snapshot = eng.cfg.lock().unwrap().clone();
     let mut app = App::new(eng.my_pub, &eng.my_code, &cfg_snapshot);
+    // Экран «Серверы» показывает то, с чем клиент запущен на самом деле.
+    app.adapter_name = adapter_name.to_string();
+    app.dll_path = dll_path;
     let res = event_loop(&mut term, &mut app, &eng);
     restore_terminal(&mut term)?;
     // Останавливаем движок (потоки туннеля).
