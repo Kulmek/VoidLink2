@@ -17,12 +17,21 @@ pub fn init() -> i64 {
 }
 
 /// Текущее смещение (определяет его при первом обращении).
+///
+/// `main()` обязан заранее вызвать [`init`] до запуска потоков; иначе первый
+/// `localtime_r` случится на рабочем потоке (в отладочной сборке — паника).
 pub fn offset() -> i64 {
+    debug_assert!(
+        OFFSET.get().is_some() || cfg!(test),
+        "clock::init() не вызван в main() до запуска потоков"
+    );
     init()
 }
 
 /// Форматирует момент в локальном времени: «HH:MM:SS», если это сегодня,
 /// иначе «DD.MM HH:MM:SS» (с годом, если год не текущий).
+///
+/// Требует предварительного [`init`] в `main()` (см. [`offset`]).
 pub fn format_local(t: SystemTime) -> String {
     format_with_offset(t, SystemTime::now(), offset())
 }

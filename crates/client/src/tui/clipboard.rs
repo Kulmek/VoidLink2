@@ -6,7 +6,7 @@
 //! пробуем OSC 52, локально — сначала системный буфер, OSC 52 — запасной.
 #![allow(dead_code)] // подключается при интеграции
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::process::{Command, Stdio};
 
 /// Каким способом текст попал в буфер.
@@ -124,9 +124,20 @@ pub fn copy(text: &str) -> Result<Method, String> {
     Err(format!("не удалось скопировать ({})", errors.join("; ")))
 }
 
+/// Предел длины base64-полезной нагрузки OSC 52 (длиннее терминалы отбрасывают).
+const OSC52_MAX_B64: usize = 100_000;
+
 fn try_method(m: Method, text: &str, env: &Env) -> Result<(), String> {
     match m {
         Method::Osc52 => {
+            // Без терминала последовательность никуда не дойдёт — пробуем следующий способ.
+            if !std::io::stdout().is_terminal() {
+                return Err("stdout не терминал".into());
+            }
+            // xterm и tmux молча отбрасывают слишком длинные OSC 52.
+            if text.len().div_ceil(3) * 4 > OSC52_MAX_B64 {
+                return Err("слишком длинный текст для OSC 52".into());
+            }
             let seq = osc52_wrapped(text, env);
             let mut out = std::io::stdout().lock();
             out.write_all(seq.as_bytes())
