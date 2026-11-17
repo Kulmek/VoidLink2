@@ -2652,9 +2652,11 @@ dependencies = [
 name = "tunnel-daemon"
 version = "0.2.0"
 dependencies = [
+ "anyhow",
  "libc",
  "serde_json",
  "tunnel-ipc",
+ "tunnel-winsvc",
  "windows-sys 0.61.2",
 ]
 

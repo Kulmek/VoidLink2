@@ -1,11 +1,16 @@
 //! Режимы демона. `console` — рабочий (лог, замок, хаб, IPC); `service`,
-//! `install`, `uninstall` — заглушки до 7.6 (`windows-service`, SCM, SDDL).
+//! `install`, `uninstall` — служба Windows через `tunnel-winsvc` (7.6; на
+//! других ОС — ошибка «только Windows»).
 
 #![allow(dead_code)] // подключается при интеграции
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+
+use tunnel_winsvc::{InstallOptions, ServiceEvent};
 
 use crate::hub::{Backend, Hub};
 use crate::lock::InstanceLock;
@@ -81,6 +86,17 @@ impl RunOpts {
             console_log: true,
             ipc: IpcMode::console_default(),
             stop_reason: "демон остановлен".into(),
+        }
+    }
+
+    /// Режим службы: лог только в файл, IPC — заданный (на Windows — пайп).
+    pub fn service(data_dir: &Path, ipc: IpcMode) -> Self {
+        RunOpts {
+            data_dir: data_dir.to_path_buf(),
+            debug: false,
+            console_log: false,
+            ipc,
+            stop_reason: "служба остановлена".into(),
         }
     }
 }
@@ -176,17 +192,301 @@ pub fn install_ctrl_handler(stop: Arc<AtomicBool>) {
     }
 }
 
-/// `tunnel-daemon service`: точка входа SCM (7.6).
-pub fn run_service(_data_dir: &Path) -> Result<(), String> {
-    Err("режим service ещё не реализован (этап 7.6)".into())
+/// Подсказка бэкенду «система вышла из сна — переподключись сейчас, не
+/// дожидаясь таймеров». Служба взводит её на POWEREVENT resume; бэкенд
+/// снимает [`ResumeSignal::take`] (например, в `poll_events`).
+#[derive(Clone, Default)]
+pub struct ResumeSignal(Arc<AtomicBool>);
+
+impl ResumeSignal {
+    pub fn raise(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+    /// `true` — был выход из сна после прошлого вызова (флаг сбрасывается).
+    pub fn take(&self) -> bool {
+        self.0.swap(false, Ordering::Relaxed)
+    }
 }
 
-/// `tunnel-daemon install` (7.6).
+/// Что служба отдаёт фабрике бэкенда.
+pub struct ServiceEnv {
+    /// Лог демона (вместо `eprintln!` движка).
+    pub log: LogFn,
+    /// `wintun.dll` только рядом с exe (`tunnel_winsvc::service_wintun_dll`);
+    /// `None` — не нашлась (ошибка уже в логе), TUN поднять нельзя.
+    pub wintun_dll: Option<PathBuf>,
+    /// Хук выхода из сна.
+    pub resume: ResumeSignal,
+}
+
+/// Ошибка режимов службы вне Windows.
+pub const ONLY_WINDOWS: &str =
+    "этот режим — только Windows (служба SCM); на этой ОС используйте `tunnel-daemon console`";
+
+/// Тело службы (без SCM, тестируется на любой ОС): ядро демона в отдельном
+/// потоке; Stop/Shutdown (или закрытый канал) — остановка, Resume — подсказка
+/// бэкенду. Если ядро завершилось само (ошибка замка/пайпа) — его результат.
+pub(crate) fn service_body<B, F>(
+    opts: RunOpts,
+    make_backend: F,
+    events: Receiver<ServiceEvent>,
+    wintun_dll: impl FnOnce() -> Result<PathBuf, String> + Send + 'static,
+    warnings: Vec<String>,
+) -> Result<(), String>
+where
+    B: Backend + 'static,
+    F: FnOnce(ServiceEnv) -> B + Send + 'static,
+{
+    let stop = Arc::new(AtomicBool::new(false));
+    let resume = ResumeSignal::default();
+    let core = {
+        let stop = stop.clone();
+        let resume = resume.clone();
+        std::thread::Builder::new()
+            .name("daemon-core".into())
+            .spawn(move || {
+                run_daemon(
+                    &opts,
+                    move |log: LogFn| {
+                        for w in &warnings {
+                            log(Level::Warn, w);
+                        }
+                        let dll = match wintun_dll() {
+                            Ok(p) => Some(p),
+                            Err(e) => {
+                                log(Level::Error, &format!("wintun: {e}"));
+                                None
+                            }
+                        };
+                        make_backend(ServiceEnv { log, wintun_dll: dll, resume })
+                    },
+                    stop,
+                )
+            })
+            .map_err(|e| format!("поток демона: {e}"))?
+    };
+    loop {
+        if core.is_finished() {
+            break;
+        }
+        match events.recv_timeout(Duration::from_millis(200)) {
+            Ok(ServiceEvent::Stop | ServiceEvent::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
+                stop.store(true, Ordering::Relaxed);
+                break;
+            }
+            Ok(ServiceEvent::Resume) => resume.raise(),
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
+    core.join().map_err(|_| "поток демона упал (panic)".to_string())?
+}
+
+/// `tunnel-daemon service`: точка входа SCM. Данные — `data_dir` или
+/// `%ProgramData%\tunnel`; IPC — пайп `tunnel_ipc::transport::DEFAULT_PIPE_NAME`
+/// с SID владельца из `owner.sid`; блокирует до Stop/Shutdown.
+pub fn run_service<B, F>(data_dir: Option<&Path>, make_backend: F) -> Result<(), String>
+where
+    B: Backend + 'static,
+    F: FnOnce(ServiceEnv) -> B + Send + 'static,
+{
+    #[cfg(windows)]
+    {
+        let dir = data_dir.map(Path::to_path_buf).unwrap_or_else(tunnel_winsvc::data_dir);
+        let mut warnings = Vec::new();
+        let owner_sid = match tunnel_winsvc::read_owner_sid(&dir) {
+            Ok(sid) => Some(sid),
+            Err(e) => {
+                warnings.push(format!("{e:#}; пайп доступен только SYSTEM и администраторам"));
+                None
+            }
+        };
+        let ipc = IpcMode::Pipe { name: tunnel_ipc::transport::DEFAULT_PIPE_NAME.into(), owner_sid };
+        let opts = RunOpts::service(&dir, ipc);
+        tunnel_winsvc::run_as_service(tunnel_winsvc::SERVICE_NAME, move |rx| {
+            service_body(
+                opts,
+                make_backend,
+                rx,
+                || tunnel_winsvc::service_wintun_dll().map_err(|e| format!("{e:#}")),
+                warnings,
+            )
+            .map_err(anyhow::Error::msg)
+        })
+        .map_err(|e| format!("{e:#}"))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (data_dir, make_backend);
+        Err(ONLY_WINDOWS.into())
+    }
+}
+
+/// Параметры установки: служба — этот exe, трей — `tunnel-tray.exe` рядом
+/// (нет файла — без Run-ключа и ярлыка, с предупреждением).
+pub(crate) fn install_options(
+    exe: &Path,
+    appdata: Option<&Path>,
+) -> Result<(InstallOptions, Vec<String>), String> {
+    let dir = exe
+        .parent()
+        .filter(|d| d.is_absolute())
+        .ok_or_else(|| format!("путь exe должен быть абсолютным: {}", exe.display()))?;
+    let mut o = InstallOptions::for_layout(dir, appdata);
+    o.daemon_exe = exe.to_path_buf();
+    let mut warnings = Vec::new();
+    if let Some(tray) = &o.tray_exe
+        && !tray.is_file()
+    {
+        warnings.push(format!("нет {} — трей не будет автозапускаться", tray.display()));
+        o.tray_exe = None;
+        o.shortcut = None;
+    }
+    Ok((o, warnings))
+}
+
+/// `tunnel-daemon install`: установить (обновить) и запустить службу.
 pub fn install() -> Result<(), String> {
-    Err("install ещё не реализован (этап 7.6)".into())
+    #[cfg(windows)]
+    {
+        let exe = std::env::current_exe().map_err(|e| format!("путь exe: {e}"))?;
+        let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
+        let (opts, mut warnings) = install_options(&exe, appdata.as_deref())?;
+        let r = tunnel_winsvc::install(&opts).map_err(|e| format!("{e:#}"))?;
+        warnings.extend(r.warnings);
+        println!(
+            "служба {} {}; данные: {}; владелец: {}{}",
+            opts.service_name,
+            if r.service_updated { "обновлена" } else { "установлена" },
+            r.data_dir.display(),
+            r.owner_sid,
+            if r.config_imported { "; client.json импортирован" } else { "" },
+        );
+        for w in warnings {
+            eprintln!("предупреждение: {w}");
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        Err(ONLY_WINDOWS.into())
+    }
 }
 
-/// `tunnel-daemon uninstall [--purge]` (7.6).
-pub fn uninstall(_purge: bool) -> Result<(), String> {
-    Err("uninstall ещё не реализован (этап 7.6)".into())
+/// `tunnel-daemon uninstall [--purge]`. `remove_adapter` — удаление
+/// Wintun-адаптера (его знает движок), вызывается после остановки службы.
+pub fn uninstall(purge: bool, remove_adapter: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
+        let opts = tunnel_winsvc::UninstallOptions::standard(purge, appdata.as_deref());
+        tunnel_winsvc::uninstall(&opts, || remove_adapter().map_err(anyhow::Error::msg))
+            .map_err(|e| format!("{e:#}"))?;
+        println!("служба {} удалена{}", opts.service_name, if purge { " вместе с данными" } else { "" });
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (purge, remove_adapter);
+        Err(ONLY_WINDOWS.into())
+    }
+}
+
+#[cfg(test)]
+mod service_tests {
+    use std::sync::Mutex;
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    use super::*;
+
+    fn tmp(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("tunnel-svc-{tag}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn body_resume_then_stop() {
+        let dir = tmp("body");
+        let _ = std::fs::remove_dir_all(&dir);
+        let (tx, rx) = mpsc::channel();
+        type Seen = Option<(ResumeSignal, Option<PathBuf>)>;
+        let seen: Arc<Mutex<Seen>> = Default::default();
+        let s2 = seen.clone();
+        let opts = RunOpts::service(&dir, IpcMode::None);
+        let body = std::thread::spawn(move || {
+            service_body(
+                opts,
+                move |env: ServiceEnv| {
+                    *s2.lock().unwrap() = Some((env.resume.clone(), env.wintun_dll.clone()));
+                    crate::FakeBackend::new()
+                },
+                rx,
+                || Err("нет".into()),
+                vec!["тест".into()],
+            )
+        });
+        let t0 = Instant::now();
+        let (sig, dll) = loop {
+            if let Some(s) = seen.lock().unwrap().clone() {
+                break s;
+            }
+            assert!(t0.elapsed() < Duration::from_secs(10), "бэкенд не создан");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(dll, None);
+        tx.send(ServiceEvent::Resume).unwrap();
+        let t0 = Instant::now();
+        while !sig.take() {
+            assert!(t0.elapsed() < Duration::from_secs(10), "resume не дошёл");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!sig.take());
+        tx.send(ServiceEvent::Shutdown).unwrap();
+        assert_eq!(body.join().unwrap(), Ok(()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn body_returns_core_error() {
+        // Каталог данных — файл: замок/лог не создать, ядро выходит с ошибкой.
+        let f = tmp("file");
+        std::fs::write(&f, b"x").unwrap();
+        let (_tx, rx) = mpsc::channel();
+        let r = service_body(
+            RunOpts::service(&f, IpcMode::None),
+            |_env: ServiceEnv| crate::FakeBackend::new(),
+            rx,
+            || Err("нет".into()),
+            Vec::new(),
+        );
+        assert!(r.is_err());
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn install_layout() {
+        let dir = tmp("inst");
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("my-daemon.exe");
+        let appdata = dir.join("appdata");
+        let (o, w) = install_options(&exe, Some(&appdata)).unwrap();
+        assert_eq!(o.daemon_exe, exe);
+        assert_eq!(o.tray_exe, None);
+        assert!(o.shortcut.is_none());
+        assert_eq!(w.len(), 1);
+        std::fs::write(dir.join(tunnel_winsvc::TRAY_EXE), b"").unwrap();
+        let (o, w) = install_options(&exe, Some(&appdata)).unwrap();
+        assert_eq!(o.tray_exe, Some(dir.join(tunnel_winsvc::TRAY_EXE)));
+        assert!(o.shortcut.is_some());
+        assert!(w.is_empty());
+        assert!(install_options(Path::new("rel.exe"), None).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn windows_only_modes() {
+        assert_eq!(install(), Err(ONLY_WINDOWS.into()));
+        assert_eq!(uninstall(true, || Ok(())), Err(ONLY_WINDOWS.into()));
+        assert_eq!(run_service(None, |_e: ServiceEnv| NullBackend), Err(ONLY_WINDOWS.into()));
+    }
 }

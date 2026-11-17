@@ -29,9 +29,11 @@ fn main() -> ExitCode {
                 service::run_console(&dir(data_dir), debug, |_log| service::NullBackend, stop)
             }
         }
-        Mode::Service { data_dir } => service::run_service(&dir(data_dir)),
+        // Данные службы — %ProgramData%\tunnel (или --data-dir); движок
+        // подключит интеграция через фабрику (env: лог, wintun.dll, resume).
+        Mode::Service { data_dir } => service::run_service(data_dir.as_deref(), |_env| service::NullBackend),
         Mode::Install => service::install(),
-        Mode::Uninstall { purge } => service::uninstall(purge),
+        Mode::Uninstall { purge } => service::uninstall(purge, || Ok(())),
     };
     match res {
         Ok(()) => ExitCode::SUCCESS,
