@@ -47,7 +47,6 @@ impl Utun {
     pub fn open(mtu: usize) -> Result<Self> {
         let fd = open_utun_fd().context("создание utun (запуск от root?)")?;
         let name = read_ifname(fd.as_raw_fd()).context("чтение имени utun")?;
-        set_nonblocking(fd.as_raw_fd(), false)?;
         let dev = Utun { fd, name, v4: Mutex::new(HashSet::new()), v6: Mutex::new(HashSet::new()) };
         dev.set_mtu(mtu)?;
         run(&ifconfig_up_args(&dev.name)).context("ifconfig up")?;
@@ -71,7 +70,10 @@ impl Utun {
     }
 
     /// Читает один IP-пакет (без 4-байтного заголовка) в `buf`.
-    /// Блокирующий вызов. Возвращает длину пакета.
+    /// Блокирующий вызов. Возвращает длину пакета. Если пакет не влез в `buf`
+    /// (MSG_TRUNC), возвращает `InvalidData` — обрезанный пакет дальше не идёт;
+    /// буфер размером MTU (или `MAX_PACKET`) этого не допускает.
+    /// Пакет с семейством, отличным от AF_INET/AF_INET6, тоже даёт `InvalidData`.
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
         let mut hdr = [0u8; AF_HEADER_LEN];
         let mut iov = [
@@ -79,8 +81,12 @@ impl Utun {
             libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len().min(MAX_PACKET) },
         ];
         loop {
-            // SAFETY: iov указывают на живые буферы нужной длины.
-            let n = unsafe { libc::readv(self.fd.as_raw_fd(), iov.as_mut_ptr(), 2) };
+            // SAFETY: msghdr — POD, нули валидны; iov указывают на живые буферы нужной длины.
+            let mut msg: libc::msghdr = unsafe { mem::zeroed() };
+            msg.msg_iov = iov.as_mut_ptr();
+            msg.msg_iovlen = iov.len() as _;
+            // SAFETY: msg корректно заполнен, буферы живы на время вызова.
+            let n = unsafe { libc::recvmsg(self.fd.as_raw_fd(), &mut msg, 0) };
             if n < 0 {
                 let e = io::Error::last_os_error();
                 if e.kind() == io::ErrorKind::Interrupted {
@@ -88,9 +94,15 @@ impl Utun {
                 }
                 return Err(e);
             }
+            if msg.msg_flags & libc::MSG_TRUNC != 0 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "utun: пакет больше буфера, обрезан"));
+            }
             let n = n as usize;
             if n < AF_HEADER_LEN {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "utun: короткий пакет"));
+            }
+            if !is_ip_family(af_from_header(hdr)) {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "utun: неизвестное семейство адресов"));
             }
             return Ok(n - AF_HEADER_LEN);
         }
@@ -162,6 +174,12 @@ fn open_utun_fd() -> io::Result<OwnedFd> {
     }
     // SAFETY: raw — только что созданный валидный дескриптор.
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    // Не наследовать дескриптор в дочерние ifconfig/route: ставим сразу после
+    // socket() (SOCK_CLOEXEC на macOS нет), чтобы сузить окно гонки с fork/exec.
+    // SAFETY: fcntl на валидном fd.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
 
     // SAFETY: ctl_info — POD, нули — валидное значение.
     let mut info: libc::ctl_info = unsafe { mem::zeroed() };
@@ -191,9 +209,6 @@ fn open_utun_fd() -> io::Result<OwnedFd> {
     if rc < 0 {
         return Err(io::Error::last_os_error());
     }
-    // Не наследовать дескриптор в дочерние ifconfig/route.
-    // SAFETY: fcntl на валидном fd.
-    unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
     Ok(fd)
 }
 
@@ -215,21 +230,6 @@ fn read_ifname(fd: RawFd) -> io::Result<String> {
     }
     parse_ifname(&buf[..(len as usize).min(buf.len())])
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "utun: пустое имя интерфейса"))
-}
-
-fn set_nonblocking(fd: RawFd, on: bool) -> Result<()> {
-    // SAFETY: fcntl на валидном fd.
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        if flags < 0 {
-            bail!("fcntl F_GETFL: {}", io::Error::last_os_error());
-        }
-        let nf = if on { flags | libc::O_NONBLOCK } else { flags & !libc::O_NONBLOCK };
-        if libc::fcntl(fd, libc::F_SETFL, nf) < 0 {
-            bail!("fcntl F_SETFL: {}", io::Error::last_os_error());
-        }
-    }
-    Ok(())
 }
 
 fn run(args: &[String]) -> Result<()> {
@@ -261,6 +261,11 @@ fn af_header_for(packet: &[u8]) -> Option<[u8; AF_HEADER_LEN]> {
 /// Семейство из заголовка входящего пакета.
 fn af_from_header(hdr: [u8; AF_HEADER_LEN]) -> i32 {
     u32::from_be_bytes(hdr) as i32
+}
+
+/// Поддерживаемое семейство адресов (IPv4/IPv6).
+fn is_ip_family(af: i32) -> bool {
+    af == libc::AF_INET || af == libc::AF_INET6
 }
 
 /// Имя интерфейса из C-строки, возвращённой UTUN_OPT_IFNAME.
@@ -339,6 +344,8 @@ mod tests {
         assert_eq!(af_header_for(&[]), None);
         assert_eq!(af_from_header(af_header_for(&v4).unwrap()), libc::AF_INET);
         assert_eq!(af_from_header(af_header_for(&v6).unwrap()), libc::AF_INET6);
+        assert!(is_ip_family(af_from_header(af_header_for(&v4).unwrap())));
+        assert!(!is_ip_family(af_from_header([0, 0, 0, 0])));
     }
 
     #[test]
