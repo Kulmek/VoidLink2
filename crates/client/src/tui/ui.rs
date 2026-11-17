@@ -997,6 +997,9 @@ fn draw_popup(f: &mut Frame, app: &App, th: &Theme, popup: &Popup, area: Rect) {
             open_popup(f, app, rect);
             draw_invite(f, app, th, inv, rect);
         }
+        // Свои рамка и геометрия для мыши — в самих модулях.
+        Popup::Admin(v) => crate::tui::admin::draw(f, th, v, area),
+        Popup::Servers(v) => v.draw(f, th, area),
     }
 }
 
@@ -1459,6 +1462,7 @@ fn help_lines(th: &Theme) -> Vec<Line<'static>> {
         kv("x", "покинуть группу"),
         kv("i", "пригласить друга в группу"),
         kv("k / b", "исключить / забанить участника"),
+        kv("m · :admin", "управление своей группой: баны, приглашения, владелец"),
         kv("o", "неотвеченные приглашения (отложенные «Позже»)"),
         kv("  в окне", "Enter/y — принять · n — отклонить · Esc — позже"),
         Line::from(""),
@@ -1468,6 +1472,7 @@ fn help_lines(th: &Theme) -> Vec<Line<'static>> {
         kv("c", "скопировать IP / pubkey / friend code"),
         kv("p", "карточка профиля"),
         kv("F3", "настройки (имя, сервер, автовход, тема)"),
+        kv("F4 · :servers", "серверы: переключить, добавить, удалить, адаптер"),
         Line::from(""),
         head("Прочее"),
         kv(":", "командная строка (:help — список)"),
@@ -2203,6 +2208,130 @@ mod tests {
             let (x, y) = find(&s, "● gamers", 0);
             assert_eq!(buf[(x, y)].bg, c.sel_bg, "{kind:?}");
             assert_eq!(buf[(x, y)].fg, c.sel_fg, "{kind:?}");
+        }
+    }
+
+    // ---------- экраны «Управление группой» и «Серверы» ----------
+
+    mod screens {
+        use super::demo_app;
+        use crate::engine::Cmd;
+        use crate::store::{Config, StoredServer};
+        use crate::tui::app::{App, Popup};
+        use crate::tui::{admin, ui::draw};
+        use ratatui::backend::TestBackend;
+        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::Terminal;
+        use tunnel_protocol as proto;
+
+        fn frame(app: &App, w: u16, h: u16) -> Vec<Vec<char>> {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| draw(f, app)).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..h)
+                .map(|y| {
+                    (0..w)
+                        .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                        .collect()
+                })
+                .collect()
+        }
+
+        fn find(screen: &[Vec<char>], text: &str) -> (u16, u16) {
+            let pat: Vec<char> = text.chars().collect();
+            for (y, row) in screen.iter().enumerate() {
+                for x in 0..row.len().saturating_sub(pat.len() - 1) {
+                    if row[x..x + pat.len()] == pat[..] {
+                        return (x as u16, y as u16);
+                    }
+                }
+            }
+            panic!("на экране нет «{text}»");
+        }
+
+        fn text(screen: &[Vec<char>]) -> String {
+            screen.iter().map(|r| r.iter().collect::<String>() + "\n").collect()
+        }
+
+        fn click(x: u16, y: u16) -> MouseEvent {
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: x,
+                row: y,
+                modifiers: KeyModifiers::NONE,
+            }
+        }
+
+        /// Клик по экрану управления (как `App::handle_mouse` для него).
+        fn admin_click(app: &mut App, x: u16, y: u16) -> Vec<Cmd> {
+            let act = match app.stack.last_mut() {
+                Some(Popup::Admin(v)) => admin::handle_mouse(v, click(x, y)),
+                _ => panic!("экран управления не открыт"),
+            };
+            app.admin_apply(act)
+        }
+
+        #[test]
+        fn управление_группой_рисуется_и_кликается() {
+            let mut app = demo_app();
+            assert!(matches!(app.open_admin(), Some(Cmd::GroupAdmin(1))));
+            app.on_admin_info(1, vec![([3; 32], "charlie".into())], vec![([4; 32], "delta".into(), 7200)]);
+            let s = frame(&app, 140, 40);
+            let t = text(&s);
+            assert!(t.contains("Управление группой «gamers»") && t.contains("charlie"), "{t}");
+
+            // Клик по кнопке «Разбанить» = Enter на выбранной строке.
+            let (x, y) = find(&s, "Разбанить (Enter)");
+            let cmds = admin_click(&mut app, x + 1, y);
+            assert!(matches!(cmds[..], [Cmd::Unban(1, pk), Cmd::GroupAdmin(1)] if pk == [3; 32]), "{cmds:?}");
+
+            // Вкладка «Приглашения» кликом, затем «Отозвать».
+            let (x, y) = find(&s, "Приглашения");
+            assert!(admin_click(&mut app, x + 1, y).is_empty());
+            let s = frame(&app, 140, 40);
+            assert!(text(&s).contains("delta"));
+            let (x, y) = find(&s, "Отозвать приглашение (Enter)");
+            let cmds = admin_click(&mut app, x + 1, y);
+            assert!(matches!(cmds[..], [Cmd::Kick(1, pk), Cmd::GroupAdmin(1)] if pk == [4; 32]), "{cmds:?}");
+
+            // Клик мимо окна — закрыть.
+            assert!(admin_click(&mut app, 0, 0).is_empty());
+            assert!(app.stack.is_empty());
+        }
+
+        #[test]
+        fn серверы_рисуются_и_переключаются_кликом() {
+            let mut app = demo_app();
+            let mut cfg = Config::default();
+            cfg.servers = vec![
+                StoredServer { addr: "127.0.0.1:5599".into(), pubkey: proto::hex_of(&[1; 32]), label: "дом".into() },
+                StoredServer { addr: "127.0.0.9:5601".into(), pubkey: proto::hex_of(&[2; 32]), label: "офис".into() },
+            ];
+            app.open_servers_with(&cfg);
+            let s = frame(&app, 140, 40);
+            let t = text(&s);
+            assert!(t.contains("127.0.0.1:5599") && t.contains("127.0.0.9:5601"), "{t}");
+
+            // Первый клик по строке выбирает, второй — переключает.
+            let (x, y) = find(&s, "127.0.0.9:5601");
+            let mut act = None;
+            for _ in 0..2 {
+                act = match app.stack.last_mut() {
+                    Some(Popup::Servers(v)) => v.handle_mouse(MouseEventKind::Down(MouseButton::Left), x, y),
+                    _ => panic!("экран серверов не открыт"),
+                };
+            }
+            let (cmd, save) = app.servers_apply(act.expect("переключение"), &mut cfg);
+            assert!(!save);
+            assert!(matches!(cmd, Some(Cmd::SwitchServer { addr, .. }) if addr.to_string() == "127.0.0.9:5601"));
+        }
+
+        #[test]
+        fn справка_знает_про_новые_экраны() {
+            let mut app = demo_app();
+            app.stack.push(Popup::Help);
+            let t = text(&frame(&app, 140, 50));
+            assert!(t.contains(":admin") && t.contains(":servers"), "{t}");
         }
     }
 }

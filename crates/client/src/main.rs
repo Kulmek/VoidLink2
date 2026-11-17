@@ -66,6 +66,7 @@ use store::{Config, StoredFriend, StoredServer};
 fn main() -> Result<()> {
     let mut dir = store::default_dir();
     let mut adapter = "TunnelVPN".to_string();
+    let mut adapter_set = false;
     let mut dll: Option<String> = None;
     let mut server_sel: Option<String> = None;
     let mut debug = false;
@@ -80,6 +81,7 @@ fn main() -> Result<()> {
             args.drain(i..=i + 1);
         } else if a == "--adapter" {
             adapter = args.get(i + 1).context("--adapter требует значение")?.clone();
+            adapter_set = true;
             args.drain(i..=i + 1);
         } else if a == "--dll" {
             dll = Some(args.get(i + 1).context("--dll требует значение")?.clone());
@@ -98,6 +100,13 @@ fn main() -> Result<()> {
 
     let store = store::Store::new(&dir);
     let mut cfg: Config = store.load().context("чтение конфига")?;
+    // Адаптер и dll из конфига (экран «Серверы» в TUI), если не заданы флагами.
+    if !adapter_set && !cfg.adapter.is_empty() {
+        adapter = cfg.adapter.clone();
+    }
+    if dll.is_none() && !cfg.dll.is_empty() {
+        dll = Some(cfg.dll.clone());
+    }
 
     let save = |c: &Config| -> Result<()> { store.save(c).context("запись конфига") };
 

@@ -59,6 +59,14 @@ pub struct Config {
     /// и при смене сервера чужие gid вошли бы в посторонние группы.
     #[serde(default)]
     pub autojoin_by_server: BTreeMap<String, Vec<u32>>,
+    /// Имя Wintun-адаптера (экран «Серверы» TUI; пусто — по умолчанию,
+    /// флаг `--adapter` важнее). Применяется после перезапуска.
+    #[serde(default)]
+    pub adapter: String,
+    /// Путь к `wintun.dll` (пусто — рядом с exe или из PATH; флаг `--dll`
+    /// важнее). Применяется после перезапуска.
+    #[serde(default)]
+    pub dll: String,
 }
 
 impl Default for Config {
@@ -76,6 +84,8 @@ impl Default for Config {
             invisible: false,
             active_server: String::new(),
             autojoin_by_server: BTreeMap::new(),
+            adapter: String::new(),
+            dll: String::new(),
         }
     }
 }
