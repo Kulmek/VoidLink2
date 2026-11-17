@@ -36,6 +36,8 @@ mod engine;
 mod engine_e2e;
 mod store;
 mod tun;
+#[cfg(target_os = "linux")]
+mod tun_linux;
 mod tui;
 
 use std::net::SocketAddr;
