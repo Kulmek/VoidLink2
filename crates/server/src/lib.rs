@@ -60,6 +60,8 @@ const GID_MAX: u32 = 254; // 100.66.<gid>.0/24
 const HOST_MIN: u32 = 2;
 const HOST_MAX: u32 = 254;
 const HOUSEKEEPING_EVERY: Duration = Duration::from_secs(2);
+/// Пауза между LEAVE и повторным JOIN той же identity в ту же группу.
+const REJOIN_COOLDOWN: Duration = Duration::from_secs(3);
 const SAVE_EVERY: Duration = Duration::from_secs(3);
 /// Срочное сохранение (кик, бан, выход, удаление…) — не чаще этого: поток
 /// таких команд не превращается в поток записей на диск.
@@ -448,6 +450,9 @@ struct Group {
     invites: HashMap<[u8; 32], Invite>,
     /// Лимит входов не-участников (`Limits::join_rate`), не сохраняется.
     joins: Bucket,
+    /// Недавно вышедшие (LEAVE) → когда: повторный вход без приглашения —
+    /// не раньше `REJOIN_COOLDOWN`. Не сохраняется.
+    left: HashMap<[u8; 32], Instant>,
 }
 
 impl Group {
@@ -800,6 +805,7 @@ fn load_state(store: &persist::Store) -> Result<Loaded> {
             banned,
             invites,
             joins: Bucket::full(),
+            left: HashMap::new(),
         };
         for (k, ip) in g.members {
             if let Ok(pk) = unhex(&k) {
@@ -1902,6 +1908,7 @@ fn handle_mutation(
                 banned: HashMap::new(),
                 invites: HashMap::new(),
                 joins: Bucket::full(),
+            left: HashMap::new(),
             };
             g.insert_member(
                 me,
@@ -1951,6 +1958,15 @@ fn handle_mutation(
                 return Ok(());
             }
             let ip = g.next_free_ip().context("группа заполнена")?;
+            // Одна identity не крутит LEAVE/JOIN (каждый — ротация) и не
+            // выбирает общий лимит входов группы: после выхода — пауза.
+            // Вход по приглашению владельца — без паузы.
+            if g.owner != me
+                && !g.invites.contains_key(&me)
+                && g.left.get(&me).is_some_and(|t| t.elapsed() < REJOIN_COOLDOWN)
+            {
+                anyhow::bail!("недавно вышли из группы — повторите вход позже");
+            }
             // Каждый вход — ротация, а выход за ним — ротация с отзывом:
             // чехарда JOIN/LEAVE (новые identity бесплатны) ломала бы трафик
             // группы. Владельцу — без лимита.
@@ -1994,6 +2010,9 @@ fn handle_mutation(
                 g.remove_member(&me).then(|| {
                     // Устаревшее приглашение не должно всплыть после выхода.
                     g.invites.remove(&me);
+                    // Размер ограничен лимитом входов: каждый выход — после входа.
+                    g.left.retain(|_, t| t.elapsed() < REJOIN_COOLDOWN);
+                    g.left.insert(me, Instant::now());
                     g.rotate(true);
                     g.bump()
                 })
@@ -2195,6 +2214,7 @@ mod tests {
             banned: HashMap::new(),
             invites: HashMap::new(),
             joins: Bucket::full(),
+            left: HashMap::new(),
         }
     }
 
@@ -2723,6 +2743,49 @@ mod tests {
         // Повторный JOIN участника — не вход, лимит не тратит.
         b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
         assert_eq!(b.state().epoch, epoch + 2);
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn чехарда_leave_join_одной_identity_не_крутит_ключ() {
+        let limits = Limits { ctrl_rate: 1e6, ctrl_burst: 1e6, ..Limits::default() };
+        let (server, dir) = test_server_with("churn", limits);
+        let a = Raw::connect(server.addr, "alpha");
+        let gid = a.create("g", false).gid;
+        let b = Raw::connect(server.addr, "bravo");
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
+        b.state();
+        b.send(ctrl::LEAVE_GROUP, &payloads::enc_gid(gid));
+        b.sync();
+        let epoch = server.shared.state.read().unwrap().groups[&gid].epoch;
+        // Сразу назад — отказ без ротации и без траты общего лимита входов.
+        let joins = server.shared.state.read().unwrap().groups[&gid].joins.tokens;
+        for _ in 0..20 {
+            b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
+            assert!(b.error().contains("недавно вышли"));
+        }
+        {
+            let s = server.shared.state.read().unwrap();
+            let g = &s.groups[&gid];
+            assert_eq!(g.epoch, epoch, "отказ ротировал ключ");
+            assert!(g.joins.tokens >= joins, "отказ потратил лимит входов группы");
+        }
+        // Другим identity пауза не мешает.
+        let c = Raw::connect(server.addr, "charlie");
+        c.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
+        assert_eq!(c.state().epoch, epoch + 1);
+        // По приглашению владельца — без паузы.
+        a.send(ctrl::INVITE, &payloads::enc_gid_target(gid, &b.pk));
+        a.sync();
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
+        assert_eq!(b.state().epoch, epoch + 2);
+        // После паузы — снова можно.
+        b.send(ctrl::LEAVE_GROUP, &payloads::enc_gid(gid));
+        b.sync();
+        thread::sleep(REJOIN_COOLDOWN + Duration::from_millis(100));
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
+        assert_eq!(b.state().epoch, epoch + 4);
         server.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -436,6 +436,8 @@ multicast, broadcast). PUNCH уходит на endpoint и на все канд�
 | relay rate / burst  | 4000 / 8000 фреймов/с на сессию |
 | ctrl rate / burst   | 50 / 100 фреймов/с на сессию |
 | hello rate / burst  | 5 / 20 в секунду на IP (HELLO, HELLO3, RESET, UNSUPPORTED, CHALLENGE) |
+| join rate / burst   | 1 / 10 входов не-участников в секунду на группу (каждый — ротация); владельцу без лимита |
+| rejoin cooldown     | 3 с между LEAVE и повторным JOIN той же identity в ту же группу (кроме входа по приглашению; не флаг) |
 | session timeout     | 30 с |
 | max_owned_groups    | 16 |
 | invite_ttl          | 7 дней |
