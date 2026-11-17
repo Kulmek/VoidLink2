@@ -2887,6 +2887,32 @@ mod tests {
     }
 
     #[test]
+    fn окна_приёма_привязаны_к_ключу_а_не_к_эпохе() {
+        let now = Instant::now();
+        let log = KeyLog::default();
+        let mut g = GroupSess::new(&state(1, 5, 1), now, log.clone());
+        assert!(g.rx_window(&[1; 32], 9).unwrap().commit(100));
+
+        // Сервер упал и выдал ту же эпоху 5 с новым ключом: окна прежнего
+        // ключа не наследуются — счётчики пира под новым ключом с нуля.
+        g.set_key(5, [2; 32], false, now);
+        assert_eq!(g.rx_key(5, now), Some([2; 32]));
+        assert!(g.rx_window(&[2; 32], 9).unwrap().commit(0), "новый ключ — свежее окно");
+        assert!(g.rx_window(&[1; 32], 9).is_none(), "прежний ключ той же эпохи не принимается");
+
+        // Возврат к ранее использованному ключу — его окна возвращаются:
+        // записанный фрейм под ним повторно не проходит.
+        g.set_key(6, [1; 32], true, now);
+        assert!(!g.rx_window(&[1; 32], 9).unwrap().commit(100), "повтор под старым ключом");
+        assert!(g.rx_window(&[1; 32], 9).unwrap().commit(101));
+
+        // И после пересоздания группы (окна в KeyLog).
+        drop(g);
+        let mut g2 = GroupSess::new(&state(1, 5, 2), now, log);
+        assert!(!g2.rx_window(&[2; 32], 9).unwrap().commit(0), "окно ключа пережило пересоздание");
+    }
+
+    #[test]
     fn участник_прямой_канал_только_на_известном_адресе() {
         let now = Instant::now();
         let mut g = GroupSess::new(&state(1, 1, 1), now, KeyLog::default());
