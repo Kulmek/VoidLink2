@@ -131,6 +131,10 @@ pub mod ctrl {
     pub const FRAG: u8 = 0x8F;
     /// Открытым текстом: версия не поддерживается (`handshake::enc_unsupported`).
     pub const UNSUPPORTED: u8 = 0x90;
+    /// Подтверждение PRESENCE: invisible bool — значение, действующее на
+    /// сервере после обработки (`enc_presence`). Шлётся на каждый PRESENCE,
+    /// и на повтор без изменения: клиент повторяет PRESENCE, пока не получит.
+    pub const PRESENCE_ACK: u8 = 0x91;
 
     /// Фреймы, которые ходят открытым текстом (всё прочее — шифрованные ctrl
     /// или фреймы группы).
