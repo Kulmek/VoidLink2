@@ -17,6 +17,7 @@ serde_json.workspace = true
 tunnel-client = { path = "../client" }
 tunnel-ipc = { path = "../ipc" }
 tunnel-protocol = { path = "../protocol" }
+tunnel-winsvc = { path = "../winsvc" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

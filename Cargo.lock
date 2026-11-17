@@ -2659,6 +2659,7 @@ dependencies = [
  "tunnel-ipc",
  "tunnel-protocol",
  "tunnel-server",
+ "tunnel-winsvc",
  "windows-sys 0.61.2",
 ]
 

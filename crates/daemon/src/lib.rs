@@ -20,7 +20,7 @@ pub use hub::{Backend, Hub, HubMsg, Subscription};
 pub use lock::{InstanceLock, LockError};
 pub use log::{Level, LogFn, Logger};
 pub use server::IpcServer;
-pub use service::{IpcMode, RunOpts, run_daemon};
+pub use service::{IpcMode, ResumeSignal, RunOpts, ServiceEnv, run_daemon};
 
 use std::path::{Path, PathBuf};
 
