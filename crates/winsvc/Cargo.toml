@@ -1,0 +1,18 @@
+[package]
+name = "tunnel-winsvc"
+version = "0.2.0"
+edition = "2024"
+description = "Служба Windows для tunnel-daemon: SCM-обёртка, установка, удаление"
+
+[dependencies]
+anyhow.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+] }
