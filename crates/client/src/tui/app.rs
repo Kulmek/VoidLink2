@@ -2,7 +2,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashSet, VecDeque};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, Result};
 use ratatui::crossterm::event::{
@@ -13,6 +13,8 @@ use tunnel_protocol as proto;
 
 use crate::engine::{Cmd, Engine};
 use crate::store::{self, Config, StoredFriend, StoredServer};
+use crate::tui::badges::Transport;
+use crate::tui::{clipboard, keymap};
 use crate::tui::theme::ThemeKind;
 
 pub const TOAST_TTL: Duration = Duration::from_secs(5);
@@ -143,7 +145,8 @@ pub struct Toast {
 pub struct LogLine {
     pub text: String,
     pub kind: MsgKind,
-    pub at: Instant,
+    /// Настенное время записи — для локальной метки в логе.
+    pub wall: SystemTime,
 }
 
 // ---------------------------------------------------------------- попапы
@@ -155,6 +158,8 @@ pub enum InputAction {
     SetName,
     SetStatus,
     InviteCode(u32),
+    /// Новый алиас друга (pubkey).
+    FriendAlias([u8; 32]),
     /// Командная строка «:».
     Command,
 }
@@ -235,14 +240,16 @@ pub enum SettingRow {
     Server,
     Autojoin,
     Theme,
+    Invisible,
 }
 
-pub const SETTING_ROWS: [SettingRow; 5] = [
+pub const SETTING_ROWS: [SettingRow; 6] = [
     SettingRow::Name,
     SettingRow::Status,
     SettingRow::Server,
     SettingRow::Autojoin,
     SettingRow::Theme,
+    SettingRow::Invisible,
 ];
 
 pub struct SettingsPopup {
@@ -257,6 +264,8 @@ pub struct InvitePopup {
     pub from_name: String,
     pub from_pubkey: [u8; 32],
     pub received_at: Instant,
+    /// Когда приглашение истекает на сервере (None — неизвестно).
+    pub expires_at: Option<Instant>,
     /// Когда окно показано (None — ещё в очереди); см. [`INVITE_GUARD`].
     pub shown_at: Option<Instant>,
 }
@@ -426,6 +435,10 @@ pub struct App {
     pub later_invites: Vec<InvitePopup>,
     /// Только что отклонённые (gid, когда) — см. [`INVITE_DECLINE_MEMORY`].
     pub declined: Vec<(u32, Instant)>,
+    /// Невидимка (из конфига).
+    pub invisible: bool,
+    /// Транспорт до сервера (пока движок знает только UDP).
+    pub transport: Transport,
 }
 
 impl App {
@@ -469,6 +482,8 @@ impl App {
             invites: VecDeque::new(),
             later_invites: Vec::new(),
             declined: Vec::new(),
+            invisible: cfg.invisible,
+            transport: Transport::Udp,
         }
     }
 
@@ -584,6 +599,7 @@ impl App {
             self.servers = cfg.servers.clone();
             self.autojoin = cfg.autojoin.clone();
             self.theme_kind = ThemeKind::from_str(&cfg.theme).unwrap_or(ThemeKind::Dark);
+            self.invisible = cfg.invisible;
         }
 
         // Выбор группы: держим актуальный gid, иначе — первая своя.
@@ -687,13 +703,12 @@ impl App {
                     self.toast(MsgKind::Error, msg);
                 }
                 E::DirectLost { gid, ip, name } => {
-                    self.log(
-                        MsgKind::Warn,
-                        format!(
-                            "прямой канал с {name} ({}) в {gid} потерян — через релей",
-                            proto::ip_str(ip)
-                        ),
+                    let msg = format!(
+                        "прямой канал с {name} ({}) в {gid} потерян — через релей",
+                        proto::ip_str(ip)
                     );
+                    self.log(MsgKind::Warn, msg.clone());
+                    self.toast(MsgKind::Warn, msg);
                 }
                 E::ServerKeyRotated { addr, new_code } => {
                     let msg = format!("ключ сервера {addr} сменён по цепочке ротации: {new_code}");
@@ -741,7 +756,7 @@ impl App {
                     self.log(MsgKind::Ok, msg.clone());
                     self.toast(MsgKind::Ok, msg);
                 }
-                E::Invite { gid, group_name, from_pubkey, from_name, .. } => {
+                E::Invite { gid, group_name, from_pubkey, from_name, expires_in } => {
                     // Уже в группе или в автовходе (движок войдёт сам) — окно
                     // не показываем: сервер повторяет приглашения после HELLO.
                     let skip = eng.groups.lock().unwrap().contains_key(&gid)
@@ -752,6 +767,9 @@ impl App {
                         from_name,
                         from_pubkey,
                         received_at: Instant::now(),
+                        expires_at: (expires_in > 0).then(|| {
+                            Instant::now() + Duration::from_secs(expires_in as u64)
+                        }),
                         shown_at: None,
                     };
                     self.on_invite(inv, skip);
@@ -1093,7 +1111,7 @@ impl App {
         self.log.push(LogLine {
             text,
             kind,
-            at: Instant::now(),
+            wall: SystemTime::now(),
         });
         if self.log.len() > LOG_MAX {
             self.log.remove(0);
@@ -1141,6 +1159,8 @@ impl App {
     // ---------- клавиши ----------
 
     pub fn handle_key(&mut self, key: KeyEvent, eng: &Engine) {
+        // Хоткеи работают и в русской раскладке; в полях ввода — как есть.
+        let key = if self.text_input_active() { key } else { latin_key(key) };
         if !self.stack.is_empty() {
             self.handle_popup_key(key, eng);
             return;
@@ -1195,6 +1215,7 @@ impl App {
                 self.sort = self.sort.next();
                 self.status_msg = format!("сортировка: {}", self.sort.label());
             }
+            KeyCode::Char('r') if self.focus == Focus::Friends => self.open_friend_alias(),
             KeyCode::Char('r') => {
                 let _ = eng.cmds.send(Cmd::RefreshList);
                 self.status_msg = "обновляем список групп".into();
@@ -1204,6 +1225,29 @@ impl App {
                 self.status_msg = format!("«{c}» — неизвестная команда; F1 — справка, / — поиск");
             }
             _ => {}
+        }
+    }
+
+    /// Ввод идёт в текстовое поле (поиск или окно ввода) — раскладку не трогаем.
+    pub fn text_input_active(&self) -> bool {
+        match self.stack.last() {
+            Some(Popup::Input(_)) => true,
+            Some(_) => false,
+            None => self.filtering,
+        }
+    }
+
+    /// Число неотвеченных приглашений: в очереди, отложенные и открытое окно.
+    pub fn pending_invites(&self) -> usize {
+        let shown = self.stack.iter().filter(|p| matches!(p, Popup::Invite(_))).count();
+        self.invites.len() + self.later_invites.len() + shown
+    }
+
+    /// Копирует в буфер обмена (OSC 52 через SSH) и сообщает результат тостом.
+    fn copy_toast(&mut self, text: &str, ok: String) {
+        match copy_to_clipboard(text) {
+            Ok(()) => self.toast(MsgKind::Ok, ok),
+            Err(e) => self.toast(MsgKind::Error, e),
         }
     }
 
@@ -1580,8 +1624,10 @@ impl App {
             },
             Popup::FriendCard(card) => match key.code {
                 KeyCode::Char('c') => {
-                    copy_to_clipboard(&proto::friend_code_of(&card.pubkey));
-                    self.toast(MsgKind::Ok, "friend code друга скопирован".into());
+                    self.copy_toast(
+                        &proto::friend_code_of(&card.pubkey),
+                        "friend code друга скопирован".into(),
+                    );
                     self.stack.push(Popup::FriendCard(card));
                 }
                 _ => {}
@@ -1662,8 +1708,8 @@ impl App {
             },
             Popup::Profile => {
                 if let KeyCode::Char('c') = key.code {
-                    copy_to_clipboard(&self.my_code);
-                    self.toast(MsgKind::Ok, "friend code скопирован".into());
+                    let code = self.my_code.clone();
+                    self.copy_toast(&code, "friend code скопирован".into());
                     self.stack.push(Popup::Profile);
                 }
             }
@@ -1767,6 +1813,10 @@ impl App {
                     self.toast(MsgKind::Ok, "приглашение отправлено".into());
                 }
                 Err(e) => self.toast(MsgKind::Error, format!("неверный friend code: {e}")),
+            },
+            InputAction::FriendAlias(pk) => match self.rename_friend(eng, pk, &value) {
+                Ok(()) => self.toast(MsgKind::Ok, format!("друг переименован: {value}")),
+                Err(e) => self.toast(MsgKind::Error, e.to_string()),
             },
             InputAction::Command => {
                 if let Err(e) = self.run_command(&value, eng) {
@@ -2024,6 +2074,12 @@ impl App {
                     action: ListAction::ToggleAutojoin,
                 }));
             }
+            SettingRow::Invisible => {
+                let on = !self.invisible;
+                self.invisible = on;
+                let _ = eng.cmds.send(Cmd::SetInvisible(on));
+                self.toast(MsgKind::Ok, invisible_msg(on));
+            }
             SettingRow::Theme => {
                 let kind = self.theme_kind.next();
                 self.theme_kind = kind;
@@ -2037,6 +2093,40 @@ impl App {
                 }
             }
         }
+    }
+
+    /// «r» в списке друзей: окно нового алиаса выбранного друга.
+    fn open_friend_alias(&mut self) {
+        match self.selected_friend() {
+            Some(f) => {
+                let (pk, alias) = (f.pubkey, f.alias.clone());
+                self.stack.push(Popup::Input(InputPopup {
+                    title: format!("Переименовать друга «{alias}»"),
+                    hint: "новый алиас · Enter — сохранить".into(),
+                    value: alias,
+                    action: InputAction::FriendAlias(pk),
+                    private: false,
+                }));
+            }
+            None => self.toast(MsgKind::Warn, "не выбран друг".into()),
+        }
+    }
+
+    /// Друг по алиасу, friend code или hex.
+    fn resolve_friend(&self, eng: &Engine, token: &str) -> Result<[u8; 32]> {
+        let cfg = eng.cfg.lock().unwrap().clone();
+        resolve_friend_in(&cfg, token)
+    }
+
+    /// Новый алиас друга: правит `Config.friends` и сохраняет конфиг.
+    fn rename_friend(&mut self, eng: &Engine, pk: [u8; 32], name: &str) -> Result<()> {
+        let mut cfg = eng.cfg.lock().unwrap().clone();
+        rename_friend_in(&mut cfg, &pk, name)?;
+        save_cfg(eng, cfg)?;
+        if let Some(f) = self.friends.iter_mut().find(|f| f.pubkey == pk) {
+            f.alias = name.trim().to_string();
+        }
+        Ok(())
     }
 
     fn open_command(&mut self) {
@@ -2065,8 +2155,8 @@ impl App {
         match self.focus {
             Focus::Peers => match self.selected_peer() {
                 Some(p) => {
-                    copy_to_clipboard(&proto::ip_str(p.ip));
-                    self.toast(MsgKind::Ok, format!("IP скопирован: {}", proto::ip_str(p.ip)));
+                    let ip = proto::ip_str(p.ip);
+                    self.copy_toast(&ip, format!("IP скопирован: {ip}"));
                 }
                 None => self.toast(MsgKind::Warn, "не выбран участник".into()),
             },
@@ -2076,15 +2166,14 @@ impl App {
                         Some(ip) => proto::ip_str(ip),
                         None => g.gid.to_string(),
                     };
-                    copy_to_clipboard(&txt);
-                    self.toast(MsgKind::Ok, format!("скопировано: {txt}"));
+                    self.copy_toast(&txt, format!("скопировано: {txt}"));
                 }
                 None => self.toast(MsgKind::Warn, "не выбрана группа".into()),
             },
             Focus::Friends => match self.selected_friend() {
                 Some(f) => {
-                    copy_to_clipboard(&proto::hex_of(&f.pubkey));
-                    self.toast(MsgKind::Ok, format!("pubkey скопирован: {}", f.alias));
+                    let (hex, alias) = (proto::hex_of(&f.pubkey), f.alias.clone());
+                    self.copy_toast(&hex, format!("pubkey скопирован: {alias}"));
                 }
                 None => self.toast(MsgKind::Warn, "не выбран друг".into()),
             },
@@ -2147,7 +2236,8 @@ impl App {
             }
             Command::Invisible(on) => {
                 let _ = eng.cmds.send(Cmd::SetInvisible(on));
-                self.toast(MsgKind::Ok, format!("невидимка {}", if on { "включена" } else { "выключена" }));
+                self.invisible = on;
+                self.toast(MsgKind::Ok, invisible_msg(on));
             }
             Command::Server(tok) => {
                 let cfg = eng.cfg.lock().unwrap().clone();
@@ -2203,8 +2293,13 @@ impl App {
                 if txt.is_empty() {
                     return Err(anyhow!("нечего копировать"));
                 }
-                copy_to_clipboard(&txt);
+                copy_to_clipboard(&txt).map_err(|e| anyhow!(e))?;
                 self.toast(MsgKind::Ok, format!("скопировано: {txt}"));
+            }
+            Command::Alias { friend, name } => {
+                let pk = self.resolve_friend(eng, &friend)?;
+                self.rename_friend(eng, pk, &name)?;
+                self.toast(MsgKind::Ok, format!("друг переименован: {name}"));
             }
             Command::Quit => {
                 self.quit = true;
@@ -2250,6 +2345,8 @@ pub enum Command {
     SetStatus(String),
     Sort(Sort),
     Copy(String),
+    /// Новый алиас друга: `:alias <друг> <имя>`.
+    Alias { friend: String, name: String },
     Quit,
 }
 
@@ -2372,6 +2469,17 @@ pub fn parse_command(line: &str) -> Result<Command> {
                 .unwrap_or("ip")
                 .to_lowercase(),
         ),
+        "alias" => {
+            let friend = rest
+                .first()
+                .ok_or_else(|| anyhow!("alias <друг> <новое имя>"))?
+                .to_string();
+            let name = rest[1.min(rest.len())..].join(" ");
+            if name.is_empty() {
+                return Err(anyhow!("нужно новое имя друга"));
+            }
+            Command::Alias { friend, name }
+        }
         "quit" | "q" => Command::Quit,
         other => return Err(anyhow!("неизвестная команда: {other}")),
     })
@@ -2394,34 +2502,54 @@ pub fn save_cfg(eng: &Engine, cfg: Config) -> Result<()> {
     Ok(())
 }
 
-/// Копирование в системный буфер обмена.
-pub fn copy_to_clipboard(text: &str) {
-    #[cfg(windows)]
-    {
-        use std::io::Write;
-        if let Ok(mut child) = std::process::Command::new("clip")
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-        {
-            if let Some(stdin) = child.stdin.as_mut() {
-                let _ = stdin.write_all(text.as_bytes());
-            }
-            let _ = child.wait();
-        }
+/// Копирование в системный буфер обмена (через SSH — OSC 52 первым).
+pub fn copy_to_clipboard(text: &str) -> std::result::Result<(), String> {
+    clipboard::copy(text).map(|_| ())
+}
+
+/// Символьная клавиша в русской раскладке → та же клавиша в латинице.
+pub fn latin_key(mut key: KeyEvent) -> KeyEvent {
+    if let KeyCode::Char(c) = key.code {
+        key.code = KeyCode::Char(keymap::latin(c));
     }
-    #[cfg(not(windows))]
-    {
-        use std::io::Write;
-        if let Ok(mut child) = std::process::Command::new("pbcopy")
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-        {
-            if let Some(stdin) = child.stdin.as_mut() {
-                let _ = stdin.write_all(text.as_bytes());
-            }
-            let _ = child.wait();
-        }
+    key
+}
+
+fn invisible_msg(on: bool) -> String {
+    format!("невидимка {}", if on { "включена" } else { "выключена" })
+}
+
+/// Друг по алиасу, friend code или hex (только из списка друзей).
+pub fn resolve_friend_in(cfg: &Config, token: &str) -> Result<[u8; 32]> {
+    if let Some(f) = cfg.friends.iter().find(|f| f.alias == token) {
+        return hex32(&f.pubkey).ok_or_else(|| anyhow!("неверный pubkey друга {token}"));
     }
+    let pk = store::resolve_peer(cfg, token)?;
+    let hex = proto::hex_of(&pk);
+    if cfg.friends.iter().any(|f| f.pubkey == hex) {
+        Ok(pk)
+    } else {
+        Err(anyhow!("друг {token:?} не найден"))
+    }
+}
+
+/// Меняет алиас друга в конфиге. Алиас не пустой и не занят другим другом.
+pub fn rename_friend_in(cfg: &mut Config, pk: &[u8; 32], name: &str) -> Result<()> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(anyhow!("пустой алиас"));
+    }
+    let hex = proto::hex_of(pk);
+    if cfg.friends.iter().any(|f| f.alias == name && f.pubkey != hex) {
+        return Err(anyhow!("алиас «{name}» уже занят"));
+    }
+    let f = cfg
+        .friends
+        .iter_mut()
+        .find(|f| f.pubkey == hex)
+        .ok_or_else(|| anyhow!("друг не найден"))?;
+    f.alias = name.to_string();
+    Ok(())
 }
 
 // ---------------------------------------------------------------- тесты
@@ -2545,6 +2673,7 @@ mod tests {
             received_at: Instant::now()
                 .checked_sub(INVITE_SYNC_GRACE * 2)
                 .unwrap_or_else(Instant::now),
+            expires_at: None,
             shown_at: None,
         }
     }
@@ -2894,5 +3023,202 @@ mod tests {
         assert_eq!(parse_command("decline 4").unwrap(), Command::Decline(4));
         assert_eq!(parse_command("invites").unwrap(), Command::Invites);
         assert!(parse_command("decline").is_err());
+    }
+
+    // ---------- раскладка, алиасы, невидимка ----------
+
+    struct NullTun;
+    impl crate::engine::TunDev for NullTun {
+        fn inject(&self, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        fn ensure_address(&self, _: u32) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Движок на локальном сервере, без адаптера. Сервер держим, пока жив движок.
+    fn test_engine(cfg: Config) -> (Engine, tunnel_server::Server) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir()
+            .join(format!("voidlink-tui-{}-{nanos}", std::process::id()));
+        let server = tunnel_server::Server::start(tunnel_server::Config {
+            listen: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            data_dir: dir,
+            workers: 1,
+            quiet: true,
+            limits: Default::default(),
+        })
+        .unwrap();
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], server.addr.port()));
+        let eng = crate::engine::start_with_tun(
+            std::sync::Arc::new(std::sync::Mutex::new(cfg)),
+            addr,
+            server.pubkey,
+            proto::Identity::generate(),
+            std::sync::Arc::new(NullTun),
+            std::sync::Arc::new(|_: &Config| {}),
+        )
+        .unwrap();
+        (eng, server)
+    }
+
+    fn friend_cfg() -> Config {
+        let mut cfg = Config::default();
+        cfg.friends = vec![
+            StoredFriend { pubkey: proto::hex_of(&[2; 32]), alias: "bob".into() },
+            StoredFriend { pubkey: proto::hex_of(&[3; 32]), alias: "eve".into() },
+        ];
+        cfg
+    }
+
+    fn ch(c: char) -> KeyEvent {
+        key(KeyCode::Char(c))
+    }
+
+    #[test]
+    fn русская_раскладка_нормализуется_кроме_полей_ввода() {
+        let mut a = app();
+        assert_eq!(latin_key(ch('й')).code, KeyCode::Char('q'));
+        assert_eq!(latin_key(ch('Щ')).code, KeyCode::Char('O'));
+        assert_eq!(latin_key(ch('o')).code, KeyCode::Char('o'));
+        let ctrl = KeyEvent::new(KeyCode::Char('с'), KeyModifiers::CONTROL);
+        assert_eq!(latin_key(ctrl), KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(!a.text_input_active());
+        a.filtering = true;
+        assert!(a.text_input_active(), "строка поиска — текст");
+        a.filtering = false;
+        a.open_command();
+        assert!(a.text_input_active(), "окно ввода — текст");
+        a.stack.clear();
+        a.stack.push(Popup::Help);
+        assert!(!a.text_input_active());
+    }
+
+    #[test]
+    fn хоткеи_в_русской_раскладке_через_handle_key() {
+        let (eng, _srv) = test_engine(friend_cfg());
+        let mut a = app();
+        // «з» = «p» — профиль.
+        a.handle_key(ch('з'), &eng);
+        assert!(matches!(a.stack.last(), Some(Popup::Profile)));
+        a.handle_key(key(KeyCode::Esc), &eng);
+        assert!(a.stack.is_empty());
+        // «Ж» = «:» — командная строка; в ней кириллица остаётся кириллицей.
+        a.handle_key(ch('Ж'), &eng);
+        a.handle_key(ch('ы'), &eng);
+        match a.stack.last() {
+            Some(Popup::Input(i)) => assert_eq!(i.value, "ы"),
+            _ => panic!("нет командной строки"),
+        }
+        a.stack.clear();
+        // Поиск: «/» и затем кириллица в фильтр как есть.
+        a.handle_key(ch('/'), &eng);
+        a.handle_key(ch('б'), &eng);
+        assert_eq!(a.filter, "б");
+        a.handle_key(key(KeyCode::Esc), &eng);
+        // «ы» = «s» — сортировка.
+        let before = a.sort;
+        a.handle_key(ch('ы'), &eng);
+        assert_ne!(a.sort, before);
+        // Ctrl+С (кириллица) — выход.
+        a.handle_key(KeyEvent::new(KeyCode::Char('с'), KeyModifiers::CONTROL), &eng);
+        assert!(a.quit);
+    }
+
+    #[test]
+    fn переименование_друга_клавишей_r_и_командой() {
+        let (eng, _srv) = test_engine(friend_cfg());
+        let mut a = app();
+        a.friends = vec![FriendView { alias: "bob".into(), pubkey: [2; 32], online: false, shared_groups: 0 }];
+        a.sel_friend = Some([2; 32]);
+        a.focus = Focus::Friends;
+        // «к» = «r» в списке друзей — окно алиаса с текущим именем.
+        a.handle_key(ch('к'), &eng);
+        match a.stack.last() {
+            Some(Popup::Input(i)) => {
+                assert!(matches!(i.action, InputAction::FriendAlias(pk) if pk == [2; 32]));
+                assert_eq!(i.value, "bob");
+            }
+            _ => panic!("нет окна алиаса"),
+        }
+        for _ in 0..3 {
+            a.handle_key(key(KeyCode::Backspace), &eng);
+        }
+        for c in "Боря".chars() {
+            a.handle_key(ch(c), &eng);
+        }
+        a.handle_key(key(KeyCode::Enter), &eng);
+        assert!(a.stack.is_empty());
+        let alias = |eng: &Engine, pk: [u8; 32]| {
+            let hex = proto::hex_of(&pk);
+            eng.cfg.lock().unwrap().friends.iter().find(|f| f.pubkey == hex).unwrap().alias.clone()
+        };
+        assert_eq!(alias(&eng, [2; 32]), "Боря");
+        assert_eq!(a.friends[0].alias, "Боря");
+        // :alias по алиасу; занятый алиас и неизвестный друг — ошибки.
+        a.run_command("alias eve Ева Ивановна", &eng).unwrap();
+        assert_eq!(alias(&eng, [3; 32]), "Ева Ивановна");
+        assert!(a.run_command("alias Боря Ева Ивановна", &eng).is_err());
+        assert!(a.run_command("alias nobody x", &eng).is_err());
+        // Вне списка друзей «r» — обновление списка групп.
+        a.focus = Focus::Groups;
+        a.handle_key(ch('r'), &eng);
+        assert!(a.stack.is_empty() && a.status_msg.contains("обновляем"));
+    }
+
+    #[test]
+    fn парс_алиаса_и_правка_конфига() {
+        assert_eq!(
+            parse_command("alias bob Боря Петров").unwrap(),
+            Command::Alias { friend: "bob".into(), name: "Боря Петров".into() }
+        );
+        assert!(parse_command("alias bob").is_err());
+        assert!(parse_command("alias").is_err());
+        let mut cfg = friend_cfg();
+        rename_friend_in(&mut cfg, &[2; 32], "  b2 ").unwrap();
+        assert_eq!(cfg.friends[0].alias, "b2");
+        assert!(rename_friend_in(&mut cfg, &[2; 32], " ").is_err());
+        assert!(rename_friend_in(&mut cfg, &[2; 32], "eve").is_err());
+        assert!(rename_friend_in(&mut cfg, &[4; 32], "x").is_err());
+        assert_eq!(resolve_friend_in(&cfg, "eve").unwrap(), [3; 32]);
+        assert_eq!(resolve_friend_in(&cfg, &proto::hex_of(&[2; 32])).unwrap(), [2; 32]);
+    }
+
+    #[test]
+    fn невидимка_из_настроек_и_командой() {
+        let (eng, _srv) = test_engine(Config::default());
+        let mut a = app();
+        assert!(!a.invisible);
+        a.handle_key(key(KeyCode::F(3)), &eng);
+        let row = SETTING_ROWS.iter().position(|r| *r == SettingRow::Invisible).unwrap();
+        for _ in 0..row {
+            a.handle_key(key(KeyCode::Down), &eng);
+        }
+        a.handle_key(key(KeyCode::Enter), &eng);
+        assert!(a.invisible);
+        assert!(a.toasts.iter().any(|t| t.text.contains("невидимка включена")));
+        assert!(matches!(a.stack.last(), Some(Popup::Settings(_))), "настройки остаются открытыми");
+        a.stack.clear();
+        a.run_command("invisible off", &eng).unwrap();
+        assert!(!a.invisible);
+    }
+
+    #[test]
+    fn счётчик_приглашений_для_бейджа() {
+        let mut a = online();
+        assert_eq!(a.pending_invites(), 0);
+        a.on_invite(inv(1), false);
+        a.on_invite(inv(2), false);
+        assert_eq!(a.pending_invites(), 2, "одно в окне, одно в очереди");
+        press(&mut a, KeyCode::Esc);
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.pending_invites(), 2, "отложенные тоже считаются");
+        // Клик по бейджу = «o»: снова открывает отложенные.
+        a.reopen_invites();
+        assert!(shown_gid(&a).is_some());
     }
 }

@@ -45,6 +45,8 @@ pub fn run(
     dll: Option<String>,
     store: Arc<Store>,
 ) -> Result<()> {
+    // Смещение локального времени — до запуска потоков движка.
+    clock::init();
     let shared = Arc::new(Mutex::new((*cfg).clone()));
     let save_store = store.clone();
     let save = move |c: &Config| {
