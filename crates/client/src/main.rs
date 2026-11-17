@@ -34,6 +34,8 @@
 mod engine;
 #[cfg(test)]
 mod engine_e2e;
+mod invites;
+mod snapshot;
 mod store;
 mod tun;
 mod tui;
