@@ -5,6 +5,11 @@
 //! разбирает рамки и складывает кадры в mpsc; запись — синхронная, под
 //! мьютексом, с таймаутом.
 //!
+//! Тихий обрыв (NAT забыл соединение, сервер обесточен) ловится таймаутом
+//! чтения `READ_TIMEOUT`: если от сервера ничего не приходит столько времени,
+//! читатель выходит и `is_alive()` становится `false`. Движок должен пинговать
+//! заметно чаще (раз в 5 с), чтобы сервер успевал отвечать.
+//!
 //! Когда переходить на TCP, решает `should_fallback`: после нескольких
 //! неудачных UDP-рукопожатий или если UDP молчит слишком долго.
 
@@ -21,7 +26,9 @@ use std::time::Duration;
 /// Максимальная длина кадра (совпадает с `DEFAULT_MAX_FRAME` сервера).
 pub const MAX_FRAME: usize = 4096;
 /// Таймаут записи в сокет.
-const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Таймаут чтения: столько тишины от сервера — соединение считается мёртвым.
+pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Сколько неудачных UDP-рукопожатий подряд — и переходим на TCP.
 pub const FALLBACK_AFTER_FAILURES: u32 = 3;
@@ -54,10 +61,16 @@ pub struct TcpLink {
 impl TcpLink {
     /// Подключиться к `addr` с таймаутом установки соединения.
     pub fn connect(addr: SocketAddr, timeout: Duration) -> io::Result<Self> {
+        Self::connect_with_read_timeout(addr, timeout, READ_TIMEOUT)
+    }
+
+    /// Как `connect`, но со своим таймаутом тишины от сервера.
+    pub fn connect_with_read_timeout(addr: SocketAddr, timeout: Duration, read_timeout: Duration) -> io::Result<Self> {
         let stream = TcpStream::connect_timeout(&addr, timeout)?;
         stream.set_nodelay(true)?;
         stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
         let read_half = stream.try_clone()?;
+        read_half.set_read_timeout(Some(read_timeout))?;
         let alive = Arc::new(AtomicBool::new(true));
         let (tx, rx) = mpsc::channel();
         let reader = {
@@ -110,6 +123,9 @@ impl TcpLink {
     }
 
     /// Отправить кадр. Ошибка записи помечает соединение мёртвым.
+    ///
+    /// Запись синхронная: при забитом сокете вызов может заблокировать
+    /// вызывающий поток (и мьютекс писателя) до `WRITE_TIMEOUT` (5 с).
     pub fn send(&self, frame: &[u8]) -> io::Result<()> {
         if frame.is_empty() || frame.len() > MAX_FRAME {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "недопустимая длина кадра"));
@@ -246,6 +262,16 @@ mod tests {
         let link = TcpLink::connect(l.local_addr().unwrap(), T).unwrap();
         let (mut srv, _) = l.accept().unwrap();
         srv.write_all(&[0, 0]).unwrap();
+        assert_eq!(link.recv_timeout(T), Err(RecvTimeoutError::Disconnected));
+        assert!(!link.is_alive());
+    }
+
+    #[test]
+    fn tcp_link_silent_server_marks_dead() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let link = TcpLink::connect_with_read_timeout(l.local_addr().unwrap(), T, Duration::from_millis(300)).unwrap();
+        // Сервер держит соединение, но молчит — как при тихом обрыве.
+        let (_srv, _) = l.accept().unwrap();
         assert_eq!(link.recv_timeout(T), Err(RecvTimeoutError::Disconnected));
         assert!(!link.is_alive());
     }
