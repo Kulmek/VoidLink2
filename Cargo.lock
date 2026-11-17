@@ -2642,6 +2642,7 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json",
+ "tunnel-ipc",
  "tunnel-protocol",
  "tunnel-server",
  "windows-sys 0.61.2",

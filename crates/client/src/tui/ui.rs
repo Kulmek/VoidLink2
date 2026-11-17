@@ -198,17 +198,23 @@ fn draw_header(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
         .border_type(BorderType::Rounded)
         .border_style(th.focused_border)
         .style(th.header())
-        .title(Line::from(vec![
-            Span::styled(" ◆ ", th.accent),
-            Span::styled("Tunnel ", th.title),
-        ]));
+        .title(Line::from({
+            let mut t = vec![Span::styled(" ◆ ", th.accent), Span::styled("Tunnel ", th.title)];
+            // Где движок: embedded (в этом процессе) или демон (PLAN.md 7.4).
+            if let Some(m) = app.mode {
+                t.push(Span::styled(format!("· {} ", m.label()), th.dim));
+            }
+            t
+        }));
     let body = block.inner(area);
     f.render_widget(block, area);
     if body.is_empty() {
         return;
     }
 
-    let (pill_text, pill_style) = if app.connected {
+    let (pill_text, pill_style) = if app.daemon_down {
+        (" ○ демон недоступен ", th.pill(th.c.danger))
+    } else if app.connected {
         (" ● подключено ", th.pill(th.c.success))
     } else {
         (" ○ реконнект ", th.pill(th.c.danger))

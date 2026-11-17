@@ -3,7 +3,8 @@
 //!
 //! - снимок — [`tunnel_client::snapshot::Snapshot`] из состояния движка
 //!   (группы, meta, счётчики, `CfgView` без identity) плюс неотвеченные
-//!   приглашения, которые ведёт [`PendingInvites`] по событиям движка;
+//!   приглашения — всё это строит `tunnel_client::api::LocalEngine` (тот же
+//!   код, что у embedded TUI, поэтому снимки совпадают — PLAN.md 7.7);
 //! - события — `Event` движка в JSON (serde, внешний тег);
 //! - команды — JSON-форма `Cmd` движка; правки конфига (`AddFriend`,
 //!   `DelServer`…) проверяются до отправки, отказ уходит клиенту в `Ack`.
@@ -15,15 +16,12 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
-use tunnel_client::engine::{self, Cmd, Engine, Event, Groups, Meta, Stats};
-use tunnel_client::invites::{IncomingInvite, InviteOutcome, PendingInvites};
-use tunnel_client::snapshot::{CfgView, GroupSnap, MetaSnap, Snapshot, StatsSnap};
+use tunnel_client::api::{EngineApi, LocalEngine};
+use tunnel_client::engine::{self, Cmd, Engine};
+use tunnel_client::snapshot::Snapshot;
 use tunnel_client::store::{self, Config};
 use tunnel_protocol as proto;
 
@@ -33,25 +31,10 @@ use crate::log::{Level, LogFn};
 /// Имя адаптера Wintun службы.
 pub const ADAPTER_NAME: &str = "TunnelVPN";
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Бэкенд на живом движке.
+/// Бэкенд на живом движке: [`LocalEngine`] (снимок, приглашения, проверка
+/// команд — тот же код, что у embedded TUI) в JSON-обёртке.
 pub struct EngineBackend {
-    groups: Groups,
-    meta: Arc<Mutex<Meta>>,
-    stats: Arc<Stats>,
-    cfg: Arc<Mutex<Config>>,
-    my_pub: [u8; 32],
-    my_code: String,
-    cmds: Mutex<Sender<Cmd>>,
-    /// Приёмник событий движка (`Receiver` не `Sync`).
-    events: Mutex<Receiver<Event>>,
-    invites: Mutex<PendingInvites>,
-    changed: AtomicBool,
-    /// Сам движок: Drop останавливает его потоки. Поля выше — его клоны.
-    _engine: Mutex<Engine>,
+    local: LocalEngine,
     /// Что ещё живёт вместе с движком (tun-поток демона).
     _guard: Mutex<Option<Box<dyn Send>>>,
 }
@@ -62,71 +45,18 @@ impl EngineBackend {
         Self::with_guard(eng, None)
     }
 
-    fn with_guard(mut eng: Engine, guard: Option<Box<dyn Send>>) -> Self {
-        // Поля из Engine не вынуть (у него есть Drop) — подменяем приёмник
-        // событий пустым и забираем настоящий себе.
-        let (_dummy_tx, dummy_rx) = std::sync::mpsc::channel();
-        let events = std::mem::replace(&mut eng.events, dummy_rx);
-        EngineBackend {
-            groups: eng.groups.clone(),
-            meta: eng.meta.clone(),
-            stats: eng.stats.clone(),
-            cfg: eng.cfg.clone(),
-            my_pub: eng.my_pub,
-            my_code: eng.my_code.clone(),
-            cmds: Mutex::new(eng.cmds.clone()),
-            events: Mutex::new(events),
-            invites: Mutex::new(PendingInvites::new()),
-            changed: AtomicBool::new(true),
-            _engine: Mutex::new(eng),
-            _guard: Mutex::new(guard),
-        }
+    fn with_guard(eng: Engine, guard: Option<Box<dyn Send>>) -> Self {
+        EngineBackend { local: LocalEngine::new(eng), _guard: Mutex::new(guard) }
     }
 
     /// Типизированный снимок (то же, что [`Backend::snapshot`] до JSON).
     pub fn snapshot_typed(&self) -> Snapshot {
-        let now = Instant::now();
-        let groups = GroupSnap::from_groups(&lock(&self.groups), now);
-        let meta = MetaSnap::from_meta(&lock(&self.meta), now);
-        let cfg = CfgView::from_cfg(&lock(&self.cfg));
-        Snapshot {
-            groups,
-            meta,
-            stats: StatsSnap::from_stats(&self.stats),
-            cfg,
-            pending_invites: lock(&self.invites).list(now),
-        }
+        self.local.snapshot_now()
     }
 
-    /// Событие → список приглашений; `false` — событие подавить (запоздавшее
-    /// приглашение, которое мы только что отклонили).
-    fn track(inv: &mut PendingInvites, ev: &Event, now: Instant) -> bool {
-        match ev {
-            Event::Invite { gid, group_name, from_pubkey, from_name, expires_in } => {
-                let i = IncomingInvite {
-                    gid: *gid,
-                    group_name: group_name.clone(),
-                    from_pubkey: *from_pubkey,
-                    from_name: from_name.clone(),
-                    expires_in: Some(*expires_in),
-                };
-                return inv.on_invite(i, now) != InviteOutcome::Declined;
-            }
-            Event::InvitesSynced { gids, from, complete } => {
-                inv.on_synced(gids, *from, *complete, now);
-            }
-            Event::GroupJoined { gid, .. } => {
-                inv.on_group_joined(*gid, now);
-            }
-            Event::GroupDeleted { gid, .. } => {
-                inv.on_group_deleted(*gid, now);
-            }
-            Event::InviteRevoked { gid } => {
-                inv.on_revoked(*gid, now);
-            }
-            _ => {}
-        }
-        true
+    /// Движок как [`EngineApi`].
+    pub fn local(&self) -> &LocalEngine {
+        &self.local
     }
 }
 
@@ -136,26 +66,7 @@ impl Backend for EngineBackend {
     }
 
     fn poll_events(&self) -> Vec<Value> {
-        let mut evs = Vec::new();
-        {
-            let rx = lock(&self.events);
-            while let Ok(e) = rx.try_recv() {
-                evs.push(e);
-            }
-        }
-        let now = Instant::now();
-        let mut inv = lock(&self.invites);
-        let expired = !inv.tick(now).is_empty();
-        let out: Vec<Value> = evs
-            .into_iter()
-            .filter(|e| Self::track(&mut inv, e, now))
-            .filter_map(|e| serde_json::to_value(e).ok())
-            .collect();
-        drop(inv);
-        if expired || !out.is_empty() {
-            self.changed.store(true, Ordering::Relaxed);
-        }
-        out
+        self.local.poll_events().into_iter().filter_map(|e| serde_json::to_value(e).ok()).collect()
     }
 
     fn send(&self, cmd: Value) -> Result<(), String> {
@@ -163,24 +74,15 @@ impl Backend for EngineBackend {
         if matches!(cmd, Cmd::Quit) {
             return Err("демон не завершается по команде фронтенда".into());
         }
-        let current: SocketAddr = lock(&self.meta).server;
-        if let Some(e) = engine::check_cfg_cmd(&lock(&self.cfg), current, &cmd) {
-            return Err(e);
-        }
-        if let Cmd::DeclineInvite(gid) = cmd {
-            lock(&self.invites).on_decline(gid, Instant::now());
-        }
-        lock(&self.cmds).send(cmd).map_err(|_| "движок остановлен".to_string())?;
-        self.changed.store(true, Ordering::Relaxed);
-        Ok(())
+        self.local.send(cmd).map_err(|e| e.to_string())
     }
 
     fn me(&self) -> Value {
-        json!({ "my_pub": proto::hex_of(&self.my_pub), "my_code": self.my_code })
+        self.local.me().to_json()
     }
 
     fn changed(&self) -> bool {
-        self.changed.swap(false, Ordering::Relaxed)
+        self.local.changed()
     }
 }
 

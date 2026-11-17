@@ -1,8 +1,9 @@
 //! TUI-режим клиента (ratatui + crossterm).
 //!
-//! Движок ничего не знает про UI: TUI читает состояние (`Engine::groups`,
-//! `Engine::meta`, `Engine::stats`), шлёт команды (`Engine::cmds`) и слушает
-//! события (`Engine::events`).
+//! Движок ничего не знает про UI: TUI видит его через [`EngineApi`] —
+//! снимок состояния, события и команды. Два режима (PLAN.md 7.4):
+//! [`run`] — embedded, движок в этом процессе ([`LocalEngine`], нужны права
+//! на TUN); [`run_remote`] — тонкий клиент демона ([`IpcEngine`]).
 
 pub mod admin;
 pub mod app;
@@ -30,7 +31,9 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::prelude::*;
 
-use crate::engine::{self, Engine};
+use crate::api::{EngineApi, LocalEngine};
+use crate::engine::{self, Cmd};
+use crate::remote::IpcEngine;
 use crate::store::{Config, Store};
 
 use app::App;
@@ -63,16 +66,33 @@ pub fn run(
         Arc::new(save),
     )?;
 
-    let mut term = setup_terminal(true)?;
     let cfg_snapshot = eng.cfg.lock().unwrap().clone();
-    let mut app = App::new(eng.my_pub, &eng.my_code, &cfg_snapshot);
+    let eng = LocalEngine::new(eng);
+
+    let mut term = setup_terminal(true)?;
+    let mut app = App::new(eng.me().my_pub, &eng.me().my_code, &cfg_snapshot);
     // Экран «Серверы» показывает то, с чем клиент запущен на самом деле.
     app.adapter_name = adapter_name.to_string();
     app.dll_path = dll_path;
     let res = event_loop(&mut term, &mut app, &eng);
     restore_terminal(&mut term)?;
     // Останавливаем движок (потоки туннеля).
-    let _ = eng.cmds.send(engine::Cmd::Quit);
+    let _ = eng.send(Cmd::Quit);
+    res
+}
+
+/// Тонкий клиент: движок в демоне, TUI только рисует и шлёт команды
+/// (права администратора не нужны). `ui` — локальные настройки (тема).
+/// Закрытие TUI туннель не трогает.
+pub fn run_remote(eng: IpcEngine, ui: &Config) -> Result<()> {
+    clock::init();
+    let mut term = setup_terminal(true)?;
+    let mut app = App::new(eng.me().my_pub, &eng.me().my_code, ui);
+    // Адаптер и dll — у демона, TUI их не знает.
+    app.adapter_name = String::new();
+    app.dll_path = String::new();
+    let res = event_loop(&mut term, &mut app, &eng);
+    restore_terminal(&mut term)?;
     res
 }
 
@@ -115,7 +135,7 @@ pub(crate) fn restore_terminal(term: &mut Terminal<CrosstermBackend<Stdout>>) ->
 fn event_loop(
     term: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
-    eng: &Engine,
+    eng: &dyn EngineApi,
 ) -> Result<()> {
     let tick = Duration::from_millis(120);
     loop {

@@ -40,10 +40,16 @@
 //!   dns on|off                  — встроенный DNS для имён пиров (*.vl)
 //!   invisible on|off            — невидимка (другие видят нас офлайн)
 //!   run                         — поднять туннель (autojoin-группы)
-//!   tui                         — поднять туннель с графическим интерфейсом
+//!   tui [--embedded|--remote]   — интерфейс: при работающем демоне — тонкий
+//!                                 клиент (без прав админа), иначе свой движок
 //!
 //! Если в конфиге нет имени или серверов, `tui` сначала показывает
 //! экран первичной настройки (tui::setup): имя, сервер, адаптер, dll.
+//!
+//! Демон (PLAN.md 7.4): если он доступен, сетевые команды и правки конфига
+//! идут ему по IPC (`remote_cli`) — свой ctrl-сеанс вытеснил бы его сессию.
+//! Движок запущен без демона (embedded TUI или `run` держат замок) — такие
+//! команды отказывают.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -53,9 +59,19 @@ use tunnel_protocol as proto;
 use proto::ctrl;
 use proto::payloads;
 
+use tunnel_client::remote::{Endpoint, IpcEngine, UiPrefs};
+use tunnel_client::remote_cli::{self, Route};
 use tunnel_client::{engine, profile, store, tui};
+use tunnel_ipc::{InstanceLock, LockError};
 
 use store::{Config, StoredFriend, StoredServer};
+
+/// Режим TUI, заданный флагом.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UiMode {
+    Embedded,
+    Remote,
+}
 
 /// Глобальные флаги CLI (в любом месте командной строки).
 #[derive(Debug, PartialEq)]
@@ -68,6 +84,8 @@ struct Globals {
     dll: Option<String>,
     server_sel: Option<String>,
     debug: bool,
+    /// `--embedded` / `--remote` для `tui` (по умолчанию — по наличию демона).
+    ui_mode: Option<UiMode>,
     /// Подкоманда и её аргументы.
     args: Vec<String>,
 }
@@ -93,6 +111,7 @@ fn parse_globals(mut args: Vec<String>) -> Result<Globals> {
         dll: None,
         server_sel: None,
         debug: false,
+        ui_mode: None,
         args: Vec::new(),
     };
     let mut i = 0;
@@ -121,6 +140,13 @@ fn parse_globals(mut args: Vec<String>) -> Result<Globals> {
             args.drain(i..=i + 1);
         } else if a == "--debug" {
             g.debug = true;
+            args.remove(i);
+        } else if a == "--embedded" || a == "--remote" {
+            let m = if a == "--embedded" { UiMode::Embedded } else { UiMode::Remote };
+            if g.ui_mode.is_some_and(|x| x != m) {
+                bail!("--embedded и --remote взаимоисключающие");
+            }
+            g.ui_mode = Some(m);
             args.remove(i);
         } else {
             i += 1;
@@ -251,8 +277,22 @@ fn main() -> Result<()> {
     let mut adapter = g.adapter.clone();
     let mut dll = g.dll.clone();
     let server_sel = g.server_sel.clone();
+    let ui_mode = g.ui_mode;
     let args = g.args;
     engine::set_debug(g.debug);
+
+    // Демон или чужой движок — до любых правок client.json (PLAN.md 7.4).
+    let cmd0 = args.first().cloned().unwrap_or_else(|| "tui".into());
+    if remote_cli::is_engine_cmd(&cmd0) {
+        match remote_cli::route(&dir)? {
+            Route::Daemon(mut c) => {
+                let mut out = std::io::stdout();
+                return remote_cli::run(&mut c, &cmd0, &args[1..], &mut out);
+            }
+            Route::Locked if !remote_cli::is_readonly(&cmd0) => bail!("{}", remote_cli::LOCKED_MSG),
+            Route::Locked | Route::Direct => {}
+        }
+    }
 
     let store = store::Store::new(&dir);
 
@@ -704,6 +744,31 @@ fn main() -> Result<()> {
         }
         "run" | "tui" | "ui" => {
             let tui_mode = cmd != "run";
+            if !tui_mode && ui_mode.is_some() {
+                bail!("--embedded / --remote — только для tui");
+            }
+            // tui: демон есть → тонкий клиент; Hello не прошёл → ошибка без
+            // фолбэка (два движка с одной identity выбивают друг друга).
+            if tui_mode && ui_mode != Some(UiMode::Embedded) {
+                let ep = Endpoint::for_data_dir(&dir);
+                let live = ep.open().with_context(|| format!("демон ({}) есть, но подключиться нельзя", ep.describe()))?;
+                match live {
+                    Some(_probe) => return run_remote_tui(&ep, &dir, &cfg),
+                    None if ui_mode == Some(UiMode::Remote) => {
+                        bail!("демон не запущен ({}); без --remote tui поднимет свой движок", ep.describe())
+                    }
+                    None => {}
+                }
+            }
+            // Свой движок: замок single-instance (демон / другой TUI / run).
+            let _lock = match InstanceLock::acquire(&dir) {
+                Ok(l) => l,
+                Err(LockError::Busy) => bail!(
+                    "движок уже запущен (embedded TUI, run или демон без IPC) — второй с той же identity \
+выбил бы его с сервера; закройте его или подключайтесь к демону"
+                ),
+                Err(e) => bail!("{e}"),
+            };
             // Первичная настройка: если конфиг не заполнен (нет имени или
             // серверов) и флаги не заданы — спрашиваем прямо в TUI, до старта
             // движка. Консольному `run` достаточно CLI-подсказки.
@@ -748,6 +813,37 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// `tui` тонким клиентом демона. Первичная настройка — командами демону.
+fn run_remote_tui(ep: &Endpoint, dir: &std::path::Path, local: &Config) -> Result<()> {
+    use tunnel_client::api::EngineApi;
+    let eng = IpcEngine::connect(ep, Some(dir.to_path_buf()))?;
+    let snap = eng.snapshot();
+    if snap.cfg.name.is_empty() || snap.cfg.servers.is_empty() {
+        let mut c = snap.cfg.to_config();
+        let (mut adapter, mut dll) = (String::new(), None);
+        if !tui::setup::run(&mut c, &mut adapter, &mut dll)? {
+            bail!("настройка не завершена; запусти ещё раз или задай параметры командами CLI");
+        }
+        if c.name != snap.cfg.name {
+            eng.send(engine::Cmd::SetName(c.name.clone()))?;
+        }
+        for s in c.servers.iter().filter(|s| !snap.cfg.servers.iter().any(|x| x.addr == s.addr)) {
+            let pubkey: [u8; 32] = proto::hex_to_bytes(&s.pubkey)
+                .ok()
+                .and_then(|v| v.try_into().ok())
+                .with_context(|| format!("неверный ключ сервера {}", s.addr))?;
+            eng.send(engine::Cmd::AddServer { addr: s.addr.clone(), pubkey, label: s.label.clone() })?;
+        }
+    }
+    // Тема — локальная: ui.json (client.json при демоне — его).
+    let mut ui = local.clone();
+    let prefs = UiPrefs::load(dir);
+    if !prefs.theme.is_empty() {
+        ui.theme = prefs.theme;
+    }
+    tui::run_remote(eng, &ui)
+}
+
 /// Подсказка по флагам `run` для текущей ОС.
 fn run_flags_help() -> &'static str {
     if cfg!(windows) {
@@ -787,11 +883,13 @@ global: --dir <path> --profile <имя> --debug --server <N|addr|label> (по у
   dns on|off                  встроенный DNS для имён пиров (*.vl)
   invisible on|off            невидимка: другие видят вас офлайн
   run                         поднять туннель (global: --adapter --dll --server <N>, см. ниже)
-  tui                         то же, но с графическим интерфейсом (ratatui)
+  tui [--embedded|--remote]   то же, но с графическим интерфейсом (ratatui);
+                              при работающем демоне — тонкий клиент без прав админа
 peer = friend code (TUN-…) | hex | alias
 
 Если при запуске tui имя или сервер не заданы — сначала открывается
-экран первичной настройки (Enter — применить, Esc — отмена)."#
+экран первичной настройки (Enter — применить, Esc — отмена).
+При работающем демоне команды уходят ему (IPC), а не своим сеансом."#
     );
     println!("run/tui: {}", run_flags_help());
 }

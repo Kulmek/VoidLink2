@@ -7,6 +7,7 @@
 //! - [`transport`] — `Listener::bind(name)` → `accept()` → [`Conn`]; `connect(name)`.
 //!   Unix — сокет `0600`, Windows — named pipe с явным SDDL и проверкой, что
 //!   сервер пайпа работает от SYSTEM.
+//! - [`lock`] — single-instance замок движка (демон, embedded TUI, `run`).
 //! - [`client`] — блокирующий [`IpcClient`] (Hello, Subscribe, Req с таймаутом)
 //!   для TUI, трея и CLI.
 // подключается при интеграции
@@ -14,10 +15,12 @@
 
 pub mod client;
 pub mod codec;
+pub mod lock;
 pub mod proto;
 pub mod transport;
 
 pub use client::{ClientError, IpcClient};
+pub use lock::{InstanceLock, LockError};
 pub use codec::{CodecError, MAX_FRAME, read_msg, write_msg};
 pub use proto::{AckResult, ClientKind, ClientMsg, DaemonMsg, PROTO_VERSION, check_hello};
 pub use transport::{Conn, Listener, connect};
