@@ -44,6 +44,8 @@ mod tcp_link;
 mod tun;
 #[cfg(target_os = "linux")]
 mod tun_linux;
+#[cfg(target_os = "macos")]
+mod tun_macos;
 mod tui;
 
 use std::net::SocketAddr;
