@@ -2,6 +2,7 @@
 //! вспомогательные модули. CLI (`main.rs`) и другие крейты (daemon, tray)
 //! используют их через `tunnel_client::…`.
 
+pub mod api;
 pub mod dns;
 pub mod engine;
 #[cfg(test)]
@@ -9,6 +10,8 @@ mod engine_e2e;
 pub mod invites;
 pub mod ipv6;
 pub mod profile;
+pub mod remote;
+pub mod remote_cli;
 pub mod snapshot;
 pub mod store;
 pub mod tcp_link;

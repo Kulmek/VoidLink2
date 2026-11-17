@@ -149,17 +149,33 @@ impl Backend for FakeBackend {
             .groups
             .iter()
             .filter(|g| g.joined)
-            .map(|g| json!({ "gid": g.gid, "name": g.name, "private": g.private, "my_ip": Self::my_ip(g.gid), "members": [] }))
+            .map(|g| {
+                let owner = [0u8; 32];
+                json!({
+                    "gid": g.gid, "name": g.name, "private": g.private, "my_ip": Self::my_ip(g.gid),
+                    "owner": owner, "joined_s_ago": 0, "members": []
+                })
+            })
             .collect();
         let list: Vec<Value> = st
             .groups
             .iter()
             .map(|g| json!({ "gid": g.gid, "name": g.name, "private": g.private, "mine": false, "online": u32::from(g.joined), "total": u32::from(g.joined) }))
             .collect();
+        // Форма `tunnel_client::snapshot::Snapshot` (её разбирают IpcEngine и
+        // CLI); `name` сверху — для старых проверок ipc_e2e.
+        let srv_key = "00".repeat(32);
         json!({
             "groups": groups,
-            "meta": { "connected": true, "server": "127.0.0.1:7000", "server_label": "fake", "group_list": list },
+            "meta": {
+                "connected": true, "server": "127.0.0.1:7000", "server_label": "fake", "group_list": list,
+                "rx_hist": [], "tx_hist": [], "uptime_s": 0
+            },
             "stats": { "rx_bytes": 0, "tx_bytes": 0, "rx_pkts": 0, "tx_pkts": 0 },
+            "cfg": {
+                "name": st.name, "status": "", "autojoin": [], "friends": [],
+                "servers": [{ "addr": "127.0.0.1:7000", "pubkey": srv_key, "label": "fake" }]
+            },
             "pending_invites": [],
             "name": st.name,
         })

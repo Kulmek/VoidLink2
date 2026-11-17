@@ -6,8 +6,6 @@
 //! не покидают движок. Конструкторы `from_*` строят снимок из внутренних
 //! структур движка (`GroupSess`, `Meta`, `Stats`, `Config`).
 
-#![allow(dead_code)] // подключается при интеграции
-
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -20,6 +18,7 @@ use crate::store::Config;
 
 /// Полный снимок.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Snapshot {
     /// Группы, в которых состоим, по возрастанию gid.
     pub groups: Vec<GroupSnap>,
@@ -132,6 +131,7 @@ impl From<&payloads::GroupSummary> for GroupSummarySnap {
 
 /// Метаданные статус-бара.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MetaSnap {
     pub connected: bool,
     /// Адрес текущего сервера (`ip:port`).
@@ -199,12 +199,16 @@ pub struct CfgFriend {
 /// Конфиг без identity: имя, статус, серверы, друзья, автовход.
 /// Тема — локальная настройка фронтенда, в снимок не входит.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CfgView {
     pub name: String,
     pub status: String,
     pub servers: Vec<CfgServer>,
     pub friends: Vec<CfgFriend>,
     pub autojoin: Vec<u32>,
+    /// Невидимка (`Cmd::SetInvisible`).
+    #[serde(default)]
+    pub invisible: bool,
 }
 
 impl CfgView {
@@ -227,6 +231,34 @@ impl CfgView {
                 .map(|f| CfgFriend { pubkey: f.pubkey.clone(), alias: f.alias.clone() })
                 .collect(),
             autojoin: c.autojoin.clone(),
+            invisible: c.invisible,
+        }
+    }
+
+    /// Обратно в `Config` (без identity и локальных настроек): чтобы
+    /// фронтенд разбирал peer/друга/сервер теми же функциями, что CLI
+    /// (`store::resolve_peer` и т.п.).
+    pub fn to_config(&self) -> Config {
+        Config {
+            name: self.name.clone(),
+            status: self.status.clone(),
+            servers: self
+                .servers
+                .iter()
+                .map(|s| crate::store::StoredServer {
+                    addr: s.addr.clone(),
+                    pubkey: s.pubkey.clone(),
+                    label: s.label.clone(),
+                })
+                .collect(),
+            friends: self
+                .friends
+                .iter()
+                .map(|f| crate::store::StoredFriend { pubkey: f.pubkey.clone(), alias: f.alias.clone() })
+                .collect(),
+            autojoin: self.autojoin.clone(),
+            invisible: self.invisible,
+            ..Config::default()
         }
     }
 }
@@ -290,6 +322,7 @@ mod tests {
                 }],
                 friends: vec![CfgFriend { pubkey: "cd".repeat(32), alias: "bravo".into() }],
                 autojoin: vec![7],
+                invisible: true,
             },
             pending_invites: vec![Invite {
                 gid: 11,
