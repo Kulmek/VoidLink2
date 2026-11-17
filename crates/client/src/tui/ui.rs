@@ -25,6 +25,8 @@ use crate::tui::app::{
     App, ConfirmPopup, Focus, FriendCardPopup, InputPopup, InvitePopup, ListPickPopup, MsgKind,
     PeerPickPopup, Popup, SettingsPopup, SETTING_ROWS, TOOLBAR,
 };
+use crate::tui::badges::{self, BadgeState, ConnState};
+use crate::tui::clock;
 use crate::tui::identicon::Identicon;
 use crate::tui::theme::{Btn, Theme};
 
@@ -652,7 +654,7 @@ fn draw_log(f: &mut Frame, app: &App, th: &Theme, area: Rect, rates: bool) {
                 MsgKind::Error => ("✗", th.error),
             };
             Line::from(vec![
-                Span::styled(format!("{} ", hhmmss(l.at)), th.dim),
+                Span::styled(format!("{} ", clock::format_local(l.wall)), th.dim),
                 Span::styled(format!("{mark} "), style.add_modifier(Modifier::BOLD)),
                 Span::styled(
                     l.text.clone(),
@@ -805,10 +807,6 @@ fn draw_status(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
         Span::raw("  "),
         Span::styled(" IP ", th.chip()),
         Span::styled(format!(" {my_ip} "), th.pill(th.c.accent)),
-        Span::styled(format!("  ◆ {direct}"), th.direct),
-        Span::styled(" direct ", th.dim),
-        Span::styled(format!("◇ {relay}"), th.relay),
-        Span::styled(" relay", th.dim),
         Span::styled(
             format!("  ≡ {}", app.groups.iter().filter(|g| g.mine).count()),
             th.accent,
@@ -824,7 +822,45 @@ fn draw_status(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
         width: area.width - tabs_area.width,
         ..area
     };
-    f.render_widget(Paragraph::new(Line::from(spans)), rest);
+    let left = Line::from(spans);
+    let left_w = (left.width() as u16).min(rest.width);
+    f.render_widget(Paragraph::new(left), rest);
+
+    // Бейджи справа: соединение, приглашения (клик — «o»), невидимка,
+    // транспорт, прямые/релейные пиры.
+    let state = BadgeState {
+        pending_invites: app.pending_invites(),
+        conn: if app.connected { ConnState::Online } else { ConnState::Reconnecting },
+        invisible: app.invisible,
+        transport: app.transport,
+        direct,
+        relay,
+    };
+    let badges_area = Rect {
+        x: rest.x + left_w + 1,
+        width: rest.width.saturating_sub(left_w + 1),
+        ..rest
+    };
+    f.render_widget(Clear, badges_area);
+    f.render_widget(Block::default().style(th.header()), badges_area);
+    let hits = badges::render_badges(f, badges_area, &state, th);
+    app.hits.toolbar.borrow_mut().extend(hits);
+}
+
+/// Сколько осталось до истечения: «6 д», «5 ч», «12 мин».
+fn left_until(t: std::time::Instant) -> String {
+    let s = t.saturating_duration_since(std::time::Instant::now()).as_secs();
+    if s == 0 {
+        "истекло".into()
+    } else if s >= 86_400 {
+        format!("истекает через {} д", s / 86_400)
+    } else if s >= 3600 {
+        format!("истекает через {} ч", s / 3600)
+    } else if s >= 60 {
+        format!("истекает через {} мин", s / 60)
+    } else {
+        "истекает меньше чем через минуту".into()
+    }
 }
 
 // ---------------------------------------------------------------- тосты
@@ -997,6 +1033,9 @@ fn draw_popup(f: &mut Frame, app: &App, th: &Theme, popup: &Popup, area: Rect) {
             open_popup(f, app, rect);
             draw_invite(f, app, th, inv, rect);
         }
+        // Свои рамка и геометрия для мыши — в самих модулях.
+        Popup::Admin(v) => crate::tui::admin::draw(f, th, v, area),
+        Popup::Servers(v) => v.draw(f, th, area),
     }
 }
 
@@ -1303,6 +1342,10 @@ fn draw_settings(f: &mut Frame, app: &App, th: &Theme, s: &SettingsPopup, area: 
             },
         ),
         ("тема".to_string(), app.theme_kind.label().to_string()),
+        (
+            "невидимка".to_string(),
+            if app.invisible { "вкл" } else { "выкл" }.to_string(),
+        ),
     ];
 
     let items: Vec<ListItem> = SETTING_ROWS
@@ -1402,6 +1445,10 @@ fn draw_invite(f: &mut Frame, app: &App, th: &Theme, inv: &InvitePopup, area: Re
         Line::from(vec![
             Span::styled("пришло:  ", th.dim),
             Span::styled(ago(inv.received_at), th.dim),
+            Span::styled(
+                inv.expires_at.map(|t| format!(" · {}", left_until(t))).unwrap_or_default(),
+                th.warn,
+            ),
         ]),
         Line::from(""),
     ];
@@ -1459,18 +1506,22 @@ fn help_lines(th: &Theme) -> Vec<Line<'static>> {
         kv("x", "покинуть группу"),
         kv("i", "пригласить друга в группу"),
         kv("k / b", "исключить / забанить участника"),
+        kv("m · :admin", "управление своей группой: баны, приглашения, владелец"),
         kv("o", "неотвеченные приглашения (отложенные «Позже»)"),
         kv("  в окне", "Enter/y — принять · n — отклонить · Esc — позже"),
         Line::from(""),
         head("Друзья и профиль"),
         kv("a", "добавить друга по friend code"),
         kv("d", "удалить друга (с подтверждением)"),
+        kv("r (в друзьях)", "переименовать друга (:alias друг имя)"),
         kv("c", "скопировать IP / pubkey / friend code"),
         kv("p", "карточка профиля"),
-        kv("F3", "настройки (имя, сервер, автовход, тема)"),
+        kv("F3", "настройки (имя, сервер, автовход, тема, невидимка)"),
+        kv("F4 · :servers", "серверы: переключить, добавить, удалить, адаптер"),
         Line::from(""),
         head("Прочее"),
         kv(":", "командная строка (:help — список)"),
+        kv("раскладка", "хоткеи работают и в русской раскладке"),
         kv("PgUp / PgDn", "прокрутка лога"),
         kv("Ctrl-C", "выход (или :quit)"),
         Line::from(""),
@@ -1510,11 +1561,6 @@ fn ago(t: std::time::Instant) -> String {
         s @ 5..=59 => format!("{s} с назад"),
         s => format!("{} мин назад", s / 60),
     }
-}
-
-fn hhmmss(t: std::time::Instant) -> String {
-    let secs = t.elapsed().as_secs();
-    format!("{:02}:{:02}:{:02}", (secs / 3600) % 24, (secs / 60) % 60, secs % 60)
 }
 
 // ---------------------------------------------------------------- тесты
@@ -1812,6 +1858,7 @@ mod tests {
             from_name: "bravo-srv".into(),
             from_pubkey: [2; 32],
             received_at: std::time::Instant::now(),
+            expires_at: None,
             shown_at: None,
         }));
         let s = frame(&app, 140, 40);
@@ -1859,6 +1906,7 @@ mod tests {
             from_name: "bravo-srv".into(),
             from_pubkey: [2; 32],
             received_at: std::time::Instant::now(),
+            expires_at: None,
             shown_at: None,
         }));
         app.toasts.clear();
@@ -1979,6 +2027,7 @@ mod tests {
                     from_name: "bravo-srv".into(),
                     from_pubkey: [2; 32],
                     received_at: std::time::Instant::now(),
+                    expires_at: Some(std::time::Instant::now() + std::time::Duration::from_secs(6 * 86_400 + 60)),
                     shown_at: None,
                 }),
                 true,
@@ -2204,5 +2253,198 @@ mod tests {
             assert_eq!(buf[(x, y)].bg, c.sel_bg, "{kind:?}");
             assert_eq!(buf[(x, y)].fg, c.sel_fg, "{kind:?}");
         }
+    }
+
+    // ---------- экраны «Управление группой» и «Серверы» ----------
+
+    mod screens {
+        use super::demo_app;
+        use crate::engine::Cmd;
+        use crate::store::{Config, StoredServer};
+        use crate::tui::app::{App, Popup};
+        use crate::tui::{admin, ui::draw};
+        use ratatui::backend::TestBackend;
+        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::Terminal;
+        use tunnel_protocol as proto;
+
+        fn frame(app: &App, w: u16, h: u16) -> Vec<Vec<char>> {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| draw(f, app)).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..h)
+                .map(|y| {
+                    (0..w)
+                        .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                        .collect()
+                })
+                .collect()
+        }
+
+        fn find(screen: &[Vec<char>], text: &str) -> (u16, u16) {
+            let pat: Vec<char> = text.chars().collect();
+            for (y, row) in screen.iter().enumerate() {
+                for x in 0..row.len().saturating_sub(pat.len() - 1) {
+                    if row[x..x + pat.len()] == pat[..] {
+                        return (x as u16, y as u16);
+                    }
+                }
+            }
+            panic!("на экране нет «{text}»");
+        }
+
+        fn text(screen: &[Vec<char>]) -> String {
+            screen.iter().map(|r| r.iter().collect::<String>() + "\n").collect()
+        }
+
+        fn click(x: u16, y: u16) -> MouseEvent {
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: x,
+                row: y,
+                modifiers: KeyModifiers::NONE,
+            }
+        }
+
+        /// Клик по экрану управления (как `App::handle_mouse` для него).
+        fn admin_click(app: &mut App, x: u16, y: u16) -> Vec<Cmd> {
+            let act = match app.stack.last_mut() {
+                Some(Popup::Admin(v)) => admin::handle_mouse(v, click(x, y)),
+                _ => panic!("экран управления не открыт"),
+            };
+            app.admin_apply(act)
+        }
+
+        #[test]
+        fn управление_группой_рисуется_и_кликается() {
+            let mut app = demo_app();
+            assert!(matches!(app.open_admin(), Some(Cmd::GroupAdmin(1))));
+            app.on_admin_info(1, vec![([3; 32], "charlie".into())], vec![([4; 32], "delta".into(), 7200)]);
+            let s = frame(&app, 140, 40);
+            let t = text(&s);
+            assert!(t.contains("Управление группой «gamers»") && t.contains("charlie"), "{t}");
+
+            // Клик по кнопке «Разбанить» = Enter на выбранной строке.
+            let (x, y) = find(&s, "Разбанить (Enter)");
+            let cmds = admin_click(&mut app, x + 1, y);
+            assert!(matches!(cmds[..], [Cmd::Unban(1, pk), Cmd::GroupAdmin(1)] if pk == [3; 32]), "{cmds:?}");
+
+            // Вкладка «Приглашения» кликом, затем «Отозвать».
+            let (x, y) = find(&s, "Приглашения");
+            assert!(admin_click(&mut app, x + 1, y).is_empty());
+            let s = frame(&app, 140, 40);
+            assert!(text(&s).contains("delta"));
+            let (x, y) = find(&s, "Отозвать приглашение (Enter)");
+            let cmds = admin_click(&mut app, x + 1, y);
+            assert!(matches!(cmds[..], [Cmd::Kick(1, pk), Cmd::GroupAdmin(1)] if pk == [4; 32]), "{cmds:?}");
+
+            // Клик мимо окна — закрыть.
+            assert!(admin_click(&mut app, 0, 0).is_empty());
+            assert!(app.stack.is_empty());
+        }
+
+        #[test]
+        fn серверы_рисуются_и_переключаются_кликом() {
+            let mut app = demo_app();
+            let mut cfg = Config::default();
+            cfg.servers = vec![
+                StoredServer { addr: "127.0.0.1:5599".into(), pubkey: proto::hex_of(&[1; 32]), label: "дом".into() },
+                StoredServer { addr: "127.0.0.9:5601".into(), pubkey: proto::hex_of(&[2; 32]), label: "офис".into() },
+            ];
+            app.open_servers_with(&cfg);
+            let s = frame(&app, 140, 40);
+            let t = text(&s);
+            assert!(t.contains("127.0.0.1:5599") && t.contains("127.0.0.9:5601"), "{t}");
+
+            // Первый клик по строке выбирает, второй — переключает.
+            let (x, y) = find(&s, "127.0.0.9:5601");
+            let mut act = None;
+            for _ in 0..2 {
+                act = match app.stack.last_mut() {
+                    Some(Popup::Servers(v)) => v.handle_mouse(MouseEventKind::Down(MouseButton::Left), x, y),
+                    _ => panic!("экран серверов не открыт"),
+                };
+            }
+            let (cmd, save) = app.servers_apply(act.expect("переключение"), &mut cfg);
+            assert!(!save);
+            assert!(matches!(cmd, Some(Cmd::SwitchServer { addr, .. }) if addr.to_string() == "127.0.0.9:5601"));
+        }
+
+        #[test]
+        fn справка_знает_про_новые_экраны() {
+            let mut app = demo_app();
+            app.stack.push(Popup::Help);
+            let t = text(&frame(&app, 140, 50));
+            assert!(t.contains(":admin") && t.contains(":servers"), "{t}");
+        }
+    }
+
+    #[test]
+    fn статус_бар_бейджи_и_клик_по_приглашениям() {
+        let mut app = demo_app();
+        app.toasts.clear();
+        app.connected = true;
+        app.invisible = true;
+        app.later_invites.push(InvitePopup {
+            gid: 9,
+            group_name: "x".into(),
+            from_name: "y".into(),
+            from_pubkey: [5; 32],
+            received_at: std::time::Instant::now(),
+            expires_at: None,
+            shown_at: None,
+        });
+        let s = frame(&app, 200, 40);
+        let last: String = s[39].iter().collect();
+        assert!(last.contains("В сети"), "{last}");
+        assert!(last.contains("✦ 1"), "{last}");
+        assert!(last.contains("невидимка"), "{last}");
+        assert!(last.contains("UDP"), "{last}");
+        assert!(last.contains("◆ 1 прямых") && last.contains("◇ 0 через релей"), "{last}");
+        // Клик по бейджу приглашений — клавиша «o».
+        let (x, y) = find(&s, "✦ 1", 0);
+        assert_eq!(app.hit(x, y), Hit::Key(k(KeyCode::Char('o'))));
+        // Без связи — «Переподключение», без приглашений бейджа нет.
+        app.connected = false;
+        app.later_invites.clear();
+        let s = frame(&app, 200, 40);
+        let last: String = s[39].iter().collect();
+        assert!(last.contains("Переподключение") && !last.contains('✦'), "{last}");
+        // Узко — не паникует.
+        let _ = frame(&app, 40, 20);
+    }
+
+    #[test]
+    fn окно_приглашения_показывает_срок() {
+        let mut app = demo_app();
+        app.toasts.clear();
+        app.stack.push(Popup::Invite(InvitePopup {
+            gid: 2,
+            group_name: "secret".into(),
+            from_name: "bravo-srv".into(),
+            from_pubkey: [2; 32],
+            received_at: std::time::Instant::now(),
+            expires_at: Some(
+                std::time::Instant::now() + std::time::Duration::from_secs(6 * 86_400 + 600),
+            ),
+            shown_at: None,
+        }));
+        let text = render(&app, 120, 40);
+        assert!(text.contains("истекает через 6 д"), "{text}");
+    }
+
+    #[test]
+    fn лог_с_локальным_временем_и_невидимка_в_настройках() {
+        let mut app = demo_app();
+        app.toasts.clear();
+        app.log.clear();
+        app.log(MsgKind::Info, "запись".into());
+        let want = clock::format_local(app.log[0].wall);
+        let text = render(&app, 120, 40);
+        assert!(text.contains(&format!("{want} · запись")), "{text}");
+        app.stack.push(Popup::Settings(SettingsPopup { sel: 0 }));
+        app.invisible = true;
+        let text = render(&app, 120, 40);
+        assert!(text.contains("невидимка") && text.contains("вкл"), "{text}");
     }
 }

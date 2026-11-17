@@ -59,6 +59,34 @@ pub struct Config {
     /// и при смене сервера чужие gid вошли бы в посторонние группы.
     #[serde(default)]
     pub autojoin_by_server: BTreeMap<String, Vec<u32>>,
+    /// Встроенный DNS для имён пиров (`<member>.vl`, `<member>.<group>.vl`
+    /// на 100.66.0.53) и настройка split-DNS ОС для `.vl`.
+    #[serde(default = "default_true")]
+    pub dns: bool,
+    /// Транспорт до сервера: auto (UDP, при молчании — TCP) | udp | tcp.
+    #[serde(default)]
+    pub transport: TransportMode,
+    /// Имя Wintun-адаптера (экран «Серверы» TUI; пусто — по умолчанию,
+    /// флаг `--adapter` важнее). Применяется после перезапуска.
+    #[serde(default)]
+    pub adapter: String,
+    /// Путь к `wintun.dll` (пусто — рядом с exe или из PATH; флаг `--dll`
+    /// важнее). Применяется после перезапуска.
+    #[serde(default)]
+    pub dll: String,
+}
+
+/// Выбор транспорта до сервера.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransportMode {
+    /// UDP, а если рукопожатие не отвечает (`tcp_link::should_fallback`) — TCP.
+    #[default]
+    Auto,
+    /// Только UDP.
+    Udp,
+    /// Только TCP (сервер — по TCP, p2p с пирами — всё равно UDP).
+    Tcp,
 }
 
 impl Default for Config {
@@ -76,6 +104,10 @@ impl Default for Config {
             invisible: false,
             active_server: String::new(),
             autojoin_by_server: BTreeMap::new(),
+            dns: true,
+            transport: TransportMode::Auto,
+            adapter: String::new(),
+            dll: String::new(),
         }
     }
 }

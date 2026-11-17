@@ -65,6 +65,10 @@ impl Peer {
 /// Обработчик входящего кадра: TCP-клиент (`Peer::Tcp`) и сам кадр (без рамки).
 pub type FrameHandler = Arc<dyn Fn(Peer, &[u8]) + Send + Sync>;
 
+/// Обработчик закрытия соединения (EOF, простой, ошибка, нарушение формата).
+/// Не вызывается для соединений, закрытых через `TcpSender::close` или `stop`.
+pub type CloseHandler = Arc<dyn Fn(Peer) + Send + Sync>;
+
 /// Максимальный размер кадра по умолчанию (v3: payload'ы режутся FRAG по 1100 байт).
 pub const DEFAULT_MAX_FRAME: usize = 4096;
 
@@ -119,13 +123,16 @@ struct Registry {
 impl Registry {
     /// Убрать соединение `peer`, только если это всё ещё соединение `id`
     /// (адрес мог уже переиспользоваться новым), и закрыть его сокет.
-    fn remove_if(&self, peer: SocketAddr, id: u64) {
+    /// `true` — запись была этой и убрана.
+    fn remove_if(&self, peer: SocketAddr, id: u64) -> bool {
         let mut conns = self.conns.lock().unwrap();
         if conns.get(&peer).is_some_and(|c| c.id == id)
             && let Some(c) = conns.remove(&peer)
         {
             let _ = c.stream.shutdown(Shutdown::Both);
+            return true;
         }
+        false
     }
 }
 
@@ -195,6 +202,16 @@ pub struct TcpTransport {
 impl TcpTransport {
     /// Слушать `listen`, отдавать входящие кадры в `handler`.
     pub fn start(listen: SocketAddr, handler: FrameHandler, limits: TcpLimits) -> io::Result<Self> {
+        Self::start_with_close(listen, handler, Arc::new(|_| {}), limits)
+    }
+
+    /// Как `start`, плюс `on_close` при закрытии соединения клиентом/по простою.
+    pub fn start_with_close(
+        listen: SocketAddr,
+        handler: FrameHandler,
+        on_close: CloseHandler,
+        limits: TcpLimits,
+    ) -> io::Result<Self> {
         let listener = TcpListener::bind(listen)?;
         // Неблокирующий слушатель: stop не зависит от «самоподключения».
         listener.set_nonblocking(true)?;
@@ -212,7 +229,7 @@ impl TcpTransport {
             let stop = stop.clone();
             thread::Builder::new()
                 .name("tcp-accept".into())
-                .spawn(move || accept_loop(listener, sender, handler, limits, stop))?
+                .spawn(move || accept_loop(listener, sender, handler, on_close, limits, stop))?
         };
         Ok(TcpTransport {
             local_addr,
@@ -254,6 +271,7 @@ fn accept_loop(
     listener: TcpListener,
     sender: TcpSender,
     handler: FrameHandler,
+    on_close: CloseHandler,
     limits: TcpLimits,
     stop: Arc<AtomicBool>,
 ) {
@@ -265,7 +283,7 @@ fn accept_loop(
                     continue;
                 }
                 // Превышение лимитов и ошибки сокета — молча.
-                let _ = admit(stream, peer, &sender, &handler, &limits);
+                let _ = admit(stream, peer, &sender, &handler, &on_close, &limits);
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => thread::sleep(ACCEPT_POLL),
             // Например, EMFILE: не крутим цикл вхолостую.
@@ -282,6 +300,7 @@ fn admit(
     peer: SocketAddr,
     sender: &TcpSender,
     handler: &FrameHandler,
+    on_close: &CloseHandler,
     limits: &TcpLimits,
 ) -> io::Result<()> {
     stream.set_nodelay(true)?;
@@ -313,13 +332,16 @@ fn admit(
 
     let reader_reg = reg.clone();
     let handler = handler.clone();
+    let on_close = on_close.clone();
     let max_frame = limits.max_frame;
     let idle = limits.idle_timeout;
     let spawned = thread::Builder::new().name("tcp-reader".into()).spawn(move || {
         reader_loop(reader_stream, peer, max_frame, idle, &handler);
         // Закрытие: запись реестра сбрасывается вместе с отправителем очереди —
         // писатель выйдет.
-        reader_reg.remove_if(peer, id);
+        if reader_reg.remove_if(peer, id) {
+            on_close(Peer::Tcp(peer));
+        }
     });
     if let Err(e) = spawned {
         // Убираем запись: отправитель очереди сброшен, писатель завершится.
@@ -481,6 +503,22 @@ mod tests {
 
         drop(c);
         assert!(wait_until(|| !s.is_live(addr)), "закрытое соединение убрано из реестра");
+    }
+
+    #[test]
+    fn close_handler_called_on_eof() {
+        let (h, _rx) = collector();
+        let (ctx, crx) = mpsc::channel();
+        let ctx = Mutex::new(ctx);
+        let on_close: CloseHandler = Arc::new(move |p| {
+            let _ = ctx.lock().unwrap().send(p);
+        });
+        let t = TcpTransport::start_with_close(loopback(), h, on_close, TcpLimits::default()).unwrap();
+        let c = TcpStream::connect(t.local_addr()).unwrap();
+        let me = c.local_addr().unwrap();
+        assert!(wait_until(|| t.sender().conn_count() == 1));
+        drop(c);
+        assert_eq!(crx.recv_timeout(Duration::from_secs(3)).unwrap(), Peer::Tcp(me));
     }
 
     #[test]

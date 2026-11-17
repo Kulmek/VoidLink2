@@ -40,8 +40,8 @@ pub mod tcp;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -60,6 +60,8 @@ const GID_MAX: u32 = 254; // 100.66.<gid>.0/24
 const HOST_MIN: u32 = 2;
 const HOST_MAX: u32 = 254;
 const HOUSEKEEPING_EVERY: Duration = Duration::from_secs(2);
+/// Пауза между LEAVE и повторным JOIN той же identity в ту же группу.
+const REJOIN_COOLDOWN: Duration = Duration::from_secs(3);
 const SAVE_EVERY: Duration = Duration::from_secs(3);
 /// Срочное сохранение (кик, бан, выход, удаление…) — не чаще этого: поток
 /// таких команд не превращается в поток записей на диск.
@@ -68,13 +70,9 @@ const URGENT_SAVE_GAP: Duration = Duration::from_millis(200);
 /// `SAVE_EVERY`, и после падения сервера номера, уже выданные клиентам с
 /// другим ключом, иначе выдавались бы снова (раздел 5: номера только растут).
 const LOAD_MARGIN: u32 = 1 << 16;
-/// Приглашений и банов на группу: без предела любой владелец раздувал бы
-/// server.json (переписывается раз в 3 с) и списки, которые сервер
-/// обходит постоянно.
-const MAX_INVITES_PER_GROUP: usize = 64;
-const MAX_BANS_PER_GROUP: usize = 256;
-/// Лимитер HELLO по IP: шардов и записей в шарде (новые адреса сверх —
-/// без ответа, пока housekeeping не забудет молчащие).
+/// Лимитер HELLO по IP: шардов и записей в шарде. Переполненный шард
+/// сначала выбрасывает восполнившиеся корзины (без потери состояния: новая
+/// корзина та же), и только если таких нет — новым адресам отказ.
 const IP_SHARDS: usize = 16;
 const IP_SHARD_MAX: usize = 4096;
 const STATS_EVERY: Duration = Duration::from_secs(300);
@@ -90,6 +88,16 @@ const GROUP_NAME_MAX_CHARS: usize = 48;
 /// последнего).
 const INVITES_PER_LIST: usize = 16;
 /// Ответ на v2 HELLO и HELLO3 другой версии.
+/// Повтор WELCOME на повтор HELLO3 той же попытки — не чаще (клиент
+/// повторяет HELLO3 раз в секунду): поток перехваченных HELLO3 с адреса
+/// жертвы даёт ей не больше двух WELCOME в секунду.
+const WELCOME_RESEND_GAP: Duration = Duration::from_millis(500);
+/// Сколько помнится `(ed_pub, eph_pub)` закрытой сессии: дольше срока
+/// cookie (текущий и предыдущий bucket — до 60 с) с запасом на часы.
+const RETIRED_EPH_TTL: Duration = Duration::from_secs(2 * hs::COOKIE_BUCKET_SECS + 5);
+/// Порог, после которого `retired_eph` чистится от истёкших записей.
+const RETIRED_EPH_PURGE: usize = 256;
+
 const UNSUPPORTED_TEXT: &str = "сервер VoidLink v3: обновите клиент";
 
 // ---------- конфигурация и запуск ----------
@@ -123,6 +131,14 @@ pub struct Limits {
     pub max_owned_groups: usize,
     /// Срок жизни приглашения.
     pub invite_ttl: Duration,
+    /// Приглашений и банов на группу: без предела любой владелец раздувал бы
+    /// server.json (переписывается раз в 3 с) и списки, которые сервер
+    /// обходит постоянно.
+    pub max_invites_per_group: usize,
+    pub max_bans_per_group: usize,
+    /// Живых приглашений на одну цель по всем группам: иначе владельцы
+    /// множества групп заваливали бы одну identity окнами приглашений.
+    pub max_invites_per_target: usize,
 }
 
 impl Default for Limits {
@@ -141,6 +157,9 @@ impl Default for Limits {
             session_timeout: Duration::from_secs(30),
             max_owned_groups: 16,
             invite_ttl: Duration::from_secs(7 * 24 * 3600),
+            max_invites_per_group: 256,
+            max_bans_per_group: 1024,
+            max_invites_per_target: 64,
         }
     }
 }
@@ -153,6 +172,10 @@ pub struct Config {
     /// Не печатать события (для тестов).
     pub quiet: bool,
     pub limits: Limits,
+    /// TCP-фолбэк на том же порту, что и UDP (`--tcp` / `--no-tcp`).
+    pub tcp: bool,
+    /// Адрес HTTP-эндпоинта метрик (`--metrics`); `None` — выключен.
+    pub metrics: Option<SocketAddr>,
 }
 
 impl Default for Config {
@@ -163,9 +186,14 @@ impl Default for Config {
             workers: 0,
             quiet: false,
             limits: Limits::default(),
+            tcp: true,
+            metrics: None,
         }
     }
 }
+
+/// Health: housekeeping не отмечался дольше этого — сервер «завис».
+const HEALTH_TICK_MAX: Duration = Duration::from_secs(10);
 
 /// Запущенный сервер. Останавливается через [`Server::stop`] или при drop.
 pub struct Server {
@@ -173,8 +201,14 @@ pub struct Server {
     /// Friend code сервера (клиент пиннит его ed25519-ключ).
     pub code: String,
     pub pubkey: [u8; 32],
+    /// Адрес TCP-фолбэка (тот же порт, что UDP), если он включён и занялся.
+    pub tcp_addr: Option<SocketAddr>,
+    /// Адрес эндпоинта метрик, если включён.
+    pub metrics_addr: Option<SocketAddr>,
     shared: Arc<Shared>,
     threads: Vec<JoinHandle<()>>,
+    tcp: Option<tcp::TcpTransport>,
+    metrics_srv: Option<metrics::MetricsServer>,
 }
 
 impl Server {
@@ -203,6 +237,7 @@ impl Server {
                 groups: loaded.groups,
                 next_gid: loaded.next_gid,
                 invite_ttl_ms: duration_ms(cfg.limits.invite_ttl),
+                retired_eph: HashMap::new(),
             }),
             identity: loaded.identity,
             links: loaded.links,
@@ -222,6 +257,11 @@ impl Server {
             rotated: Mutex::new(None),
             relayed: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
+            metrics: metrics::Metrics::new(),
+            tcp: OnceLock::new(),
+            alive: AtomicUsize::new(0),
+            expected_threads: AtomicUsize::new(usize::MAX),
+            last_tick: AtomicU64::new(0),
         });
         if !cfg.quiet {
             if fresh {
@@ -248,30 +288,89 @@ impl Server {
             cfg.workers
         };
         let mut threads = Vec::new();
+        shared.expected_threads.store(workers + 1, Ordering::Relaxed);
         for i in 0..workers {
             let sh = shared.clone();
+            sh.alive.fetch_add(1, Ordering::Relaxed);
             threads.push(
                 thread::Builder::new()
                     .name(format!("worker-{i}"))
-                    .spawn(move || worker(sh))?,
+                    .spawn(move || {
+                        let _alive = Alive(&sh.alive);
+                        worker(sh.clone())
+                    })?,
             );
         }
         {
             let sh = shared.clone();
+            sh.alive.fetch_add(1, Ordering::Relaxed);
             threads.push(
                 thread::Builder::new()
                     .name("housekeeping".into())
-                    .spawn(move || housekeeping(sh))?,
+                    .spawn(move || {
+                        let _alive = Alive(&sh.alive);
+                        housekeeping(sh.clone())
+                    })?,
             );
         }
+        // TCP-фолбэк на том же порту: кадры идут тем же путём, что UDP, а
+        // источником сессии считается адрес TCP-соединения.
+        let tcp = if cfg.tcp {
+            let on_frame: tcp::FrameHandler = {
+                let sh = shared.clone();
+                Arc::new(move |peer, frame| handle_datagram(&sh, peer.addr(), frame))
+            };
+            let on_close: tcp::CloseHandler = {
+                let sh = shared.clone();
+                Arc::new(move |peer| drop_session_at(&sh, peer.addr()))
+            };
+            match tcp::TcpTransport::start_with_close(addr, on_frame, on_close, tcp::TcpLimits::default()) {
+                Ok(t) => {
+                    let _ = shared.tcp.set(t.sender());
+                    Some(t)
+                }
+                Err(e) => {
+                    eprintln!("[server] TCP {addr}: {e} — работаю только по UDP");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let tcp_addr = tcp.as_ref().map(|t| t.local_addr());
+        let metrics_srv = match cfg.metrics {
+            Some(maddr) => {
+                let health: metrics::HealthFn = {
+                    let sh = shared.clone();
+                    Arc::new(move || healthy(&sh))
+                };
+                let refresh: metrics::RefreshFn = {
+                    let sh = shared.clone();
+                    Arc::new(move || refresh_gauges(&sh))
+                };
+                Some(metrics::MetricsServer::start_with_refresh(maddr, shared.metrics.clone(), health, refresh)?)
+            }
+            None => None,
+        };
+        let metrics_addr = metrics_srv.as_ref().map(|m| m.local_addr());
         shared.log(format!("listening on {addr}, воркеров: {workers}"));
+        if let Some(t) = tcp_addr {
+            shared.log(format!("TCP-фолбэк на {t}"));
+        }
+        if let Some(m) = metrics_addr {
+            shared.log(format!("метрики: http://{m}/metrics"));
+        }
         shared.log(format!("Server code: {code}"));
         Ok(Server {
             addr,
             code,
             pubkey,
+            tcp_addr,
+            metrics_addr,
             shared,
             threads,
+            tcp,
+            metrics_srv,
         })
     }
 
@@ -290,6 +389,13 @@ impl Server {
     fn shutdown(&mut self) {
         self.shared.stop.store(true, Ordering::Relaxed);
         self.shared.urgent.1.notify_all();
+        if let Some(m) = self.metrics_srv.take() {
+            m.stop();
+        }
+        // TCP — раньше воркеров: читатели соединений тоже вызывают обработку.
+        if let Some(mut t) = self.tcp.take() {
+            t.stop();
+        }
         for t in self.threads.drain(..) {
             let _ = t.join();
         }
@@ -385,6 +491,30 @@ impl Bucket {
             false
         }
     }
+
+    /// Запас уже восполнился до `burst`: такая корзина неотличима от новой,
+    /// её можно забыть без ослабления лимита.
+    fn refilled(&self, rate: f64, burst: f64, now: Instant) -> bool {
+        self.tokens + now.saturating_duration_since(self.last).as_secs_f64() * rate >= burst
+    }
+}
+
+/// Жетон лимитера HELLO из шарда `m` для ключа `key`. Шард с `cap`
+/// записями чистится от восполнившихся корзин; не помогло — отказ новому
+/// адресу (поток с подменой адресов не раздувает карту и не вытесняет
+/// корзины тех, кто реально исчерпал запас).
+fn ip_take(m: &mut HashMap<IpAddr, Bucket>, key: IpAddr, rate: f64, burst: f64, cap: usize) -> bool {
+    if let Some(b) = m.get_mut(&key) {
+        return b.take(rate, burst);
+    }
+    if m.len() >= cap {
+        let now = Instant::now();
+        m.retain(|_, b| !b.refilled(rate, burst, now));
+        if m.len() >= cap {
+            return false;
+        }
+    }
+    m.entry(key).or_insert_with(|| Bucket::new(burst)).take(rate, burst)
 }
 
 struct Session {
@@ -397,6 +527,9 @@ struct Session {
     keys: proto::DirKeys,
     /// Готовый WELCOME этой сессии: повтор HELLO3 получает его же.
     welcome: Vec<u8>,
+    /// Когда WELCOME уходил последний раз, мс от старта сервера
+    /// (`WELCOME_RESEND_GAP`).
+    welcome_at: AtomicU64,
     /// Счётчик nonce s2c (с 0, строго растёт; атомарный — шифруют и
     /// воркеры под блокировкой на чтение).
     tx: AtomicU64,
@@ -448,6 +581,9 @@ struct Group {
     invites: HashMap<[u8; 32], Invite>,
     /// Лимит входов не-участников (`Limits::join_rate`), не сохраняется.
     joins: Bucket,
+    /// Недавно вышедшие (LEAVE) → когда: повторный вход без приглашения —
+    /// не раньше `REJOIN_COOLDOWN`. Не сохраняется.
+    left: HashMap<[u8; 32], Instant>,
 }
 
 impl Group {
@@ -500,6 +636,10 @@ struct State {
     next_gid: u32,
     /// `Limits::invite_ttl` в мс (нужен почти всем спискам приглашений).
     invite_ttl_ms: u64,
+    /// `(ed_pub, eph_pub)` закрытых сессий → когда закрыта. HELLO3 с таким
+    /// ключом (старая попытка клиента, повторённая в пределах срока cookie)
+    /// игнорируется: иначе он пересоздавал бы живую сессию.
+    retired_eph: HashMap<([u8; 32], [u8; 32]), Instant>,
 }
 
 impl State {
@@ -518,7 +658,18 @@ impl State {
         if self.by_pub.get(&ses.ed_pub) == Some(addr) {
             self.by_pub.remove(&ses.ed_pub);
         }
+        let now = Instant::now();
+        if self.retired_eph.len() >= RETIRED_EPH_PURGE {
+            self.retired_eph.retain(|_, t| now.duration_since(*t) < RETIRED_EPH_TTL);
+        }
+        self.retired_eph.insert((ses.ed_pub, ses.eph_pub), now);
         Some(ses)
+    }
+
+    /// Эфемерный ключ закрытой сессии этой identity, cookie под него ещё
+    /// может быть жив.
+    fn eph_retired(&self, ed: &[u8; 32], eph: &[u8; 32]) -> bool {
+        self.retired_eph.get(&(*ed, *eph)).is_some_and(|t| t.elapsed() < RETIRED_EPH_TTL)
     }
 
     fn groups_of(&self, pk: &[u8; 32]) -> Vec<u32> {
@@ -593,6 +744,59 @@ struct Shared {
     rotated: Mutex<Option<persist::PKey>>,
     relayed: AtomicU64,
     dropped: AtomicU64,
+    /// Счётчики для `/metrics`.
+    metrics: Arc<metrics::Metrics>,
+    /// Реестр TCP-клиентов (если TCP-фолбэк включён).
+    tcp: OnceLock<tcp::TcpSender>,
+    /// Живых потоков (воркеры + housekeeping) и сколько их должно быть.
+    alive: AtomicUsize,
+    expected_threads: AtomicUsize,
+    /// `now_ms` последнего прохода housekeeping.
+    last_tick: AtomicU64,
+}
+
+/// Учёт живого потока: декремент при выходе, в том числе по панике.
+struct Alive<'a>(&'a AtomicUsize);
+
+impl Drop for Alive<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// `/healthz`: все потоки живы, housekeeping недавно отмечался.
+fn healthy(sh: &Shared) -> bool {
+    !sh.stop.load(Ordering::Relaxed)
+        && sh.alive.load(Ordering::Relaxed) == sh.expected_threads.load(Ordering::Relaxed)
+        && sh.now_ms().saturating_sub(sh.last_tick.load(Ordering::Relaxed)) < duration_ms(HEALTH_TICK_MAX)
+}
+
+/// Датчики метрик — из авторитетного состояния.
+fn refresh_gauges(sh: &Shared) {
+    let now = unix_ms();
+    let s = sh.state.read().unwrap();
+    let m = &sh.metrics;
+    metrics::Metrics::set(&m.sessions, s.sessions.len() as u64);
+    metrics::Metrics::set(&m.groups, s.groups.len() as u64);
+    metrics::Metrics::set(&m.members, s.groups.values().map(|g| g.members.len() as u64).sum());
+    let pending = s.groups.values().flat_map(|g| g.invites.values()).filter(|i| s.invite_live(i, now)).count();
+    metrics::Metrics::set(&m.invites_pending, pending as u64);
+}
+
+/// TCP-соединение закрылось: его сессия — офлайн сразу, не по таймауту.
+fn drop_session_at(sh: &Shared, addr: SocketAddr) {
+    let mut out = Outbox::new();
+    {
+        let mut s = sh.state.write().unwrap();
+        let Some(ses) = s.remove_session(&addr) else { return };
+        sh.log(format!("offline: {} ({}) — TCP закрыт", ses.name, short(&ses.ed_pub)));
+        if !s.online(&ses.ed_pub) {
+            member_changed(&mut s, &ses.ed_pub, &mut out);
+        }
+    }
+    sh.list_dirty.store(true, Ordering::Relaxed);
+    sh.dirty.store(true, Ordering::Relaxed);
+    sh.flush(out);
 }
 
 impl Shared {
@@ -608,6 +812,22 @@ impl Shared {
 
     fn drop_frame(&self) {
         self.dropped.fetch_add(1, Ordering::Relaxed);
+        metrics::Metrics::inc(&self.metrics.dropped_frames, 1);
+    }
+
+    /// Единственный путь датаграммы клиенту: адрес живого TCP-клиента —
+    /// через реестр TCP, остальное — UDP.
+    fn send_to(&self, frame: &[u8], addr: SocketAddr) {
+        if let Some(t) = self.tcp.get() {
+            let peer = tcp::Peer::Tcp(addr);
+            if t.is_live(peer) {
+                if !t.send(peer, frame) {
+                    self.drop_frame();
+                }
+                return;
+            }
+        }
+        let _ = self.sock.send_to(frame, addr);
     }
 
     /// Жетон лимита HELLO для адреса. IPv6 считается по /64: у одного
@@ -618,14 +838,7 @@ impl Shared {
         let (rate, burst) = (self.limits.hello_rate, self.limits.hello_burst);
         let key = ip_key(ip);
         let shard = self.ip_hash.hash_one(key) as usize % IP_SHARDS;
-        let mut m = self.per_ip[shard].lock().unwrap();
-        if let Some(b) = m.get_mut(&key) {
-            return b.take(rate, burst);
-        }
-        if m.len() >= IP_SHARD_MAX {
-            return false;
-        }
-        m.entry(key).or_insert_with(|| Bucket::new(burst)).take(rate, burst)
+        ip_take(&mut self.per_ip[shard].lock().unwrap(), key, rate, burst, IP_SHARD_MAX)
     }
 
     /// Жетон общего бюджета открытых ответов.
@@ -642,7 +855,7 @@ impl Shared {
 
     fn flush(&self, out: Outbox) {
         for (addr, frame) in out {
-            let _ = self.sock.send_to(&frame, addr);
+            self.send_to(&frame, addr);
         }
     }
 
@@ -654,7 +867,7 @@ impl Shared {
             self.drop_frame();
             return;
         }
-        let _ = self.sock.send_to(&proto::plain_frame(typ, body), addr);
+        self.send_to(&proto::plain_frame(typ, body), addr);
     }
 }
 
@@ -800,6 +1013,7 @@ fn load_state(store: &persist::Store) -> Result<Loaded> {
             banned,
             invites,
             joins: Bucket::full(),
+            left: HashMap::new(),
         };
         for (k, ip) in g.members {
             if let Ok(pk) = unhex(&k) {
@@ -951,6 +1165,7 @@ fn housekeeping(sh: Arc<Shared>) {
     let mut last_stats = Instant::now();
     let mut last_relayed = 0u64;
     while !sh.stop.load(Ordering::Relaxed) {
+        sh.last_tick.store(sh.now_ms(), Ordering::Relaxed);
         let left = HOUSEKEEPING_EVERY.saturating_sub(last_tick.elapsed());
         if wait_urgent(&sh, left) {
             // Срочное — сразу, но не чаще URGENT_SAVE_GAP.
@@ -967,12 +1182,15 @@ fn housekeeping(sh: Arc<Shared>) {
         last_tick = Instant::now();
         expire_sessions(&sh);
         expire_invites(&sh);
+        refresh_gauges(&sh);
         if sh.list_dirty.swap(false, Ordering::Relaxed) {
             broadcast_group_list(&sh);
         }
-        // Лимитер по IP: забыть давно молчащих.
+        // Лимитер по IP: забыть восполнившиеся корзины (раньше — не
+        // сбрасывать запас исчерпавшим его, даже при медленном `hello_rate`).
+        let (rate, burst, now) = (sh.limits.hello_rate, sh.limits.hello_burst, Instant::now());
         for shard in &sh.per_ip {
-            shard.lock().unwrap().retain(|_, b| b.last.elapsed() < Duration::from_secs(60));
+            shard.lock().unwrap().retain(|_, b| !b.refilled(rate, burst, now));
         }
         if last_save.elapsed() >= SAVE_EVERY {
             last_save = Instant::now();
@@ -1106,6 +1324,7 @@ fn handle_datagram(sh: &Shared, src: SocketAddr, datagram: &[u8]) {
             sh.drop_frame();
             return;
         }
+        metrics::Metrics::inc(&sh.metrics.hello_total, 1);
         if typ == ctrl::HELLO {
             // v2: тело не разбирается; ответ — не длиннее запроса.
             match unsupported_body(datagram.len()) {
@@ -1165,7 +1384,8 @@ fn relay_group(sh: &Shared, src: SocketAddr, datagram: &[u8]) {
         addr
     };
     sh.relayed.fetch_add(1, Ordering::Relaxed);
-    let _ = sh.sock.send_to(datagram, target);
+    sh.metrics.relayed(datagram.len());
+    sh.send_to(datagram, target);
 }
 
 // ---------- отправка ----------
@@ -1502,6 +1722,7 @@ fn handle_hello3(sh: &Shared, src: SocketAddr, body: &[u8]) {
     let now = hs::unix_now();
     let cookie_ok = h.cookie.as_ref().is_some_and(|c| sh.cookies.verify(src, &h.eph_pub, c, now));
     if !cookie_ok {
+        metrics::Metrics::inc(&sh.metrics.challenge_total, 1);
         sh.send_plain(src, ctrl::CHALLENGE, &hs::enc_challenge(&sh.cookies.make(src, &h.eph_pub, now)));
         return;
     }
@@ -1521,9 +1742,17 @@ fn handle_hello3(sh: &Shared, src: SocketAddr, body: &[u8]) {
             && ses.ed_pub == h.ed_pub
             && ses.eph_pub == h.eph_pub
         {
-            push_hello_replay(src, ses, &mut out);
+            push_hello_replay(sh, src, ses, &mut out);
             drop(s);
             sh.flush(out);
+            return;
+        }
+        // HELLO3 прошлой попытки (её сессию уже сменила более новая или
+        // закрыл таймаут) — молча: cookie под старый eph ещё жив, но
+        // пересоздавать сессию и рассылать состояние по нему нельзя.
+        if s.eph_retired(&h.ed_pub, &h.eph_pub) {
+            drop(s);
+            sh.drop_frame();
             return;
         }
     }
@@ -1546,7 +1775,9 @@ fn handle_hello3(sh: &Shared, src: SocketAddr, body: &[u8]) {
             && ses.ed_pub == h.ed_pub
             && ses.eph_pub == h.eph_pub
         {
-            push_hello_replay(src, ses, &mut out);
+            push_hello_replay(sh, src, ses, &mut out);
+        } else if s.eph_retired(&h.ed_pub, &h.eph_pub) {
+            sh.drop_frame();
         } else {
             install_session(sh, &mut s, src, &h, keys, welcome, &mut out);
         }
@@ -1559,8 +1790,18 @@ fn handle_hello3(sh: &Shared, src: SocketAddr, body: &[u8]) {
 /// первым, клиент либо держит (принятые до WELCOME разбираются после него),
 /// либо дочитает сам (GROUP_LIST → GET_GROUP, LIST_INVITES). Повтор всего
 /// состояния превращал бы перехваченный HELLO3 (cookie живёт до 60 с) в
-/// усилитель: ~200 байт → все GROUP_STATE клиента.
-fn push_hello_replay(src: SocketAddr, ses: &Session, out: &mut Outbox) {
+/// усилитель: ~200 байт → все GROUP_STATE клиента. И сам WELCOME — не
+/// чаще `WELCOME_RESEND_GAP`.
+fn push_hello_replay(sh: &Shared, src: SocketAddr, ses: &Session, out: &mut Outbox) {
+    let now = sh.now_ms();
+    let gap = WELCOME_RESEND_GAP.as_millis() as u64;
+    let last = ses.welcome_at.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < gap
+        || ses.welcome_at.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err()
+    {
+        sh.drop_frame();
+        return;
+    }
     out.push((src, ses.welcome.clone()));
 }
 
@@ -1612,6 +1853,7 @@ fn install_session(
             status: status.clone(),
             keys,
             welcome: welcome.clone(),
+            welcome_at: AtomicU64::new(sh.now_ms()),
             tx: AtomicU64::new(0),
             msg_id: AtomicU32::new(0),
             rx: Mutex::new(proto::ReplayWindow::new()),
@@ -1699,6 +1941,7 @@ fn is_urgent(typ: u8) -> bool {
 }
 
 fn handle_ctrl_frame(sh: &Shared, src: SocketAddr, typ: u8, body: &[u8]) {
+    metrics::Metrics::inc(&sh.metrics.ctrl_frames, 1);
     // Быстрый путь — под блокировкой на чтение: сессия, окно повторов,
     // расшифровка, лимит.
     let (me, payload) = {
@@ -1875,6 +2118,9 @@ fn handle_mutation(
                 sh.log(format!("presence: {uname} invisible={invisible}"));
                 member_changed(s, &me, out);
             }
+            // Подтверждение — всегда, и на повтор: клиент повторяет PRESENCE,
+            // пока не получит его (потерянный PRESENCE оставлял бы видимым).
+            push_ctrl(out, src, &s.sessions[&src], ctrl::PRESENCE_ACK, &pl::enc_presence(invisible));
         }
         ctrl::CREATE_GROUP => {
             let (name, private) = pl::dec_create_group(payload)?;
@@ -1902,6 +2148,7 @@ fn handle_mutation(
                 banned: HashMap::new(),
                 invites: HashMap::new(),
                 joins: Bucket::full(),
+            left: HashMap::new(),
             };
             g.insert_member(
                 me,
@@ -1951,6 +2198,15 @@ fn handle_mutation(
                 return Ok(());
             }
             let ip = g.next_free_ip().context("группа заполнена")?;
+            // Одна identity не крутит LEAVE/JOIN (каждый — ротация) и не
+            // выбирает общий лимит входов группы: после выхода — пауза.
+            // Вход по приглашению владельца — без паузы.
+            if g.owner != me
+                && !g.invites.contains_key(&me)
+                && g.left.get(&me).is_some_and(|t| t.elapsed() < REJOIN_COOLDOWN)
+            {
+                anyhow::bail!("недавно вышли из группы — повторите вход позже");
+            }
             // Каждый вход — ротация, а выход за ним — ротация с отзывом:
             // чехарда JOIN/LEAVE (новые identity бесплатны) ломала бы трафик
             // группы. Владельцу — без лимита.
@@ -1994,6 +2250,9 @@ fn handle_mutation(
                 g.remove_member(&me).then(|| {
                     // Устаревшее приглашение не должно всплыть после выхода.
                     g.invites.remove(&me);
+                    // Размер ограничен лимитом входов: каждый выход — после входа.
+                    g.left.retain(|_, t| t.elapsed() < REJOIN_COOLDOWN);
+                    g.left.insert(me, Instant::now());
                     g.rotate(true);
                     g.bump()
                 })
@@ -2015,14 +2274,27 @@ fn handle_mutation(
             let (gid, target) = pl::dec_gid_target(payload)?;
             let tname = known_name(s, &target);
             let ttl_secs = s.invite_ttl_ms.div_ceil(1000).min(u32::MAX as u64) as u32;
+            let (max_group, max_target) = (sh.limits.max_invites_per_group, sh.limits.max_invites_per_target);
+            // Живые приглашения цели в других группах (продление своего — не новое).
+            let now = unix_ms();
+            let target_pending = s
+                .groups
+                .values()
+                .filter(|g| g.id != gid)
+                .filter(|g| g.invites.get(&target).is_some_and(|i| s.invite_live(i, now)))
+                .count();
             let g = s.groups.get_mut(&gid).context("группа не найдена")?;
             anyhow::ensure!(g.owner == me, "приглашать может только владелец");
             anyhow::ensure!(!g.banned.contains_key(&target), "цель забанена");
             // Участнику окно приглашения ни к чему (и владельцу самому себе).
             anyhow::ensure!(!g.members.contains_key(&target), "уже участник группы");
             anyhow::ensure!(
-                g.invites.contains_key(&target) || g.invites.len() < MAX_INVITES_PER_GROUP,
-                "лимит приглашений в группе ({MAX_INVITES_PER_GROUP}): дождитесь ответов или отзовите (KICK)"
+                g.invites.contains_key(&target) || g.invites.len() < max_group,
+                "лимит приглашений в группе ({max_group}): дождитесь ответов или отзовите (KICK)"
+            );
+            anyhow::ensure!(
+                g.invites.contains_key(&target) || target_pending < max_target,
+                "лимит приглашений у цели ({max_target}): у неё слишком много неотвеченных приглашений"
             );
             // Повторное приглашение продлевает срок.
             g.invites.insert(target, Invite { created_ms: unix_ms(), name: tname });
@@ -2066,12 +2338,13 @@ fn handle_mutation(
             let (gid, target) = pl::dec_gid_target(payload)?;
             let banned = typ == ctrl::BAN;
             let tname = known_name(s, &target);
+            let max_bans = sh.limits.max_bans_per_group;
             let g = s.groups.get_mut(&gid).context("группа не найдена")?;
             anyhow::ensure!(g.owner == me, "может только владелец");
             anyhow::ensure!(target != g.owner, "нельзя исключить владельца");
             anyhow::ensure!(
-                !banned || g.banned.contains_key(&target) || g.banned.len() < MAX_BANS_PER_GROUP,
-                "лимит банов в группе ({MAX_BANS_PER_GROUP}): снимите старые (UNBAN) или исключите без бана"
+                !banned || g.banned.contains_key(&target) || g.banned.len() < max_bans,
+                "лимит банов в группе ({max_bans}): снимите старые (UNBAN) или исключите без бана"
             );
             let kicked = g.remove_member(&target);
             // Приглашение снимают и KICK, и BAN: кикнутому не всплывёт окно
@@ -2195,6 +2468,7 @@ mod tests {
             banned: HashMap::new(),
             invites: HashMap::new(),
             joins: Bucket::full(),
+            left: HashMap::new(),
         }
     }
 
@@ -2205,6 +2479,7 @@ mod tests {
             groups: HashMap::new(),
             next_gid: GID_MIN,
             invite_ttl_ms: duration_ms(Limits::default().invite_ttl),
+            retired_eph: HashMap::new(),
         }
     }
 
@@ -2430,6 +2705,7 @@ mod tests {
             workers,
             quiet: true,
             limits,
+            ..Config::default()
         })
         .unwrap()
     }
@@ -2513,6 +2789,7 @@ mod tests {
             workers: 1,
             quiet: true,
             limits: Limits::default(),
+            ..Config::default()
         })
         .unwrap();
         assert_eq!(again.code, code, "identity сервера сохранилась");
@@ -2622,6 +2899,64 @@ mod tests {
     }
 
     #[test]
+    fn повтор_старого_hello3_не_пересоздаёт_сессию_и_welcome_ограничен() {
+        // Типы всех датаграмм (и открытых) за `wait`.
+        fn raw_types(sock: &UdpSocket, wait: Duration) -> Vec<u8> {
+            let end = Instant::now() + wait;
+            let mut buf = [0u8; 65_535];
+            let mut seen = Vec::new();
+            while Instant::now() < end {
+                if let Ok((n, _)) = sock.recv_from(&mut buf)
+                    && let Ok((typ, _)) = proto::split_frame(&buf[..n])
+                {
+                    seen.push(typ);
+                }
+            }
+            seen
+        }
+        let (server, dir) = test_server("hello-replay");
+        let id = proto::Identity::generate();
+        let a1 = Raw::connect_as(server.addr, "alpha", &id);
+        a1.sync();
+        let gid = a1.create("g", false).gid;
+        a1.sync();
+        // Новая попытка той же identity (новый eph) сменила сессию.
+        let a2 = Raw::connect_as(server.addr, "alpha", &id);
+        let a2_addr = a2.sock.local_addr().unwrap();
+        a2.sync();
+        a1.drain(Duration::from_millis(200));
+
+        // HELLO3 прошлой попытки с её адреса (cookie ещё жив) — тишина:
+        // ни WELCOME, ни состояния, сессия новой попытки на месте.
+        for _ in 0..3 {
+            a1.sock.send_to(&a1.hello, server.addr).unwrap();
+        }
+        let got = raw_types(&a1.sock, Duration::from_millis(600));
+        assert!(got.is_empty(), "ответ на старый HELLO3: {got:02x?}");
+        {
+            let s = server.shared.state.read().unwrap();
+            assert_eq!(s.sessions.len(), 1);
+            assert_eq!(s.by_pub[&id.ed_pub()], a2_addr, "старый HELLO3 пересоздал сессию");
+        }
+        assert!(a2.sync().is_empty(), "живой сессии что-то пришло");
+        a2.send(ctrl::GET_GROUP, &payloads::enc_gid(gid));
+        assert_eq!(a2.state().gid, gid, "сессия жива");
+
+        // Поток повторов HELLO3 живой попытки — не больше одного WELCOME на
+        // `WELCOME_RESEND_GAP`, и ничего кроме него.
+        thread::sleep(WELCOME_RESEND_GAP);
+        for _ in 0..5 {
+            a2.sock.send_to(&a2.hello, server.addr).unwrap();
+        }
+        let got = raw_types(&a2.sock, Duration::from_millis(300));
+        assert_eq!(got.iter().filter(|&&t| t == ctrl::WELCOME).count(), 1, "WELCOME: {got:02x?}");
+        assert!(got.iter().all(|&t| t == ctrl::WELCOME), "за WELCOME пришло: {got:02x?}");
+
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn повтор_ctrl_фрейма_игнорируется() {
         let (server, dir) = test_server("replay");
         let a = Raw::connect(server.addr, "alpha");
@@ -2678,8 +3013,46 @@ mod tests {
     }
 
     #[test]
+    fn лимит_приглашений_на_одну_цель() {
+        let limits = Limits { max_invites_per_target: 2, ctrl_rate: 1e6, ctrl_burst: 1e6, ..Limits::default() };
+        let (server, dir) = test_server_with("target-cap", limits);
+        let a = Raw::connect(server.addr, "alpha");
+        let target = [0x77; 32];
+        let gids: Vec<u32> = (0..3).map(|i| a.create(&format!("g{i}"), false).gid).collect();
+        for &gid in &gids[..2] {
+            a.send(ctrl::INVITE, &payloads::enc_gid_target(gid, &target));
+        }
+        assert!(!a.sync().contains(&ctrl::ERROR));
+        a.send(ctrl::INVITE, &payloads::enc_gid_target(gids[2], &target));
+        assert!(a.error().contains("лимит приглашений у цели"));
+        // Продление уже висящего — не новое приглашение.
+        a.send(ctrl::INVITE, &payloads::enc_gid_target(gids[0], &target));
+        assert!(!a.sync().contains(&ctrl::ERROR));
+        // Другой цели лимит не мешает.
+        a.send(ctrl::INVITE, &payloads::enc_gid_target(gids[2], &[0x78; 32]));
+        assert!(!a.sync().contains(&ctrl::ERROR));
+        // Отзыв (KICK) освобождает место.
+        a.send(ctrl::KICK, &payloads::enc_gid_target(gids[0], &target));
+        a.send(ctrl::INVITE, &payloads::enc_gid_target(gids[2], &target));
+        assert!(!a.sync().contains(&ctrl::ERROR));
+        assert!(server.shared.state.read().unwrap().groups[&gids[2]].invites.contains_key(&target));
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn лимиты_приглашений_банов_и_входов_в_группу() {
-        let limits = Limits { join_rate: 0.001, join_burst: 2.0, ctrl_rate: 1e6, ctrl_burst: 1e6, ..Limits::default() };
+        const MAX_INVITES_PER_GROUP: usize = 64;
+        const MAX_BANS_PER_GROUP: usize = 256;
+        let limits = Limits {
+            join_rate: 0.001,
+            join_burst: 2.0,
+            ctrl_rate: 1e6,
+            ctrl_burst: 1e6,
+            max_invites_per_group: MAX_INVITES_PER_GROUP,
+            max_bans_per_group: MAX_BANS_PER_GROUP,
+            ..Limits::default()
+        };
         let (server, dir) = test_server_with("caps", limits);
         let a = Raw::connect(server.addr, "alpha");
         let gid = a.create("g", false).gid;
@@ -2723,6 +3096,49 @@ mod tests {
         // Повторный JOIN участника — не вход, лимит не тратит.
         b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
         assert_eq!(b.state().epoch, epoch + 2);
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn чехарда_leave_join_одной_identity_не_крутит_ключ() {
+        let limits = Limits { ctrl_rate: 1e6, ctrl_burst: 1e6, ..Limits::default() };
+        let (server, dir) = test_server_with("churn", limits);
+        let a = Raw::connect(server.addr, "alpha");
+        let gid = a.create("g", false).gid;
+        let b = Raw::connect(server.addr, "bravo");
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
+        b.state();
+        b.send(ctrl::LEAVE_GROUP, &payloads::enc_gid(gid));
+        b.sync();
+        let epoch = server.shared.state.read().unwrap().groups[&gid].epoch;
+        // Сразу назад — отказ без ротации и без траты общего лимита входов.
+        let joins = server.shared.state.read().unwrap().groups[&gid].joins.tokens;
+        for _ in 0..20 {
+            b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
+            assert!(b.error().contains("недавно вышли"));
+        }
+        {
+            let s = server.shared.state.read().unwrap();
+            let g = &s.groups[&gid];
+            assert_eq!(g.epoch, epoch, "отказ ротировал ключ");
+            assert!(g.joins.tokens >= joins, "отказ потратил лимит входов группы");
+        }
+        // Другим identity пауза не мешает.
+        let c = Raw::connect(server.addr, "charlie");
+        c.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
+        assert_eq!(c.state().epoch, epoch + 1);
+        // По приглашению владельца — без паузы.
+        a.send(ctrl::INVITE, &payloads::enc_gid_target(gid, &b.pk));
+        a.sync();
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
+        assert_eq!(b.state().epoch, epoch + 2);
+        // После паузы — снова можно.
+        b.send(ctrl::LEAVE_GROUP, &payloads::enc_gid(gid));
+        b.sync();
+        thread::sleep(REJOIN_COOLDOWN + Duration::from_millis(100));
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
+        assert_eq!(b.state().epoch, epoch + 4);
         server.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2775,6 +3191,48 @@ mod tests {
         let t0 = Instant::now();
         wait_until_srv(Duration::from_secs(5), || !on_disk(&b.pk));
         assert!(t0.elapsed() < Duration::from_millis(1500), "кик сохранён за {:?}", t0.elapsed());
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Падение сразу после BAN (без сохранения при остановке): с диска не
+    /// возвращается ни забаненный участник, ни уже выданный номер эпохи.
+    #[test]
+    fn бан_и_эпоха_переживают_падение() {
+        let (server, dir) = test_server("ban-crash");
+        let a = Raw::connect(server.addr, "alpha");
+        let gid = a.create("g", false).gid;
+        let b = Raw::connect(server.addr, "bravo");
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
+        b.state();
+        let store = persist::Store::new(&dir);
+        // «Падение» — загрузка того, что сейчас на диске, без shutdown.
+        let crashed = || {
+            let c = temp_dir("ban-crash-copy");
+            std::fs::create_dir_all(&c).unwrap();
+            std::fs::copy(dir.join("server.json"), c.join("server.json")).unwrap();
+            let l = load_state(&persist::Store::new(&c)).unwrap();
+            let _ = std::fs::remove_dir_all(&c);
+            l
+        };
+        let banned_on_disk =
+            |pk: &[u8; 32]| store.load().unwrap().unwrap().groups.iter().any(|g| g.id == gid && g.banned.contains(&hex(pk)));
+        a.send(ctrl::BAN, &payloads::enc_gid_target(gid, &b.pk));
+        b.expect(ctrl::KICKED);
+        let t0 = Instant::now();
+        wait_until_srv(Duration::from_secs(5), || banned_on_disk(&b.pk));
+        assert!(t0.elapsed() < Duration::from_millis(1500), "бан сохранён за {:?}", t0.elapsed());
+        let issued = server.shared.state.read().unwrap().groups[&gid].epoch;
+        let l = crashed();
+        let g = &l.groups[&gid];
+        assert!(g.banned.contains_key(&b.pk) && !g.members.contains_key(&b.pk), "забаненный вернулся");
+        assert!(g.epoch > issued, "эпоха {} повторяет выданную {issued}", g.epoch);
+        // UNBAN — тоже сразу.
+        a.send(ctrl::UNBAN, &payloads::enc_gid_target(gid, &b.pk));
+        a.expect(ctrl::ADMIN_INFO);
+        let t0 = Instant::now();
+        wait_until_srv(Duration::from_secs(5), || !banned_on_disk(&b.pk));
+        assert!(t0.elapsed() < Duration::from_millis(1500), "разбан сохранён за {:?}", t0.elapsed());
         server.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2841,6 +3299,37 @@ mod tests {
         assert!(recv_plain(&sock, ctrl::UNSUPPORTED, Duration::from_millis(500)).is_none());
         server.stop();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn карта_лимитера_ip_ограничена_и_не_забывает_исчерпавших() {
+        let ip = |i: u32| IpAddr::V4(Ipv4Addr::from(i));
+        let mut m = HashMap::new();
+        // Медленный лимит: исчерпавшие запас не восполняются за тест.
+        let (rate, burst) = (0.001, 2.0);
+        for i in 0..8 {
+            assert!(ip_take(&mut m, ip(i), rate, burst, 8));
+            assert!(ip_take(&mut m, ip(i), rate, burst, 8));
+            assert!(!ip_take(&mut m, ip(i), rate, burst, 8));
+        }
+        // Карта полна исчерпавшими: новому адресу отказ, карта не растёт.
+        assert!(!ip_take(&mut m, ip(100), rate, burst, 8));
+        assert_eq!(m.len(), 8);
+        // Восполнившиеся корзины вытесняются, лимит у исчерпавших остаётся.
+        let mut m = HashMap::new();
+        let (rate, burst) = (1e9, 2.0);
+        for i in 0..8 {
+            assert!(ip_take(&mut m, ip(i), rate, burst, 8));
+        }
+        assert!(ip_take(&mut m, ip(100), rate, burst, 8), "восполнившиеся — вытеснить");
+        assert!(m.len() <= 8);
+        // IPv6 из одного /64 — одна запись.
+        let mut m = HashMap::new();
+        for i in 0..100u128 {
+            let a = std::net::Ipv6Addr::from((0x2001_0db8_0001_0002u128 << 64) | i);
+            ip_take(&mut m, ip_key(IpAddr::V6(a)), 0.001, 1000.0, 8);
+        }
+        assert_eq!(m.len(), 1);
     }
 
     #[test]
@@ -2980,7 +3469,12 @@ mod tests {
         let ub = b.update();
         assert_eq!(ub.base_rev, sb.rev);
 
+        // Повтор того же значения — без дельты, но с подтверждением.
+        b.send(ctrl::PRESENCE, &payloads::enc_presence(true));
+        assert!(payloads::dec_presence(&b.expect(ctrl::PRESENCE_ACK)).unwrap());
+        assert!(!a.sync().contains(&ctrl::GROUP_UPDATE), "повтор PRESENCE — не изменение");
         b.send(ctrl::PRESENCE, &payloads::enc_presence(false));
+        assert!(!payloads::dec_presence(&b.expect(ctrl::PRESENCE_ACK)).unwrap());
         let GroupDelta::Member(m) = a.update().delta else { panic!() };
         assert!(m.online);
         assert_eq!(m.endpoint, Some(b.sock.local_addr().unwrap()));
@@ -3168,6 +3662,7 @@ mod tests {
                         status: long_text('s'),
                         keys: proto::DirKeys { tx: [1; 32], rx: [2; 32] },
                         welcome: Vec::new(),
+                        welcome_at: AtomicU64::new(0),
                         tx: AtomicU64::new(0),
                         msg_id: AtomicU32::new(0),
                         rx: Mutex::new(proto::ReplayWindow::new()),
@@ -3280,6 +3775,32 @@ mod tests {
         }
         let b = Raw::connect(server.addr, "bravo");
         assert_eq!(b.welcome.links.len(), 2);
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotate_key_не_затирается_финальным_сохранением_при_остановке() {
+        let dir = temp_dir("rotate-stop");
+        let server = start_in(&dir, Limits::default());
+        let a = Raw::connect(server.addr, "alpha");
+        let gid = a.create("g", false).gid;
+        save_now(&server.shared);
+        let r = rotate_key(&dir).unwrap();
+        // После ротации состояние меняется (dirty), затем — остановка: её
+        // сохранение должно сохранить и новые группы, и новый ключ.
+        let gid2 = a.create("g2", false).gid;
+        a.sync();
+        server.stop();
+        let k = persist::Store::new(&dir).load_key().unwrap();
+        assert_eq!(proto::Identity { ed_seed: k.ed_seed, x_seed: k.x_seed }.ed_pub(), r.pubkey, "ключ затёрт при остановке");
+        assert_eq!(k.rotations.len(), 1);
+        let server = start_in(&dir, Limits::default());
+        assert_eq!(server.pubkey, r.pubkey);
+        {
+            let s = server.shared.state.read().unwrap();
+            assert!(s.groups.contains_key(&gid) && s.groups.contains_key(&gid2), "группы потеряны");
+        }
         server.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3666,6 +4187,171 @@ mod tests {
         assert_eq!((g.invites[&invited].created_ms, g.invites[&invited].name.as_str()), (42, "who"));
         assert_eq!((g.members[&member].name.as_str(), g.members[&member].status.as_str()), ("b", "st"));
         assert_eq!(g.banned[&banned], "zed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- эксплуатация: метрики и TCP-фолбэк ----------
+
+    fn http_get(addr: SocketAddr, path: &str) -> String {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes()).unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).unwrap();
+        out
+    }
+
+    fn metric_values(resp: &str) -> HashMap<String, u64> {
+        let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        body.lines()
+            .filter(|l| !l.starts_with('#'))
+            .filter_map(|l| l.split_once(' '))
+            .map(|(k, v)| (k.to_string(), v.parse().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn метрики_показывают_живые_счётчики_после_рукопожатия() {
+        let dir = temp_dir("metrics");
+        let server = Server::start(Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            data_dir: dir.clone(),
+            workers: 1,
+            quiet: true,
+            metrics: Some("127.0.0.1:0".parse().unwrap()),
+            ..Config::default()
+        })
+        .unwrap();
+        let maddr = server.metrics_addr.expect("метрики включены");
+        let a = Raw::connect(server.addr, "alpha");
+        a.expect(ctrl::GROUP_LIST);
+        let st = a.create("game", false);
+        let b = Raw::connect(server.addr, "bravo");
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(st.gid));
+        let st_b = b.state();
+        let x = proto::Identity::generate().ed_pub();
+        a.send(ctrl::INVITE, &payloads::enc_gid_target(st.gid, &x));
+        a.sync();
+        let f = frame_for(&st_b, st.my_ip, st_b.my_ip, b"hi");
+        a.sock.send_to(&f, server.addr).unwrap();
+        b.group_frame(Duration::from_secs(3)).expect("релей");
+
+        let r = http_get(maddr, "/metrics");
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        let v = metric_values(&r);
+        assert_eq!(v["voidlink_sessions"], 2);
+        assert_eq!(v["voidlink_groups"], 1);
+        assert_eq!(v["voidlink_members"], 2);
+        assert_eq!(v["voidlink_invites_pending"], 1);
+        assert!(v["voidlink_hello_total"] >= 4, "{v:?}");
+        assert!(v["voidlink_challenge_total"] >= 2, "{v:?}");
+        assert!(v["voidlink_ctrl_frames_total"] >= 3, "{v:?}");
+        assert_eq!(v["voidlink_relayed_frames_total"], 1);
+        assert_eq!(v["voidlink_bytes_relayed_total"], f.len() as u64);
+
+        let h = http_get(maddr, "/healthz");
+        assert!(h.starts_with("HTTP/1.1 200"), "{h}");
+        server.stop();
+        assert!(std::net::TcpStream::connect_timeout(&maddr, Duration::from_millis(300)).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// UDP ↔ TCP мост для `Raw`: клиент шлёт датаграммы на локальный UDP,
+    /// мост пересылает их рамками по TCP-соединению с сервером и обратно.
+    struct TcpBridge {
+        udp: SocketAddr,
+        tcp_local: SocketAddr,
+        stream: std::net::TcpStream,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl TcpBridge {
+        fn new(srv: SocketAddr) -> TcpBridge {
+            use std::io::{Read, Write};
+            let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+            udp.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+            let stream = std::net::TcpStream::connect(srv).unwrap();
+            stream.set_nodelay(true).unwrap();
+            let tcp_local = stream.local_addr().unwrap();
+            let client: Arc<Mutex<Option<SocketAddr>>> = Arc::default();
+            let stop = Arc::new(AtomicBool::new(false));
+            {
+                let (udp, mut w, client, stop) =
+                    (udp.try_clone().unwrap(), stream.try_clone().unwrap(), client.clone(), stop.clone());
+                thread::spawn(move || {
+                    let mut buf = [0u8; 65_535];
+                    while !stop.load(Ordering::Relaxed) {
+                        let Ok((n, from)) = udp.recv_from(&mut buf) else { continue };
+                        *client.lock().unwrap() = Some(from);
+                        if w.write_all(&tcp::encode_frame(&buf[..n])).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            {
+                let (udp, mut r) = (udp.try_clone().unwrap(), stream.try_clone().unwrap());
+                thread::spawn(move || {
+                    loop {
+                        let mut hdr = [0u8; 2];
+                        if r.read_exact(&mut hdr).is_err() {
+                            break;
+                        }
+                        let mut body = vec![0u8; u16::from_le_bytes(hdr) as usize];
+                        if r.read_exact(&mut body).is_err() {
+                            break;
+                        }
+                        if let Some(to) = *client.lock().unwrap() {
+                            let _ = udp.send_to(&body, to);
+                        }
+                    }
+                });
+            }
+            TcpBridge { udp: udp.local_addr().unwrap(), tcp_local, stream, stop }
+        }
+
+        fn close(&self) {
+            self.stop.store(true, Ordering::Relaxed);
+            let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    #[test]
+    fn tcp_клиент_и_udp_клиент_релеят_друг_другу() {
+        let (server, dir) = test_server("tcp");
+        let tcp_addr = server.tcp_addr.expect("TCP-фолбэк включён по умолчанию");
+        assert_eq!(tcp_addr.port(), server.addr.port(), "TCP на том же порту, что UDP");
+        let bridge = TcpBridge::new(tcp_addr);
+
+        // A — по TCP (рукопожатие v3 целиком через TCP), B — по UDP.
+        let a = Raw::connect(bridge.udp, "alpha");
+        a.expect(ctrl::GROUP_LIST);
+        let st = a.create("game", false);
+        assert_eq!(
+            server.shared.state.read().unwrap().by_pub.get(&a.pk).copied(),
+            Some(bridge.tcp_local),
+            "источник сессии — адрес TCP-соединения"
+        );
+        let b = Raw::connect(server.addr, "bravo");
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(st.gid));
+        let st_b = b.state();
+
+        // TCP → UDP.
+        let ab = frame_for(&st_b, st.my_ip, st_b.my_ip, b"over tcp");
+        a.sock.send_to(&ab, a.srv).unwrap();
+        assert_eq!(b.group_frame(Duration::from_secs(3)).expect("релей TCP → UDP"), ab);
+        // UDP → TCP: ответ идёт через реестр TCP, а не UDP-сокетом.
+        let ba = frame_for(&st_b, st_b.my_ip, st.my_ip, b"over udp");
+        b.sock.send_to(&ba, server.addr).unwrap();
+        assert_eq!(a.group_frame(Duration::from_secs(3)).expect("релей UDP → TCP"), ba);
+
+        // Закрытие TCP — сессия снимается сразу, не по таймауту.
+        bridge.close();
+        wait_until_srv(Duration::from_secs(3), || {
+            !server.shared.state.read().unwrap().by_pub.contains_key(&a.pk)
+        });
+        server.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

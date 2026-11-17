@@ -229,6 +229,12 @@ impl LinuxTun {
     }
 }
 
+impl AsRawFd for LinuxTun {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.file.as_raw_fd()
+    }
+}
+
 /// Как часто поток-читатель проверяет флаг остановки, если пакетов нет.
 const READER_POLL_INTERVAL: Duration = Duration::from_millis(250);
 

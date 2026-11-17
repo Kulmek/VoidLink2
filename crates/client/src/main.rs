@@ -1,6 +1,7 @@
 //! Клиент туннеля (протокол v3): CLI-диспетчер.
 //!
-//! Глобальные флаги: `--dir <путь>` (каталог конфига), `--debug`,
+//! Глобальные флаги: `--dir <путь>` (каталог конфига), `--profile <имя>`
+//! (каталог `<dir>/profiles/<имя>`), `--debug`,
 //! `--server <N|addr|label>` (по умолчанию — последний использованный).
 //! Для `run` дополнительно: `--adapter <имя>`, `--dll <путь>`.
 //!
@@ -29,29 +30,20 @@
 //!   add-friend <code> [alias]   — добавить друга локально
 //!   del-friend <alias>          — удалить друга
 //!   friends                     — список друзей
+//!   alias <friend> <имя>        — переименовать друга локально
+//!   export-identity <файл> [--passphrase <p>|--passphrase-stdin] [--force]
+//!                               — выгрузить identity (перенос на другую машину)
+//!   import-identity <файл> [--passphrase <p>|--passphrase-stdin] [--force]
+//!                               — загрузить identity (--force — заменить текущую)
+//!   set-transport auto|udp|tcp  — транспорт до сервера
+//!   set-mtu <N>                 — MTU адаптера
+//!   dns on|off                  — встроенный DNS для имён пиров (*.vl)
 //!   invisible on|off            — невидимка (другие видят нас офлайн)
 //!   run                         — поднять туннель (autojoin-группы)
 //!   tui                         — поднять туннель с графическим интерфейсом
 //!
 //! Если в конфиге нет имени или серверов, `tui` сначала показывает
 //! экран первичной настройки (tui::setup): имя, сервер, адаптер, dll.
-
-mod dns;
-mod engine;
-#[cfg(test)]
-mod engine_e2e;
-mod ipv6;
-mod invites;
-mod snapshot;
-mod profile;
-mod store;
-mod tcp_link;
-mod tun;
-#[cfg(target_os = "linux")]
-mod tun_linux;
-#[cfg(target_os = "macos")]
-mod tun_macos;
-mod tui;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -61,43 +53,223 @@ use tunnel_protocol as proto;
 use proto::ctrl;
 use proto::payloads;
 
+use tunnel_client::{engine, profile, store, tui};
+
 use store::{Config, StoredFriend, StoredServer};
 
-fn main() -> Result<()> {
-    let mut dir = store::default_dir();
-    let mut adapter = "TunnelVPN".to_string();
-    let mut dll: Option<String> = None;
-    let mut server_sel: Option<String> = None;
-    let mut debug = false;
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
+/// Глобальные флаги CLI (в любом месте командной строки).
+#[derive(Debug, PartialEq)]
+struct Globals {
+    dir: Option<std::path::PathBuf>,
+    profile: Option<String>,
+    adapter: String,
+    /// `--adapter` задан явно (иначе берётся из конфига).
+    adapter_set: bool,
+    dll: Option<String>,
+    server_sel: Option<String>,
+    debug: bool,
+    /// Подкоманда и её аргументы.
+    args: Vec<String>,
+}
 
-    // Глобальные флаги (до подкоманды).
+impl Globals {
+    /// Каталог данных: `--dir` (или каталог по умолчанию), а с `--profile` —
+    /// его подкаталог `profiles/<имя>`.
+    fn data_dir(&self) -> Result<std::path::PathBuf> {
+        let base = self.dir.clone().unwrap_or_else(store::default_dir);
+        match &self.profile {
+            None => Ok(base),
+            Some(name) => profile::profile_dir_in(&base, name),
+        }
+    }
+}
+
+fn parse_globals(mut args: Vec<String>) -> Result<Globals> {
+    let mut g = Globals {
+        dir: None,
+        profile: None,
+        adapter: engine::DEFAULT_ADAPTER.to_string(),
+        adapter_set: false,
+        dll: None,
+        server_sel: None,
+        debug: false,
+        args: Vec::new(),
+    };
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
         if a == "--dir" {
-            dir = args.get(i + 1).context("--dir требует значение")?.into();
+            g.dir = Some(args.get(i + 1).context("--dir требует значение")?.into());
+            args.drain(i..=i + 1);
+        } else if a == "--profile" {
+            let name = args.get(i + 1).context("--profile требует значение")?.clone();
+            profile::validate_profile_name(&name)?;
+            g.profile = Some(name);
             args.drain(i..=i + 1);
         } else if a == "--adapter" {
-            adapter = args.get(i + 1).context("--adapter требует значение")?.clone();
+            g.adapter = args.get(i + 1).context("--adapter требует значение")?.clone();
+            g.adapter_set = true;
             args.drain(i..=i + 1);
         } else if a == "--dll" {
-            dll = Some(args.get(i + 1).context("--dll требует значение")?.clone());
+            if !cfg!(windows) {
+                bail!("--dll нужен только на Windows (wintun.dll)");
+            }
+            g.dll = Some(args.get(i + 1).context("--dll требует значение")?.clone());
             args.drain(i..=i + 1);
         } else if a == "--server" {
-            server_sel = Some(args.get(i + 1).context("--server требует значение")?.clone());
+            g.server_sel = Some(args.get(i + 1).context("--server требует значение")?.clone());
             args.drain(i..=i + 1);
         } else if a == "--debug" {
-            debug = true;
+            g.debug = true;
             args.remove(i);
         } else {
             i += 1;
         }
     }
-    engine::set_debug(debug);
+    g.args = args;
+    Ok(g)
+}
+
+/// Аргументы export-/import-identity: файл, парольная фраза, `--force`.
+#[derive(Debug, PartialEq)]
+struct IdentityArgs {
+    file: std::path::PathBuf,
+    passphrase: Option<String>,
+    passphrase_stdin: bool,
+    force: bool,
+}
+
+fn parse_identity_args(cmd: &str, rest: &[String]) -> Result<IdentityArgs> {
+    let usage = || format!("usage: {cmd} <файл> [--passphrase <p>|--passphrase-stdin] [--force]");
+    let mut file = None;
+    let mut passphrase = None;
+    let mut passphrase_stdin = false;
+    let mut force = false;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--passphrase" => {
+                passphrase = Some(rest.get(i + 1).with_context(usage)?.clone());
+                i += 2;
+                continue;
+            }
+            "--passphrase-stdin" => passphrase_stdin = true,
+            "--force" => force = true,
+            f if f.starts_with("--") => bail!("неизвестный флаг {f:?}; {}", usage()),
+            f => {
+                if file.is_some() {
+                    bail!("лишний аргумент {f:?}; {}", usage());
+                }
+                file = Some(std::path::PathBuf::from(f));
+            }
+        }
+        i += 1;
+    }
+    if passphrase.is_some() && passphrase_stdin {
+        bail!("--passphrase и --passphrase-stdin взаимоисключающие");
+    }
+    if matches!(&passphrase, Some(p) if p.is_empty()) {
+        bail!("пустая парольная фраза");
+    }
+    Ok(IdentityArgs { file: file.with_context(usage)?, passphrase, passphrase_stdin, force })
+}
+
+impl IdentityArgs {
+    /// Парольная фраза: из флага или первой строки stdin.
+    fn passphrase(&self) -> Result<Option<String>> {
+        if !self.passphrase_stdin {
+            return Ok(self.passphrase.clone());
+        }
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).context("чтение парольной фразы из stdin")?;
+        let p = line.trim_end_matches(['\r', '\n']).to_string();
+        anyhow::ensure!(!p.is_empty(), "пустая парольная фраза");
+        Ok(Some(p))
+    }
+}
+
+/// `on|off` → bool.
+fn parse_on_off(v: Option<&String>, usage: &str) -> Result<bool> {
+    match v.map(|s| s.as_str()) {
+        Some("on") => Ok(true),
+        Some("off") => Ok(false),
+        _ => bail!("{usage}"),
+    }
+}
+
+fn parse_mtu(v: Option<&String>) -> Result<usize> {
+    let n: usize = v.context("usage: set-mtu <N>")?.parse().context("MTU должен быть числом")?;
+    anyhow::ensure!(
+        (store::MTU_MIN..=store::MTU_MAX).contains(&n),
+        "MTU должен быть в пределах {}..={}",
+        store::MTU_MIN,
+        store::MTU_MAX
+    );
+    Ok(n)
+}
+
+fn parse_transport(v: Option<&String>) -> Result<store::TransportMode> {
+    let t = v.context("usage: set-transport auto|udp|tcp")?.to_ascii_lowercase();
+    let t: store::TransportMode =
+        serde_json::from_value(serde_json::Value::String(t)).map_err(|_| anyhow::anyhow!("usage: set-transport auto|udp|tcp"))?;
+    Ok(t)
+}
+
+/// Импорт identity в конфиг `store` (до автосоздания новой identity).
+fn import_identity_cmd(store: &store::Store, a: &IdentityArgs) -> Result<()> {
+    let pass = a.passphrase()?;
+    let id = profile::import_from_file(&a.file, pass.as_deref())?;
+    let mut cfg = store.load().context("чтение конфига")?;
+    if profile::apply_identity(&mut cfg, &id, a.force)? {
+        store.save(&cfg).context("запись конфига")?;
+        println!("identity импортирована: {}", id.friend_code());
+    } else {
+        println!("identity уже такая: {}", id.friend_code());
+    }
+    Ok(())
+}
+
+/// Экспорт identity в файл (без `--force` существующий файл не затирается).
+fn export_identity_cmd(id: &proto::Identity, a: &IdentityArgs) -> Result<()> {
+    if a.file.exists() && !a.force {
+        bail!("файл {} уже есть; повторите с --force", a.file.display());
+    }
+    let pass = a.passphrase()?;
+    profile::export_to_file(&a.file, id, pass.as_deref())?;
+    println!(
+        "identity {} выгружена в {}{}",
+        id.friend_code(),
+        a.file.display(),
+        if pass.is_some() { " (зашифрована)" } else { " (НЕ зашифрована — храните файл в секрете)" }
+    );
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let g = parse_globals(std::env::args().skip(1).collect())?;
+    let dir = g.data_dir()?;
+    let mut adapter = g.adapter.clone();
+    let mut dll = g.dll.clone();
+    let server_sel = g.server_sel.clone();
+    let args = g.args;
+    engine::set_debug(g.debug);
 
     let store = store::Store::new(&dir);
+
+    // Импорт — до автосоздания identity: иначе в свежем профиле сначала
+    // появилась бы случайная identity и импорт требовал бы --force.
+    if args.first().map(|s| s.as_str()) == Some("import-identity") {
+        return import_identity_cmd(&store, &parse_identity_args("import-identity", &args[1..])?);
+    }
+
     let mut cfg: Config = store.load().context("чтение конфига")?;
+    // Адаптер и dll из конфига (экран «Серверы» в TUI), если не заданы флагами.
+    if !g.adapter_set && !cfg.adapter.is_empty() {
+        adapter = cfg.adapter.clone();
+    }
+    if dll.is_none() && !cfg.dll.is_empty() {
+        dll = Some(cfg.dll.clone());
+    }
 
     let save = |c: &Config| -> Result<()> { store.save(c).context("запись конфига") };
 
@@ -452,11 +624,7 @@ fn main() -> Result<()> {
             })?;
         }
         "invisible" => {
-            let on = match rest.first().map(|s| s.as_str()) {
-                Some("on") => true,
-                Some("off") => false,
-                _ => bail!("usage: invisible on|off"),
-            };
+            let on = parse_on_off(rest.first(), "usage: invisible on|off")?;
             cfg.invisible = on;
             save(&cfg)?;
             // Флаг уходит в HELLO3: на сервере он живёт, пока жива сессия.
@@ -485,6 +653,46 @@ fn main() -> Result<()> {
             }
             save(&cfg)?;
             println!("удалён");
+        }
+        "alias" => {
+            let usage = "usage: alias <friend (alias|code|hex)> <новое имя>";
+            let peer = rest.first().context(usage)?;
+            let name = rest[1.min(rest.len())..].join(" ");
+            bail_if_empty(&name, usage);
+            let pk = proto::hex_of(&store::resolve_peer(&cfg, peer)?);
+            if cfg.friends.iter().any(|f| f.alias == name && f.pubkey != pk) {
+                bail!("имя {name:?} уже занято другим другом");
+            }
+            let f = cfg
+                .friends
+                .iter_mut()
+                .find(|f| f.pubkey == pk)
+                .with_context(|| format!("друг {peer:?} не найден"))?;
+            f.alias = name.clone();
+            save(&cfg)?;
+            println!("друг переименован: {name}");
+        }
+        "export-identity" => {
+            let a = parse_identity_args("export-identity", rest)?;
+            export_identity_cmd(&identity, &a)?;
+        }
+        "set-transport" => {
+            cfg.transport = parse_transport(rest.first())?;
+            save(&cfg)?;
+            println!("транспорт: {} (применится при следующем подключении)", format!("{:?}", cfg.transport).to_lowercase());
+        }
+        "set-mtu" => {
+            cfg.mtu = parse_mtu(rest.first())?;
+            save(&cfg)?;
+            println!("MTU: {} (применится при следующем подключении)", cfg.mtu);
+        }
+        "dns" => {
+            cfg.dns = parse_on_off(rest.first(), "usage: dns on|off")?;
+            save(&cfg)?;
+            println!(
+                "DNS для имён пиров {}: применится при следующем подключении",
+                if cfg.dns { "включён" } else { "выключен" }
+            );
         }
         "friends" => {
             if cfg.friends.is_empty() {
@@ -540,10 +748,21 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Подсказка по флагам `run` для текущей ОС.
+fn run_flags_help() -> &'static str {
+    if cfg!(windows) {
+        "--adapter <имя wintun-адаптера> --dll <путь к wintun.dll>; нужен запуск от администратора"
+    } else if cfg!(target_os = "linux") {
+        "--adapter <имя интерфейса, по умолчанию voidlink0>; нужен root или CAP_NET_ADMIN"
+    } else {
+        "адаптер — utunN, выбирается автоматически; нужен запуск через sudo"
+    }
+}
+
 fn usage() {
     println!(
         r#"tunnel-client (протокол v3) — Hamachi-подобный VPN
-global: --dir <path> --debug --server <N|addr|label> (по умолчанию — последний использованный)
+global: --dir <path> --profile <имя> --debug --server <N|addr|label> (по умолчанию — последний использованный)
   id                          friend code и identity
   set-name <имя>              имя профиля
   set-status <текст>          статус
@@ -560,14 +779,21 @@ global: --dir <path> --debug --server <N|addr|label> (по умолчанию �
   rename <gid> <имя>
   friend-groups <peer>
   add-friend <code> [alias] | del-friend <alias> | friends
+  alias <friend> <имя>        переименовать друга локально
+  export-identity <файл> [--passphrase <p>|--passphrase-stdin] [--force]
+  import-identity <файл> [--passphrase <p>|--passphrase-stdin] [--force]
+  set-transport auto|udp|tcp  транспорт до сервера
+  set-mtu <N>                 MTU адаптера (576..1500)
+  dns on|off                  встроенный DNS для имён пиров (*.vl)
   invisible on|off            невидимка: другие видят вас офлайн
-  run                         поднять туннель (global: --adapter --dll --server <N>)
+  run                         поднять туннель (global: --adapter --dll --server <N>, см. ниже)
   tui                         то же, но с графическим интерфейсом (ratatui)
 peer = friend code (TUN-…) | hex | alias
 
 Если при запуске tui имя или сервер не заданы — сначала открывается
 экран первичной настройки (Enter — применить, Esc — отмена)."#
     );
+    println!("run/tui: {}", run_flags_help());
 }
 
 fn bail_if_empty(s: &str, msg: &str) {
@@ -690,5 +916,104 @@ mod tests {
         assert_eq!(find_server(&cfg, "3.3.3.3:5555"), Some(2));
         assert_eq!(find_server(&cfg, "home"), Some(0));
         assert_eq!(find_server(&cfg, ""), None, "пустая метка не совпадает с сервером без метки");
+    }
+
+    fn sv(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("vl-cli-{tag}-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn глобальные_флаги_в_любом_месте() {
+        let g = parse_globals(sv(&["--debug", "join", "--server", "home", "5", "--profile", "work", "--dir", "/x"])).unwrap();
+        assert!(g.debug);
+        assert_eq!(g.server_sel.as_deref(), Some("home"));
+        assert_eq!(g.profile.as_deref(), Some("work"));
+        assert_eq!(g.args, sv(&["join", "5"]));
+        assert_eq!(g.adapter, engine::DEFAULT_ADAPTER);
+        assert_eq!(g.data_dir().unwrap(), std::path::Path::new("/x").join("profiles").join("work"));
+
+        let g = parse_globals(sv(&["--dir", "/x", "id"])).unwrap();
+        assert_eq!(g.data_dir().unwrap(), std::path::PathBuf::from("/x"));
+        assert!(parse_globals(sv(&["--profile", "../evil"])).is_err(), "имя профиля проверяется");
+        assert!(parse_globals(sv(&["id", "--profile"])).is_err());
+        assert!(parse_globals(sv(&["--dir"])).is_err());
+    }
+
+    #[test]
+    fn аргументы_identity() {
+        let a = parse_identity_args("export-identity", &sv(&["f.json", "--passphrase", "p w", "--force"])).unwrap();
+        assert_eq!(
+            a,
+            IdentityArgs { file: "f.json".into(), passphrase: Some("p w".into()), passphrase_stdin: false, force: true }
+        );
+        let a = parse_identity_args("import-identity", &sv(&["--passphrase-stdin", "f.json"])).unwrap();
+        assert!(a.passphrase_stdin && a.passphrase.is_none() && !a.force);
+        assert!(parse_identity_args("x", &sv(&[])).is_err(), "нужен файл");
+        assert!(parse_identity_args("x", &sv(&["a", "b"])).is_err());
+        assert!(parse_identity_args("x", &sv(&["a", "--passphrase"])).is_err());
+        assert!(parse_identity_args("x", &sv(&["a", "--passphrase", ""])).is_err());
+        assert!(parse_identity_args("x", &sv(&["a", "--passphrase", "p", "--passphrase-stdin"])).is_err());
+        assert!(parse_identity_args("x", &sv(&["a", "--bogus"])).is_err());
+    }
+
+    #[test]
+    fn настройки_mtu_transport_on_off() {
+        assert_eq!(parse_mtu(Some(&"1280".into())).unwrap(), 1280);
+        assert!(parse_mtu(Some(&"100".into())).is_err());
+        assert!(parse_mtu(Some(&"9000".into())).is_err());
+        assert!(parse_mtu(Some(&"abc".into())).is_err());
+        assert!(parse_mtu(None).is_err());
+        assert_eq!(parse_transport(Some(&"TCP".into())).unwrap(), store::TransportMode::Tcp);
+        assert_eq!(parse_transport(Some(&"auto".into())).unwrap(), store::TransportMode::Auto);
+        assert!(parse_transport(Some(&"quic".into())).is_err());
+        assert!(parse_on_off(Some(&"on".into()), "u").unwrap());
+        assert!(!parse_on_off(Some(&"off".into()), "u").unwrap());
+        assert!(parse_on_off(Some(&"yes".into()), "u").is_err());
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.transport, store::TransportMode::Auto, "старый конфиг — транспорт auto");
+        assert!(cfg.dns, "старый конфиг — встроенный DNS включён");
+    }
+
+    #[test]
+    fn экспорт_и_импорт_в_профиль() {
+        let base = tmp_dir("prof");
+        let src = store::Store::new(&base);
+        let mut cfg = Config::default();
+        let id = store::ensure_identity(&mut cfg);
+        src.save(&cfg).unwrap();
+
+        let file = base.join("id.json");
+        let a = IdentityArgs { file: file.clone(), passphrase: None, passphrase_stdin: false, force: false };
+        export_identity_cmd(&id, &a).unwrap();
+        assert!(export_identity_cmd(&id, &a).is_err(), "существующий файл без --force не затирается");
+        export_identity_cmd(&id, &IdentityArgs { force: true, ..a }).unwrap();
+
+        // Свежий профиль: импорт без --force (identity ещё нет).
+        let g = parse_globals(sv(&["--dir", base.to_str().unwrap(), "--profile", "laptop"])).unwrap();
+        let dst = store::Store::new(&g.data_dir().unwrap());
+        let imp = IdentityArgs { file: file.clone(), passphrase: None, passphrase_stdin: false, force: false };
+        import_identity_cmd(&dst, &imp).unwrap();
+        let got = store::ensure_identity(&mut dst.load().unwrap());
+        assert_eq!(got.friend_code(), id.friend_code());
+        // Повторный импорт той же identity — no-op.
+        import_identity_cmd(&dst, &imp).unwrap();
+
+        // Другая identity поверх — только с --force.
+        let other = proto::Identity::generate();
+        let file2 = base.join("other.json");
+        profile::export_to_file(&file2, &other, None).unwrap();
+        let imp2 = IdentityArgs { file: file2, passphrase: None, passphrase_stdin: false, force: false };
+        assert!(import_identity_cmd(&dst, &imp2).is_err());
+        import_identity_cmd(&dst, &IdentityArgs { force: true, ..imp2 }).unwrap();
+        let got = store::ensure_identity(&mut dst.load().unwrap());
+        assert_eq!(got.friend_code(), other.friend_code());
+        assert_eq!(profile::list_profiles(&base).unwrap(), vec!["laptop".to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

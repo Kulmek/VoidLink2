@@ -207,6 +207,7 @@ fn start_server_with(dir: &std::path::Path, port: u16, limits: tunnel_server::Li
         workers: 4,
         quiet: true,
         limits,
+        ..Default::default()
     })
     .expect("сервер стартует")
 }
@@ -762,7 +763,7 @@ fn e2e_битый_server_json_не_затирается() {
         data_dir: dir.clone(),
         workers: 1,
         quiet: true,
-        limits: tunnel_server::Limits::default(),
+        ..Default::default()
     });
     assert!(r.is_err(), "сервер не должен стартовать с битым server.json");
     assert_eq!(std::fs::read(&path).unwrap(), b"{ not json", "файл не тронут");
@@ -1347,14 +1348,15 @@ fn e2e_запоздавший_group_state_не_возвращает_отозва
     });
     std::thread::sleep(Duration::from_millis(300));
 
-    // B и C просят полное состояние (фрейм «новой эпохи» — сигнал
-    // GET_GROUP), а ответы задерживаются в сети.
+    // B и C просят полное состояние (фрейм «новой эпохи» с адреса A —
+    // сигнал GET_GROUP принимается только от релея или известного адреса
+    // заявленного отправителя), а ответы задерживаются в сети.
     let (epoch, c_key, _) = c.eng.group_key(gid).unwrap();
     let (ia, ib, ic) = (a.my_ip(gid), b.my_ip(gid), c.my_ip(gid));
     for (n, p, ip) in [(&b, &proxy, ib), (&c, &proxy_c, ic)] {
         p.hold(ctrl::GROUP_STATE, 1);
         let h = proto::GroupHeader { gid, src: ia, dst: ip, epoch: epoch + 1 };
-        n.eng.send_raw(&proto::seal_group(&[7; 32], proto::grp::DATA, &h, 1, b"x"), n.addr());
+        a.eng.send_raw(&proto::seal_group(&[7; 32], proto::grp::DATA, &h, 1, b"x"), n.addr());
         wait_until("ответ GET_GROUP придержан", T, || p.held() == 1);
     }
 
@@ -1384,5 +1386,492 @@ fn e2e_запоздавший_group_state_не_возвращает_отозва
     drop(proxy);
     drop(proxy_c);
     server.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Посредник-«подделыватель»: на каждый HELLO3 клиента сначала шлёт ему
+/// неаутентифицированные UNSUPPORTED, RESET, WELCOME с битой подписью и
+/// WELCOME, подписанный чужим ключом (под наш ed/eph), — и лишь потом
+/// пересылает HELLO3 серверу. Остальное — прозрачно.
+fn spoofing_proxy(server: SocketAddr) -> (SocketAddr, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+    let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    sock.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+    let addr = sock.local_addr().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop2 = stop.clone();
+    let thread = std::thread::spawn(move || {
+        let stranger = proto::Identity::generate();
+        let mut buf = vec![0u8; 65_535];
+        let mut client: Option<SocketAddr> = None;
+        while !stop2.load(Ordering::Relaxed) {
+            let Ok((n, src)) = sock.recv_from(&mut buf) else { continue };
+            if src == server {
+                if let Some(c) = client {
+                    let _ = sock.send_to(&buf[..n], c);
+                }
+                continue;
+            }
+            client = Some(src);
+            if let Ok((ctrl::HELLO3, body)) = proto::split_frame(&buf[..n])
+                && let Ok(h) = proto::Hello3::decode(body)
+            {
+                let eph = proto::EphemeralKey::generate();
+                let forged = proto::Welcome::encode(&stranger, &eph.public(), &[], &h.ed_pub, &h.eph_pub);
+                let mut bad_sig = forged.clone();
+                *bad_sig.last_mut().unwrap() ^= 0xff;
+                let frames = [
+                    proto::plain_frame(ctrl::UNSUPPORTED, &proto::handshake::enc_unsupported("подделка")),
+                    proto::plain_frame(ctrl::RESET, &[]),
+                    proto::plain_frame(ctrl::WELCOME, &bad_sig),
+                    proto::plain_frame(ctrl::WELCOME, &forged),
+                ];
+                for f in frames {
+                    let _ = sock.send_to(&f, src);
+                }
+            }
+            let _ = sock.send_to(&buf[..n], server);
+        }
+    });
+    (addr, stop, thread)
+}
+
+#[test]
+fn e2e_открытые_ответы_не_обрывают_подключение() {
+    let dir = temp_dir("forged-plain");
+    let server = start_server(&dir, 0);
+    let (addr, stop, thread) = spoofing_proxy(local(server.addr));
+
+    // CLI (CtrlConn): поддельные UNSUPPORTED/RESET/WELCOME не обрывают
+    // рукопожатие — подлинный WELCOME принимается, команда работает.
+    let id = proto::Identity::generate();
+    let t0 = Instant::now();
+    let conn = engine::CtrlConn::connect(&Config::default(), addr, &server.pubkey, &id)
+        .expect("CtrlConn подключается сквозь подделки");
+    assert!(t0.elapsed() < Duration::from_secs(5), "без ожидания таймаута");
+    assert!(conn.rotated.is_none());
+    conn.invite_list().expect("ответ сервера после подделок");
+    drop(conn);
+
+    // Движок: первое подключение тоже не обрывается и не шлёт Error.
+    let mut n = Node::start_via("forged", addr, server.pubkey, proto::Identity::generate());
+    n.wait("подключён", T, |e| matches!(e, Event::Connected(_)));
+    n.drain();
+    assert!(
+        !n.seen.iter().any(|e| matches!(e, Event::Error(_))),
+        "подделки не дают ошибок: {:?}",
+        n.seen
+    );
+    drop(n);
+
+    stop.store(true, Ordering::Relaxed);
+    thread.join().unwrap();
+    server.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Кикнутый с отстающей ревизией (дельта не дошла — повод для GET_GROUP):
+/// ответ с ревизией новее его своей, но не новее кика, группу не возвращает —
+/// граница запоздания берётся из KICKED, а не из своей ревизии.
+#[test]
+fn e2e_кик_при_отстающей_ревизии_не_возвращает_группу() {
+    let dir = temp_dir("stale-lag");
+    let server = start_server(&dir, 0);
+    let proxy_c = LossyProxy::start(local(server.addr), Box::new(|_, _, _| false));
+    let mut a = Node::start("alpha", &server);
+    let mut c = Node::start_via("charlie", proxy_c.addr, server.pubkey, proto::Identity::generate());
+    for n in [&mut a, &mut c] {
+        n.wait("подключён", T, |e| matches!(e, Event::Connected(_)));
+    }
+    let gid = a.create("lag", false);
+    c.join(gid);
+    wait_until("видят друг друга", T, || a.sees_online(gid, 1) && c.sees_online(gid, 1));
+    std::thread::sleep(Duration::from_millis(300));
+    let c_rev = c.eng.groups.lock().unwrap()[&gid].rev;
+
+    // Дельта переименования до C не доходит: его ревизия отстаёт.
+    proxy_c.hold(ctrl::GROUP_UPDATE, 1);
+    a.eng.cmds.send(Cmd::Rename(gid, "lag2".into())).unwrap();
+    wait_until("дельта придержана", T, || proxy_c.held() == 1);
+
+    // GET_GROUP от C, ответ (ревизия новее его) задерживается.
+    let (epoch, _, _) = c.eng.group_key(gid).unwrap();
+    let (ia, ic) = (a.my_ip(gid), c.my_ip(gid));
+    proxy_c.hold(ctrl::GROUP_STATE, 1);
+    let h = proto::GroupHeader { gid, src: ia, dst: ic, epoch: epoch + 1 };
+    a.eng.send_raw(&proto::seal_group(&[7; 32], proto::grp::DATA, &h, 1, b"x"), c.addr());
+    wait_until("ответ GET_GROUP придержан", T, || proxy_c.held() == 2);
+    assert_eq!(c.eng.groups.lock().unwrap()[&gid].rev, c_rev, "ревизия C не должна была сдвинуться");
+
+    a.eng.cmds.send(Cmd::Kick(gid, c.eng.my_pub)).unwrap();
+    c.wait("C кикнут", T, |e| matches!(e, Event::Kicked { .. }));
+    let mark = c.seen.len();
+    proxy_c.release();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!c.has_group(gid), "запоздавшее состояние вернуло группу кикнутому");
+    assert!(!c.saw_since(mark, |e| matches!(e, Event::GroupJoined { .. })), "{:?}", &c.seen[mark..]);
+
+    drop((a, c));
+    drop(proxy_c);
+    server.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn e2e_потерянный_presence_повторяется_до_подтверждения() {
+    let dir = temp_dir("presence-loss");
+    let server = start_server(&dir, 0);
+    let mut a = Node::start("alpha", &server);
+    a.wait("A подключён", T, |e| matches!(e, Event::Connected(_)));
+    let gid = a.create("game", false);
+
+    // Первые два PRESENCE теряются по дороге к серверу, первый PRESENCE_ACK —
+    // по дороге к клиенту.
+    let mut acks = 0;
+    let proxy = LossyProxy::start(
+        local(server.addr),
+        Box::new(move |to_server, typ, sent| {
+            if to_server {
+                return typ == ctrl::PRESENCE && sent[&typ] <= 2;
+            }
+            if typ == ctrl::PRESENCE_ACK {
+                acks += 1;
+                return acks == 1;
+            }
+            false
+        }),
+    );
+    let mut b = Node::start_via("bravo", proxy.addr, server.pubkey, proto::Identity::generate());
+    b.wait("B подключён", T, |e| matches!(e, Event::Connected(_)));
+    b.join(gid);
+    wait_until("A видит B онлайн", T, || a.sees_online(gid, 1));
+
+    b.eng.cmds.send(Cmd::SetInvisible(true)).unwrap();
+    wait_until("A видит невидимку B офлайн", T, || {
+        let g = a.eng.groups.lock().unwrap();
+        g.get(&gid).is_some_and(|gs| gs.members.len() == 1 && gs.members.values().all(|p| !p.online))
+    });
+    // Два потерянных + дошедший (его ACK потерян) + подтверждённый; дальше
+    // подтверждённое не повторяется.
+    wait_until("B получил подтверждение", T, || proxy.sent(ctrl::PRESENCE) >= 4);
+    std::thread::sleep(Duration::from_millis(2500));
+    assert_eq!(proxy.sent(ctrl::PRESENCE), 4, "повторы только до PRESENCE_ACK");
+
+    b.eng.cmds.send(Cmd::SetInvisible(false)).unwrap();
+    wait_until("A снова видит B онлайн", T, || a.sees_online(gid, 1));
+
+    drop(a);
+    drop(b);
+    drop(proxy);
+    server.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Управляющие фреймы сервера клиенту типа `typ`, прошедшие посредника.
+fn from_server(p: &LossyProxy, typ: u8) -> usize {
+    p.tap
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(to_server, d)| !*to_server && proto::split_frame(d).is_ok_and(|(t, _)| t == typ))
+        .count()
+}
+
+#[test]
+fn e2e_переименование_и_передача_дельтой_kind3_удаление_без_сверки_ревизии() {
+    let dir = temp_dir("meta-delta");
+    let server = start_server(&dir, 0);
+    let proxy = LossyProxy::start(local(server.addr), Box::new(|_, _, _| false));
+    let mut a = Node::start("alpha", &server);
+    let mut b = Node::start_via("bravo", proxy.addr, server.pubkey, proto::Identity::generate());
+    let mut c = Node::start("charlie", &server);
+    for n in [&mut a, &mut b, &mut c] {
+        n.wait("подключён", T, |e| matches!(e, Event::Connected(_)));
+    }
+    let gid = a.create("old-name", false);
+    b.join(gid);
+    c.join(gid);
+    wait_until("все видят всех", T, || a.sees_online(gid, 2) && b.sees_online(gid, 2) && c.sees_online(gid, 2));
+    let rev = |n: &Node| n.eng.groups.lock().unwrap().get(&gid).map(|g| g.rev);
+    let name = |n: &Node| n.eng.groups.lock().unwrap().get(&gid).map(|g| g.name.clone());
+    wait_until("ревизия у всех одна", T, || rev(&a) == rev(&b) && rev(&b) == rev(&c));
+    std::thread::sleep(Duration::from_millis(300));
+    let states0 = from_server(&proxy, ctrl::GROUP_STATE);
+    assert!(states0 > 0, "посредник не видит GROUP_STATE входа — проверка ниже пуста");
+    let gets0 = proxy.sent(ctrl::GET_GROUP);
+    let rev0 = rev(&b).unwrap();
+
+    // (b) RENAME — дельта kind 3: имя меняется у всех, без полного состояния.
+    a.eng.cmds.send(Cmd::Rename(gid, "new-name".into())).unwrap();
+    wait_until("имя сменилось у всех", T, || {
+        [&a, &b, &c].iter().all(|n| name(n).as_deref() == Some("new-name"))
+    });
+    assert_eq!(rev(&b), Some(rev0 + 1), "переименование — одна ревизия");
+    assert_eq!(rev(&a), rev(&b));
+    assert_eq!(rev(&c), rev(&b));
+
+    // (c) TRANSFER_OWNER — дельта kind 3: новый владелец у всех.
+    let c_pub = c.eng.my_pub;
+    a.eng.cmds.send(Cmd::Transfer(gid, c_pub)).unwrap();
+    wait_until("владелец сменился у всех", T, || {
+        [&a, &b, &c].iter().all(|n| n.owner(gid) == Some(c_pub))
+    });
+    assert_eq!(rev(&b), Some(rev0 + 2), "передача — одна ревизия");
+    assert_eq!(name(&b).as_deref(), Some("new-name"), "передача затёрла имя");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(from_server(&proxy, ctrl::GROUP_STATE), states0, "B получил GROUP_STATE вместо дельты");
+    assert_eq!(proxy.sent(ctrl::GET_GROUP), gets0, "B запрашивал полное состояние");
+    // Группа жива после дельт.
+    deliver(&b, &c, gid, "after-meta", T);
+
+    // (a) Удаление: GROUP_STATE deleted (rev 0) применяется в обход сверки
+    // ревизии — у всех группа исчезает с событием GroupDeleted.
+    let marks = [a.seen.len(), b.seen.len(), c.seen.len()];
+    c.eng.cmds.send(Cmd::Delete(gid)).unwrap();
+    for (n, mark) in [(&mut a, marks[0]), (&mut b, marks[1]), (&mut c, marks[2])] {
+        n.wait("группа удалена", T, |e| {
+            matches!(e, Event::GroupDeleted { gid: g, name } if *g == gid && name == "new-name")
+        });
+        assert!(!n.has_group(gid), "группа осталась после удаления");
+        assert!(!n.saw_since(mark, |e| matches!(e, Event::GroupJoined { gid: g, .. } if *g == gid)));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    for n in [&a, &b, &c] {
+        assert!(!n.has_group(gid), "группа вернулась после удаления");
+    }
+
+    drop((a, b, c));
+    drop(proxy);
+    server.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// DNS-запрос (A) к встроенному DNS 100.66.0.53:53 от `src`.
+fn dns_query(src: u32, id: u16, name: &str) -> Vec<u8> {
+    let mut q = Vec::new();
+    q.extend_from_slice(&id.to_be_bytes());
+    q.extend_from_slice(&0x0100u16.to_be_bytes()); // RD
+    q.extend_from_slice(&[0, 1, 0, 0, 0, 0, 0, 0]);
+    for l in name.split('.') {
+        q.push(l.len() as u8);
+        q.extend_from_slice(l.as_bytes());
+    }
+    q.push(0);
+    q.extend_from_slice(&1u16.to_be_bytes()); // A
+    q.extend_from_slice(&1u16.to_be_bytes()); // IN
+    let mut udp = Vec::new();
+    udp.extend_from_slice(&40000u16.to_be_bytes());
+    udp.extend_from_slice(&53u16.to_be_bytes());
+    udp.extend_from_slice(&((8 + q.len()) as u16).to_be_bytes());
+    udp.extend_from_slice(&[0, 0]);
+    udp.extend_from_slice(&q);
+    ipv4(src, u32::from(crate::dns::DNS_ADDR), &udp)
+}
+
+/// Ответ встроенного DNS с ID `id` среди вброшенных в TUN.
+fn dns_answer(n: &Node, id: u16) -> Option<Vec<u8>> {
+    let inj = n.tun.injected.lock().unwrap();
+    inj.iter()
+        .find(|p| p.len() >= 30 && p[12..16] == crate::dns::DNS_ADDR.octets() && p[28..30] == id.to_be_bytes())
+        .cloned()
+}
+
+/// Минимальный IPv6-пакет (UDP, без контрольной суммы — TUN её не проверяет).
+fn ipv6_pkt(src: std::net::Ipv6Addr, dst: std::net::Ipv6Addr, data: &[u8]) -> Vec<u8> {
+    let mut p = vec![0u8; 40];
+    p[0] = 0x60;
+    p[4..6].copy_from_slice(&(data.len() as u16).to_be_bytes());
+    p[6] = 17;
+    p[7] = 64;
+    p[8..24].copy_from_slice(&src.octets());
+    p[24..40].copy_from_slice(&dst.octets());
+    p.extend_from_slice(data);
+    p
+}
+
+#[test]
+fn e2e_dns_имена_участников_и_ipv6_оверлей() {
+    let dir = temp_dir("dns6");
+    let server = start_server(&dir, 0);
+    let mut a = Node::start("Alpha", &server);
+    let mut b = Node::start("Bravo Two", &server);
+    a.wait("A подключён", T, |e| matches!(e, Event::Connected(_)));
+    b.wait("B подключён", T, |e| matches!(e, Event::Connected(_)));
+    let gid = a.create("Game Room", false);
+    b.join(gid);
+    a.wait("A видит B онлайн", T, |e| matches!(e, Event::PeerOnline { .. }));
+    let (ia, ib) = (a.my_ip(gid), b.my_ip(gid));
+
+    // DNS: ответ вброшен в TUN самого A, в туннель не уходит.
+    for (id, name, want) in [
+        (1u16, "bravo-two.vl", Some(ib)),
+        (2, "BRAVO-TWO.game-room.vl", Some(ib)),
+        (3, "alpha.vl", Some(ia)),
+        (4, "bravo-two.other.vl", None),
+    ] {
+        a.eng.send_ip_packet(&dns_query(ia, id, name));
+        let r = dns_answer(&a, id).unwrap_or_else(|| panic!("{name}: нет ответа DNS"));
+        assert_eq!(r[16..20], ia.to_be_bytes(), "ответ — запросившему");
+        let ancount = u16::from_be_bytes([r[34], r[35]]);
+        match want {
+            Some(ip) => {
+                assert_eq!(ancount, 1, "{name}: одна A-запись");
+                assert_eq!(r[r.len() - 4..], ip.to_be_bytes(), "{name}: адрес");
+            }
+            None => assert_eq!((ancount, r[31] & 0x0f), (0, 3), "{name}: NXDOMAIN"),
+        }
+    }
+
+    // IPv6 оверлея A → B доходит до TUN B.
+    let (a6, b6) = (crate::ipv6::v6_of(ia).unwrap(), crate::ipv6::v6_of(ib).unwrap());
+    let pkt = ipv6_pkt(a6, b6, b"hello6");
+    wait_until("IPv6 A→B", T, || {
+        a.eng.send_ip_packet(&pkt);
+        std::thread::sleep(Duration::from_millis(50));
+        b.got(&pkt) > 0
+    });
+    // Подделанный IPv6-источник (чужой хост группы) и источник вне
+    // префикса отбрасываются у B (раздел 7, п. 6).
+    let fake = ipv6_pkt(crate::ipv6::v6_of(ia ^ 0x80).unwrap(), b6, b"spoof6");
+    let alien = ipv6_pkt("fe80::1".parse().unwrap(), b6, b"alien6");
+    for _ in 0..5 {
+        a.eng.send_ip_packet(&fake);
+        a.eng.send_ip_packet(&alien);
+    }
+    let marker = ipv6_pkt(a6, b6, b"marker6");
+    wait_until("IPv6 маркер", T, || {
+        a.eng.send_ip_packet(&marker);
+        std::thread::sleep(Duration::from_millis(50));
+        b.got(&marker) > 0
+    });
+    assert_eq!((b.got(&fake), b.got(&alien)), (0, 0), "подделки IPv6 не доставлены");
+    assert!(
+        !b.tun.injected.lock().unwrap().iter().any(|p| p.len() > 16 && p[12..16] == crate::dns::DNS_ADDR.octets()),
+        "DNS-запросы A не уходят пирам"
+    );
+
+    drop((a, b));
+    server.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Сервер, «видимый» клиенту только по TCP: на порту — TCP-слушатель и
+/// UDP-сокет, который всё глотает (сеть режет UDP). Каждое TCP-соединение
+/// мостится в свой UDP-сокет к настоящему серверу (рамка `u16 LE` + кадр).
+struct TcpOnlyBridge {
+    addr: SocketAddr,
+    stop: Arc<AtomicBool>,
+    _udp_hole: UdpSocket,
+}
+
+impl TcpOnlyBridge {
+    fn start(server: SocketAddr) -> TcpOnlyBridge {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let (listener, hole) = loop {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            if let Ok(u) = UdpSocket::bind(l.local_addr().unwrap()) {
+                break (l, u);
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let st = stop.clone();
+        std::thread::spawn(move || {
+            while !st.load(Ordering::Relaxed) {
+                let Ok((tcp, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                };
+                tcp.set_nonblocking(false).unwrap();
+                let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+                udp.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+                // TCP → сервер.
+                let (mut rd, u1, s1) = (tcp.try_clone().unwrap(), udp.clone(), st.clone());
+                std::thread::spawn(move || {
+                    let mut hdr = [0u8; 2];
+                    while !s1.load(Ordering::Relaxed) && rd.read_exact(&mut hdr).is_ok() {
+                        let mut f = vec![0u8; u16::from_le_bytes(hdr) as usize];
+                        if rd.read_exact(&mut f).is_err() {
+                            break;
+                        }
+                        let _ = u1.send_to(&f, server);
+                    }
+                });
+                // Сервер → TCP.
+                let (mut wr, s2) = (tcp, st.clone());
+                std::thread::spawn(move || {
+                    let mut buf = vec![0u8; 65_535];
+                    while !s2.load(Ordering::Relaxed) {
+                        let Ok((n, src)) = udp.recv_from(&mut buf) else { continue };
+                        if src != server {
+                            continue;
+                        }
+                        let mut out = (n as u16).to_le_bytes().to_vec();
+                        out.extend_from_slice(&buf[..n]);
+                        if wr.write_all(&out).is_err() {
+                            break;
+                        }
+                    }
+                    let _ = wr.shutdown(std::net::Shutdown::Both);
+                });
+            }
+        });
+        TcpOnlyBridge { addr, stop, _udp_hole: hole }
+    }
+}
+
+impl Drop for TcpOnlyBridge {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn e2e_udp_заблокирован_движок_уходит_на_tcp() {
+    let dir = temp_dir("tcp-fallback");
+    let server = start_server(&dir, 0);
+    let bridge = TcpOnlyBridge::start(local(server.addr));
+
+    let mut a = Node::start("alpha", &server);
+    a.wait("A подключён", T, |e| matches!(e, Event::Connected(_)));
+    assert_eq!(a.eng.meta.lock().unwrap().transport, engine::Transport::Udp);
+
+    // B видит сервер только по TCP: auto — несколько HELLO3 по UDP, потом TCP.
+    let cfg = Config { name: "bravo".into(), ..Config::default() };
+    let mut b = Node::start_cfg(cfg, bridge.addr, server.pubkey, proto::Identity::generate(), Arc::new(|_| {}))
+        .expect("B подключается по TCP");
+    assert_eq!(b.eng.meta.lock().unwrap().transport, engine::Transport::Tcp);
+
+    let gid = a.create("tcp", false);
+    b.join(gid);
+    wait_until("оба видят друг друга онлайн", T, || a.sees_online(gid, 1) && b.sees_online(gid, 1));
+    deliver(&a, &b, gid, "a-to-b", T);
+    deliver(&b, &a, gid, "b-to-a", T);
+
+    // Режим tcp: сразу по TCP, без попыток по UDP.
+    let cfg = Config {
+        name: "charlie".into(),
+        transport: crate::store::TransportMode::Tcp,
+        ..Config::default()
+    };
+    let t0 = Instant::now();
+    let c = Node::start_cfg(cfg, bridge.addr, server.pubkey, proto::Identity::generate(), Arc::new(|_| {}))
+        .expect("C подключается по TCP");
+    assert!(t0.elapsed() < Duration::from_secs(2), "режим tcp не ждёт UDP");
+    assert_eq!(c.eng.meta.lock().unwrap().transport, engine::Transport::Tcp);
+
+    // CLI-соединение: тот же фолбэк.
+    let cli = engine::CtrlConn::connect(
+        &Config { name: "delta".into(), ..Config::default() },
+        bridge.addr,
+        &server.pubkey,
+        &proto::Identity::generate(),
+    )
+    .expect("CtrlConn по TCP");
+    assert!(cli.via_tcp());
+    cli.send_ctrl(ctrl::CTRL_PING, &[]);
+    cli.wait_for(ctrl::CTRL_PONG, T).expect("PONG по TCP");
+    drop(b);
     let _ = std::fs::remove_dir_all(&dir);
 }

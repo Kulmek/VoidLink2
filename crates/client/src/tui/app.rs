@@ -2,7 +2,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashSet, VecDeque};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, Result};
 use ratatui::crossterm::event::{
@@ -13,6 +13,10 @@ use tunnel_protocol as proto;
 
 use crate::engine::{Cmd, Engine};
 use crate::store::{self, Config, StoredFriend, StoredServer};
+use crate::tui::admin::{self, AdminAction, AdminView, BanEntry, InviteEntry, MemberEntry};
+use crate::tui::servers::{ServerEntry, ServersAction, ServersView};
+use crate::tui::badges::Transport;
+use crate::tui::{clipboard, keymap};
 use crate::tui::theme::ThemeKind;
 
 pub const TOAST_TTL: Duration = Duration::from_secs(5);
@@ -143,7 +147,8 @@ pub struct Toast {
 pub struct LogLine {
     pub text: String,
     pub kind: MsgKind,
-    pub at: Instant,
+    /// Настенное время записи — для локальной метки в логе.
+    pub wall: SystemTime,
 }
 
 // ---------------------------------------------------------------- попапы
@@ -155,6 +160,8 @@ pub enum InputAction {
     SetName,
     SetStatus,
     InviteCode(u32),
+    /// Новый алиас друга (pubkey).
+    FriendAlias([u8; 32]),
     /// Командная строка «:».
     Command,
 }
@@ -217,7 +224,6 @@ pub struct ListItem {
 }
 
 pub enum ListAction {
-    PickServer,
     ToggleAutojoin,
 }
 
@@ -235,14 +241,16 @@ pub enum SettingRow {
     Server,
     Autojoin,
     Theme,
+    Invisible,
 }
 
-pub const SETTING_ROWS: [SettingRow; 5] = [
+pub const SETTING_ROWS: [SettingRow; 6] = [
     SettingRow::Name,
     SettingRow::Status,
     SettingRow::Server,
     SettingRow::Autojoin,
     SettingRow::Theme,
+    SettingRow::Invisible,
 ];
 
 pub struct SettingsPopup {
@@ -257,6 +265,8 @@ pub struct InvitePopup {
     pub from_name: String,
     pub from_pubkey: [u8; 32],
     pub received_at: Instant,
+    /// Когда приглашение истекает на сервере (None — неизвестно).
+    pub expires_at: Option<Instant>,
     /// Когда окно показано (None — ещё в очереди); см. [`INVITE_GUARD`].
     pub shown_at: Option<Instant>,
 }
@@ -280,6 +290,10 @@ pub enum Popup {
     Settings(SettingsPopup),
     Profile,
     Invite(InvitePopup),
+    /// Управление своей группой: баны, приглашения, передача владения.
+    Admin(AdminView),
+    /// Экран «Серверы»: переключение, добавление/удаление, адаптер.
+    Servers(ServersView),
 }
 
 // ---------------------------------------------------------------- мышь
@@ -426,6 +440,17 @@ pub struct App {
     pub later_invites: Vec<InvitePopup>,
     /// Только что отклонённые (gid, когда) — см. [`INVITE_DECLINE_MEMORY`].
     pub declined: Vec<(u32, Instant)>,
+    /// Сервер, к которому относятся приглашения и окна с gid (последний
+    /// `Connected`/`ServerSwitched`): gid — номер группы на конкретном
+    /// сервере, на другом сервере тот же gid — чужая группа.
+    pub invites_server: Option<std::net::SocketAddr>,
+    /// Адаптер и dll, с которыми запущен клиент (экран «Серверы»).
+    pub adapter_name: String,
+    pub dll_path: String,
+    /// Невидимка (из конфига).
+    pub invisible: bool,
+    /// Транспорт до сервера (пока движок знает только UDP).
+    pub transport: Transport,
 }
 
 impl App {
@@ -469,6 +494,11 @@ impl App {
             invites: VecDeque::new(),
             later_invites: Vec::new(),
             declined: Vec::new(),
+            invites_server: None,
+            adapter_name: cfg.adapter.clone(),
+            dll_path: cfg.dll.clone(),
+            invisible: cfg.invisible,
+            transport: Transport::Udp,
         }
     }
 
@@ -584,6 +614,7 @@ impl App {
             self.servers = cfg.servers.clone();
             self.autojoin = cfg.autojoin.clone();
             self.theme_kind = ThemeKind::from_str(&cfg.theme).unwrap_or(ThemeKind::Dark);
+            self.invisible = cfg.invisible;
         }
 
         // Выбор группы: держим актуальный gid, иначе — первая своя.
@@ -649,6 +680,7 @@ impl App {
             };
             match ev {
                 E::Connected(s) => {
+                    self.on_server(s);
                     self.log(MsgKind::Ok, format!("подключено к {s}"));
                 }
                 E::Disconnected(r) => {
@@ -687,13 +719,12 @@ impl App {
                     self.toast(MsgKind::Error, msg);
                 }
                 E::DirectLost { gid, ip, name } => {
-                    self.log(
-                        MsgKind::Warn,
-                        format!(
-                            "прямой канал с {name} ({}) в {gid} потерян — через релей",
-                            proto::ip_str(ip)
-                        ),
+                    let msg = format!(
+                        "прямой канал с {name} ({}) в {gid} потерян — через релей",
+                        proto::ip_str(ip)
                     );
+                    self.log(MsgKind::Warn, msg.clone());
+                    self.toast(MsgKind::Warn, msg);
                 }
                 E::ServerKeyRotated { addr, new_code } => {
                     let msg = format!("ключ сервера {addr} сменён по цепочке ротации: {new_code}");
@@ -701,6 +732,7 @@ impl App {
                     self.toast(MsgKind::Warn, msg);
                 }
                 E::ServerSwitched { addr, label } => {
+                    self.on_server(addr);
                     let msg = if label.is_empty() {
                         format!("переключено на сервер {addr}")
                     } else {
@@ -708,8 +740,14 @@ impl App {
                     };
                     self.log(MsgKind::Info, msg.clone());
                     self.toast(MsgKind::Info, msg);
+                    self.server_addr = addr.to_string();
+                    self.on_server_switched(addr);
                 }
-                // Экран администрирования — позже; пока сводка в журнал.
+                // Открыт экран администрирования этой группы — заполняем его,
+                // иначе сводка в журнал.
+                E::AdminInfo { gid, bans, invites } if self.admin_open(gid) => {
+                    self.on_admin_info(gid, bans, invites);
+                }
                 E::AdminInfo { gid, bans, invites } => {
                     let names = |v: Vec<String>| if v.is_empty() { "—".to_string() } else { v.join(", ") };
                     let bans = names(bans.into_iter().map(|(_, n)| n).collect());
@@ -741,7 +779,7 @@ impl App {
                     self.log(MsgKind::Ok, msg.clone());
                     self.toast(MsgKind::Ok, msg);
                 }
-                E::Invite { gid, group_name, from_pubkey, from_name, .. } => {
+                E::Invite { gid, group_name, from_pubkey, from_name, expires_in } => {
                     // Уже в группе или в автовходе (движок войдёт сам) — окно
                     // не показываем: сервер повторяет приглашения после HELLO.
                     let skip = eng.groups.lock().unwrap().contains_key(&gid)
@@ -752,6 +790,9 @@ impl App {
                         from_name,
                         from_pubkey,
                         received_at: Instant::now(),
+                        expires_at: (expires_in > 0).then(|| {
+                            Instant::now() + Duration::from_secs(expires_in as u64)
+                        }),
                         shown_at: None,
                     };
                     self.on_invite(inv, skip);
@@ -898,6 +939,39 @@ impl App {
         self.log(MsgKind::Warn, msg.clone());
         self.toast(MsgKind::Warn, msg);
         self.invites.push_back(inv);
+        self.pump_invites();
+    }
+
+    /// Текущий сервер — `addr`. Если это другой сервер, всё, что
+    /// привязано к gid старого (приглашения на экране, в очереди и
+    /// отложенные, недавние отказы, окна выбора участника / подтверждения
+    /// выхода и удаления, ввод для переименования / кода приглашения),
+    /// сбрасывается: принять такое приглашение значило бы JOIN в тот же gid
+    /// на новом сервере — чужую группу.
+    pub fn on_server(&mut self, addr: std::net::SocketAddr) {
+        let prev = self.invites_server.replace(addr);
+        if prev.is_none() || prev == Some(addr) {
+            return;
+        }
+        self.invites.clear();
+        self.later_invites.clear();
+        self.declined.clear();
+        self.stack.retain(|p| {
+            !matches!(
+                p,
+                Popup::Invite(_)
+                    | Popup::PeerPick(_)
+                    | Popup::FriendCard(_)
+                    | Popup::Confirm(ConfirmPopup {
+                        action: ConfirmAction::DeleteGroup(_) | ConfirmAction::LeaveGroup(_),
+                        ..
+                    })
+                    | Popup::Input(InputPopup {
+                        action: InputAction::RenameGroup(_) | InputAction::InviteCode(_),
+                        ..
+                    })
+            )
+        });
         self.pump_invites();
     }
 
@@ -1093,7 +1167,7 @@ impl App {
         self.log.push(LogLine {
             text,
             kind,
-            at: Instant::now(),
+            wall: SystemTime::now(),
         });
         if self.log.len() > LOG_MAX {
             self.log.remove(0);
@@ -1141,6 +1215,8 @@ impl App {
     // ---------- клавиши ----------
 
     pub fn handle_key(&mut self, key: KeyEvent, eng: &Engine) {
+        // Хоткеи работают и в русской раскладке; в полях ввода — как есть.
+        let key = if self.text_input_active() { key } else { latin_key(key) };
         if !self.stack.is_empty() {
             self.handle_popup_key(key, eng);
             return;
@@ -1162,6 +1238,7 @@ impl App {
             KeyCode::F(3) | KeyCode::F(10) => {
                 self.stack.push(Popup::Settings(SettingsPopup { sel: 0 }))
             }
+            KeyCode::F(4) => self.open_servers(eng),
             KeyCode::F(6) => self.open_rename(),
             KeyCode::F(8) => self.open_delete_group(),
             KeyCode::Char('?') => self.stack.push(Popup::Help),
@@ -1191,10 +1268,16 @@ impl App {
             KeyCode::Char('c') => self.copy_context(),
             KeyCode::Char('p') => self.stack.push(Popup::Profile),
             KeyCode::Char('o') => self.reopen_invites(),
+            KeyCode::Char('m') => {
+                if let Some(cmd) = self.open_admin() {
+                    let _ = eng.cmds.send(cmd);
+                }
+            }
             KeyCode::Char('s') => {
                 self.sort = self.sort.next();
                 self.status_msg = format!("сортировка: {}", self.sort.label());
             }
+            KeyCode::Char('r') if self.focus == Focus::Friends => self.open_friend_alias(),
             KeyCode::Char('r') => {
                 let _ = eng.cmds.send(Cmd::RefreshList);
                 self.status_msg = "обновляем список групп".into();
@@ -1204,6 +1287,29 @@ impl App {
                 self.status_msg = format!("«{c}» — неизвестная команда; F1 — справка, / — поиск");
             }
             _ => {}
+        }
+    }
+
+    /// Ввод идёт в текстовое поле (поиск или окно ввода) — раскладку не трогаем.
+    pub fn text_input_active(&self) -> bool {
+        match self.stack.last() {
+            Some(Popup::Input(_)) => true,
+            Some(_) => false,
+            None => self.filtering,
+        }
+    }
+
+    /// Число неотвеченных приглашений: в очереди, отложенные и открытое окно.
+    pub fn pending_invites(&self) -> usize {
+        let shown = self.stack.iter().filter(|p| matches!(p, Popup::Invite(_))).count();
+        self.invites.len() + self.later_invites.len() + shown
+    }
+
+    /// Копирует в буфер обмена (OSC 52 через SSH) и сообщает результат тостом.
+    fn copy_toast(&mut self, text: &str, ok: String) {
+        match copy_to_clipboard(text) {
+            Ok(()) => self.toast(MsgKind::Ok, ok),
+            Err(e) => self.toast(MsgKind::Error, e),
         }
     }
 
@@ -1278,6 +1384,14 @@ impl App {
     // ---------- мышь ----------
 
     pub fn handle_mouse(&mut self, m: MouseEvent, eng: &Engine) {
+        // Экраны со своей геометрией (admin, servers) разбирают мышь сами;
+        // тост поверх них по-прежнему закрывает то, что под ним.
+        if matches!(self.stack.last(), Some(Popup::Admin(_) | Popup::Servers(_)))
+            && !inside(self.hits.toasts.get(), m.column, m.row)
+        {
+            self.screen_mouse(m, eng);
+            return;
+        }
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => self.click(m.column, m.row, eng),
             MouseEventKind::ScrollUp => self.wheel(m.column, m.row, -1),
@@ -1514,6 +1628,21 @@ impl App {
     // ---------- попапы ----------
 
     fn handle_popup_key(&mut self, key: KeyEvent, eng: &Engine) {
+        match self.stack.last() {
+            Some(Popup::Admin(_)) => {
+                for cmd in self.admin_key(key) {
+                    let _ = eng.cmds.send(cmd);
+                }
+                self.pump_invites();
+                return;
+            }
+            Some(Popup::Servers(_)) => {
+                self.servers_input(eng, |v| v.handle_key(key));
+                self.pump_invites();
+                return;
+            }
+            _ => {}
+        }
         let popup = match self.stack.pop() {
             Some(p) => p,
             None => return,
@@ -1580,8 +1709,10 @@ impl App {
             },
             Popup::FriendCard(card) => match key.code {
                 KeyCode::Char('c') => {
-                    copy_to_clipboard(&proto::friend_code_of(&card.pubkey));
-                    self.toast(MsgKind::Ok, "friend code друга скопирован".into());
+                    self.copy_toast(
+                        &proto::friend_code_of(&card.pubkey),
+                        "friend code друга скопирован".into(),
+                    );
                     self.stack.push(Popup::FriendCard(card));
                 }
                 _ => {}
@@ -1601,32 +1732,6 @@ impl App {
                 }
                 KeyCode::Enter => {
                     match p.action {
-                        ListAction::PickServer => {
-                            // Выбранный сервер становится первым в client.json:
-                            // `run`/`tui` без --server берут первый. Раньше выбор
-                            // только показывал тост и нигде не сохранялся.
-                            let idx = p.items.get(p.sel).and_then(|i| i.value.parse::<usize>().ok());
-                            let mut cfg = eng.cfg.lock().unwrap().clone();
-                            match idx.filter(|i| *i < cfg.servers.len()) {
-                                Some(i) => {
-                                    let picked = cfg.servers.remove(i);
-                                    let addr = picked.addr.clone();
-                                    cfg.servers.insert(0, picked);
-                                    match save_cfg(eng, cfg) {
-                                        Ok(()) => {
-                                            self.status_msg = format!("сервер: {addr}");
-                                            self.toast(
-                                                MsgKind::Ok,
-                                                format!("сервер {addr} — применится после перезапуска"),
-                                            );
-                                        }
-                                        Err(e) => self
-                                            .toast(MsgKind::Error, format!("не сохранить сервер: {e}")),
-                                    }
-                                }
-                                None => self.toast(MsgKind::Warn, "сервер не выбран".into()),
-                            }
-                        }
                         ListAction::ToggleAutojoin => {
                             // gid берём из выбранной строки: в действии лежит
                             // заглушка 0, из-за которой переключалась «группа 0».
@@ -1662,8 +1767,8 @@ impl App {
             },
             Popup::Profile => {
                 if let KeyCode::Char('c') = key.code {
-                    copy_to_clipboard(&self.my_code);
-                    self.toast(MsgKind::Ok, "friend code скопирован".into());
+                    let code = self.my_code.clone();
+                    self.copy_toast(&code, "friend code скопирован".into());
                     self.stack.push(Popup::Profile);
                 }
             }
@@ -1672,6 +1777,8 @@ impl App {
                     let _ = eng.cmds.send(cmd);
                 }
             }
+            // Разобраны выше.
+            p @ (Popup::Admin(_) | Popup::Servers(_)) => self.stack.push(p),
         }
         // Закрыли окно — следующее приглашение из очереди.
         self.pump_invites();
@@ -1767,6 +1874,10 @@ impl App {
                     self.toast(MsgKind::Ok, "приглашение отправлено".into());
                 }
                 Err(e) => self.toast(MsgKind::Error, format!("неверный friend code: {e}")),
+            },
+            InputAction::FriendAlias(pk) => match self.rename_friend(eng, pk, &value) {
+                Ok(()) => self.toast(MsgKind::Ok, format!("друг переименован: {value}")),
+                Err(e) => self.toast(MsgKind::Error, e.to_string()),
             },
             InputAction::Command => {
                 if let Err(e) = self.run_command(&value, eng) {
@@ -1974,34 +2085,7 @@ impl App {
                 action: InputAction::SetStatus,
                 private: false,
             })),
-            SettingRow::Server => {
-                let items: Vec<ListItem> = self
-                    .servers
-                    .iter()
-                    .enumerate()
-                    .map(|(i, s)| ListItem {
-                        label: if s.label.is_empty() {
-                            format!("{}: {}", i, s.addr)
-                        } else {
-                            format!("{}: {} ({})", i, s.addr, s.label)
-                        },
-                        // Отмечен сервер, к которому подключены сейчас.
-                        checked: s.addr.parse::<std::net::SocketAddr>().ok()
-                            == Some(eng.meta.lock().unwrap().server),
-                        value: i.to_string(),
-                    })
-                    .collect();
-                if items.is_empty() {
-                    self.toast(MsgKind::Warn, "нет серверов".into());
-                    return;
-                }
-                self.stack.push(Popup::ListPick(ListPickPopup {
-                    title: "Сервер (влияет на перезапуск)".into(),
-                    items,
-                    sel: 0,
-                    action: ListAction::PickServer,
-                }));
-            }
+            SettingRow::Server => self.open_servers(eng),
             SettingRow::Autojoin => {
                 let items: Vec<ListItem> = self
                     .groups
@@ -2024,6 +2108,12 @@ impl App {
                     action: ListAction::ToggleAutojoin,
                 }));
             }
+            SettingRow::Invisible => {
+                let on = !self.invisible;
+                self.invisible = on;
+                let _ = eng.cmds.send(Cmd::SetInvisible(on));
+                self.toast(MsgKind::Ok, invisible_msg(on));
+            }
             SettingRow::Theme => {
                 let kind = self.theme_kind.next();
                 self.theme_kind = kind;
@@ -2037,6 +2127,40 @@ impl App {
                 }
             }
         }
+    }
+
+    /// «r» в списке друзей: окно нового алиаса выбранного друга.
+    fn open_friend_alias(&mut self) {
+        match self.selected_friend() {
+            Some(f) => {
+                let (pk, alias) = (f.pubkey, f.alias.clone());
+                self.stack.push(Popup::Input(InputPopup {
+                    title: format!("Переименовать друга «{alias}»"),
+                    hint: "новый алиас · Enter — сохранить".into(),
+                    value: alias,
+                    action: InputAction::FriendAlias(pk),
+                    private: false,
+                }));
+            }
+            None => self.toast(MsgKind::Warn, "не выбран друг".into()),
+        }
+    }
+
+    /// Друг по алиасу, friend code или hex.
+    fn resolve_friend(&self, eng: &Engine, token: &str) -> Result<[u8; 32]> {
+        let cfg = eng.cfg.lock().unwrap().clone();
+        resolve_friend_in(&cfg, token)
+    }
+
+    /// Новый алиас друга: правит `Config.friends` и сохраняет конфиг.
+    fn rename_friend(&mut self, eng: &Engine, pk: [u8; 32], name: &str) -> Result<()> {
+        let mut cfg = eng.cfg.lock().unwrap().clone();
+        rename_friend_in(&mut cfg, &pk, name)?;
+        save_cfg(eng, cfg)?;
+        if let Some(f) = self.friends.iter_mut().find(|f| f.pubkey == pk) {
+            f.alias = name.trim().to_string();
+        }
+        Ok(())
     }
 
     fn open_command(&mut self) {
@@ -2065,8 +2189,8 @@ impl App {
         match self.focus {
             Focus::Peers => match self.selected_peer() {
                 Some(p) => {
-                    copy_to_clipboard(&proto::ip_str(p.ip));
-                    self.toast(MsgKind::Ok, format!("IP скопирован: {}", proto::ip_str(p.ip)));
+                    let ip = proto::ip_str(p.ip);
+                    self.copy_toast(&ip, format!("IP скопирован: {ip}"));
                 }
                 None => self.toast(MsgKind::Warn, "не выбран участник".into()),
             },
@@ -2076,20 +2200,282 @@ impl App {
                         Some(ip) => proto::ip_str(ip),
                         None => g.gid.to_string(),
                     };
-                    copy_to_clipboard(&txt);
-                    self.toast(MsgKind::Ok, format!("скопировано: {txt}"));
+                    self.copy_toast(&txt, format!("скопировано: {txt}"));
                 }
                 None => self.toast(MsgKind::Warn, "не выбрана группа".into()),
             },
             Focus::Friends => match self.selected_friend() {
                 Some(f) => {
-                    copy_to_clipboard(&proto::hex_of(&f.pubkey));
-                    self.toast(MsgKind::Ok, format!("pubkey скопирован: {}", f.alias));
+                    let (hex, alias) = (proto::hex_of(&f.pubkey), f.alias.clone());
+                    self.copy_toast(&hex, format!("pubkey скопирован: {alias}"));
                 }
                 None => self.toast(MsgKind::Warn, "не выбран друг".into()),
             },
             Focus::Log => {}
         }
+    }
+
+    // ---------- управление группой ----------
+
+    /// Открыт ли экран управления группой `gid`.
+    pub fn admin_open(&self, gid: u32) -> bool {
+        self.stack.iter().any(|p| matches!(p, Popup::Admin(v) if v.gid == gid))
+    }
+
+    /// «m» на выбранной группе: экран управления (только своя группа).
+    /// Возвращает запрос данных для движка.
+    pub fn open_admin(&mut self) -> Option<Cmd> {
+        let Some(gid) = self.sel_group else {
+            self.toast(MsgKind::Warn, "не выбрана группа".into());
+            return None;
+        };
+        match self.open_admin_for(gid) {
+            Ok(cmd) => Some(cmd),
+            Err(e) => {
+                self.toast(MsgKind::Warn, e.to_string());
+                None
+            }
+        }
+    }
+
+    /// Открывает экран управления группой `gid` → `Cmd::GroupAdmin(gid)`.
+    pub fn open_admin_for(&mut self, gid: u32) -> Result<Cmd> {
+        let g = self
+            .groups
+            .iter()
+            .find(|g| g.gid == gid)
+            .ok_or_else(|| anyhow!("группа {gid} не найдена"))?;
+        if !g.owner_is_me {
+            return Err(anyhow!("управлять группой может только владелец"));
+        }
+        let mut v = AdminView::new(gid, g.name.clone());
+        v.members = admin_members(g);
+        self.stack.push(Popup::Admin(v));
+        Ok(Cmd::GroupAdmin(gid))
+    }
+
+    /// Ответ ADMIN_INFO: заполнить открытый экран группы `gid`.
+    pub fn on_admin_info(
+        &mut self,
+        gid: u32,
+        bans: Vec<([u8; 32], String)>,
+        invites: Vec<([u8; 32], String, u32)>,
+    ) {
+        let members = self.groups.iter().find(|g| g.gid == gid).map(admin_members);
+        let bans: Vec<BanEntry> = bans.into_iter().map(|(pk, name)| BanEntry { pk, name }).collect();
+        let invites: Vec<InviteEntry> = invites
+            .into_iter()
+            .map(|(pk, name, exp)| InviteEntry { pk, name, expires_in_secs: exp as u64 })
+            .collect();
+        for p in self.stack.iter_mut() {
+            if let Popup::Admin(v) = p
+                && v.gid == gid
+            {
+                let members = members.clone().unwrap_or_else(|| v.members.clone());
+                v.set_data(bans.clone(), invites.clone(), members);
+            }
+        }
+    }
+
+    /// Клавиша в экране управления (он сверху стека): команды движку.
+    pub fn admin_key(&mut self, key: KeyEvent) -> Vec<Cmd> {
+        let act = match self.stack.last_mut() {
+            Some(Popup::Admin(v)) => admin::handle_key(v, key),
+            _ => return Vec::new(),
+        };
+        self.admin_apply(act)
+    }
+
+    /// Действие экрана управления → команды движку. После UNBAN / KICK
+    /// данные запрашиваются заново; после передачи владения экран закрыт:
+    /// управлять группой мы больше не можем.
+    pub fn admin_apply(&mut self, act: Option<AdminAction>) -> Vec<Cmd> {
+        let name = |a: &App, pk: &[u8; 32]| match a.stack.last() {
+            Some(Popup::Admin(v)) => v
+                .bans
+                .iter()
+                .find(|e| &e.pk == pk)
+                .map(|e| e.name.clone())
+                .or_else(|| v.invites.iter().find(|e| &e.pk == pk).map(|e| e.name.clone()))
+                .or_else(|| v.members.iter().find(|e| &e.pk == pk).map(|e| e.name.clone()))
+                .unwrap_or_else(|| proto::hex_of(&pk[..4])),
+            _ => proto::hex_of(&pk[..4]),
+        };
+        match act {
+            None => Vec::new(),
+            Some(AdminAction::Close) => {
+                self.stack.pop();
+                Vec::new()
+            }
+            Some(AdminAction::Refresh(gid)) => vec![Cmd::GroupAdmin(gid)],
+            Some(AdminAction::Unban(gid, pk)) => {
+                let n = name(self, &pk);
+                self.toast(MsgKind::Ok, format!("бан снят: {n}"));
+                vec![Cmd::Unban(gid, pk), Cmd::GroupAdmin(gid)]
+            }
+            Some(AdminAction::RevokeInvite(gid, pk)) => {
+                let n = name(self, &pk);
+                self.toast(MsgKind::Ok, format!("приглашение отозвано: {n}"));
+                vec![Cmd::Kick(gid, pk), Cmd::GroupAdmin(gid)]
+            }
+            Some(AdminAction::Transfer(gid, pk)) => {
+                let n = name(self, &pk);
+                self.stack.pop();
+                self.toast(MsgKind::Warn, format!("группа {gid} передаётся: {n}"));
+                vec![Cmd::Transfer(gid, pk)]
+            }
+        }
+    }
+
+    // ---------- серверы ----------
+
+    /// Индекс текущего сервера в `cfg.servers` (по адресу из движка).
+    fn current_server(&self, cfg: &Config) -> usize {
+        cfg.servers
+            .iter()
+            .position(|s| {
+                s.addr == self.server_addr
+                    || resolve_addr(&s.addr).is_some_and(|a| a.to_string() == self.server_addr)
+            })
+            .unwrap_or(0)
+    }
+
+    /// Экран «Серверы» (F4, `:servers`, настройки).
+    pub fn open_servers(&mut self, eng: &Engine) {
+        let cfg = eng.cfg.lock().unwrap().clone();
+        self.open_servers_with(&cfg);
+    }
+
+    pub fn open_servers_with(&mut self, cfg: &Config) {
+        let v = ServersView::new(
+            server_entries(cfg),
+            self.current_server(cfg),
+            &self.adapter_name,
+            &self.dll_path,
+        );
+        self.stack.push(Popup::Servers(v));
+    }
+
+    /// Ввод в экран «Серверы» (клавиша или мышь — `f`): действие
+    /// применяется к копии конфига, изменённый конфиг сохраняется.
+    fn servers_input(
+        &mut self,
+        eng: &Engine,
+        f: impl FnOnce(&mut ServersView) -> Option<ServersAction>,
+    ) {
+        let act = match self.stack.last_mut() {
+            Some(Popup::Servers(v)) => f(v),
+            _ => return,
+        };
+        let Some(act) = act else { return };
+        let mut cfg = eng.cfg.lock().unwrap().clone();
+        let (cmd, save) = self.servers_apply(act, &mut cfg);
+        if save && let Err(e) = save_cfg(eng, cfg) {
+            self.toast(MsgKind::Error, format!("не сохранить конфиг: {e}"));
+        }
+        if let Some(cmd) = cmd {
+            let _ = eng.cmds.send(cmd);
+        }
+    }
+
+    /// Действие экрана «Серверы» над конфигом. Возвращает команду движку и
+    /// признак «конфиг изменён — сохранить».
+    pub fn servers_apply(&mut self, act: ServersAction, cfg: &mut Config) -> (Option<Cmd>, bool) {
+        match act {
+            ServersAction::Close => {
+                self.stack.pop();
+                (None, false)
+            }
+            ServersAction::Switch(i) => {
+                let Some(s) = cfg.servers.get(i) else { return (None, false) };
+                let Some(addr) = resolve_addr(&s.addr) else {
+                    self.toast(MsgKind::Error, format!("адрес {} не разрешается", s.addr));
+                    return (None, false);
+                };
+                let Some(pubkey) = hex32(&s.pubkey) else {
+                    self.toast(MsgKind::Error, format!("неверный ключ сервера {}", s.addr));
+                    return (None, false);
+                };
+                let label = s.label.clone();
+                if let Some(Popup::Servers(v)) = self.stack.last_mut() {
+                    v.notice = Some(format!("переключаемся на {addr}…"));
+                }
+                (Some(Cmd::SwitchServer { addr, pubkey, label }), false)
+            }
+            ServersAction::Add { addr, pubkey, label } => {
+                cfg.servers.push(StoredServer {
+                    addr: addr.clone(),
+                    pubkey: proto::hex_of(&pubkey),
+                    label,
+                });
+                self.servers = cfg.servers.clone();
+                let cur = self.current_server(cfg);
+                if let Some(Popup::Servers(v)) = self.stack.last_mut() {
+                    v.set_servers(server_entries(cfg), cur);
+                    v.sel = v.servers.len().saturating_sub(1);
+                    v.notice = Some(format!("сервер {addr} добавлен"));
+                }
+                (None, true)
+            }
+            ServersAction::Delete(i) => {
+                let cur = self.current_server(cfg);
+                if i >= cfg.servers.len() || i == cur {
+                    return (None, false);
+                }
+                let gone = cfg.servers.remove(i);
+                self.servers = cfg.servers.clone();
+                let cur = self.current_server(cfg);
+                if let Some(Popup::Servers(v)) = self.stack.last_mut() {
+                    v.set_servers(server_entries(cfg), cur);
+                    v.notice = Some(format!("сервер {} удалён", gone.addr));
+                }
+                (None, true)
+            }
+            ServersAction::SetAdapter { name, dll } => {
+                cfg.adapter = name.clone();
+                cfg.dll = dll.clone();
+                if let Some(Popup::Servers(v)) = self.stack.last_mut() {
+                    v.adapter_name = name;
+                    v.dll_path = dll;
+                    v.notice = Some("адаптер и dll сохранены — применится после перезапуска".into());
+                }
+                self.toast(MsgKind::Ok, "адаптер сохранён — применится после перезапуска".into());
+                (None, true)
+            }
+        }
+    }
+
+    /// Движок переключён на `addr`: отметить текущий в открытом экране.
+    pub fn on_server_switched(&mut self, addr: std::net::SocketAddr) {
+        for p in self.stack.iter_mut() {
+            if let Popup::Servers(v) = p
+                && let Some(i) = v
+                    .servers
+                    .iter()
+                    .position(|s| s.addr == addr.to_string() || resolve_addr(&s.addr) == Some(addr))
+            {
+                v.current = i;
+                v.sel = i;
+                v.notice = Some(format!("текущий сервер: {addr}"));
+            }
+        }
+    }
+
+    /// Мышь в экранах admin / servers (они сверху стека).
+    fn screen_mouse(&mut self, m: MouseEvent, eng: &Engine) {
+        match self.stack.last_mut() {
+            Some(Popup::Admin(v)) => {
+                let act = admin::handle_mouse(v, m);
+                for cmd in self.admin_apply(act) {
+                    let _ = eng.cmds.send(cmd);
+                }
+            }
+            Some(Popup::Servers(_)) => {
+                self.servers_input(eng, |v| v.handle_mouse(m.kind, m.column, m.row));
+            }
+            _ => return,
+        }
+        self.pump_invites();
     }
 
     // ---------- командная строка ----------
@@ -2143,11 +2529,15 @@ impl App {
                 let _ = eng.cmds.send(Cmd::Transfer(gid, pk));
             }
             Command::Admin(gid) => {
-                let _ = eng.cmds.send(Cmd::GroupAdmin(gid));
+                let gid = gid.or(self.sel_group).ok_or_else(|| anyhow!("не выбрана группа"))?;
+                let cmd = self.open_admin_for(gid)?;
+                let _ = eng.cmds.send(cmd);
             }
+            Command::Servers => self.open_servers(eng),
             Command::Invisible(on) => {
                 let _ = eng.cmds.send(Cmd::SetInvisible(on));
-                self.toast(MsgKind::Ok, format!("невидимка {}", if on { "включена" } else { "выключена" }));
+                self.invisible = on;
+                self.toast(MsgKind::Ok, invisible_msg(on));
             }
             Command::Server(tok) => {
                 let cfg = eng.cfg.lock().unwrap().clone();
@@ -2203,8 +2593,13 @@ impl App {
                 if txt.is_empty() {
                     return Err(anyhow!("нечего копировать"));
                 }
-                copy_to_clipboard(&txt);
+                copy_to_clipboard(&txt).map_err(|e| anyhow!(e))?;
                 self.toast(MsgKind::Ok, format!("скопировано: {txt}"));
+            }
+            Command::Alias { friend, name } => {
+                let pk = self.resolve_friend(eng, &friend)?;
+                self.rename_friend(eng, pk, &name)?;
+                self.toast(MsgKind::Ok, format!("друг переименован: {name}"));
             }
             Command::Quit => {
                 self.quit = true;
@@ -2239,8 +2634,10 @@ pub enum Command {
     Ban(u32, String),
     Unban(u32, String),
     Transfer(u32, String),
-    /// Баны и неотвеченные приглашения группы (владелец).
-    Admin(u32),
+    /// Экран управления группой (владелец): gid или выбранная группа.
+    Admin(Option<u32>),
+    /// Экран «Серверы».
+    Servers,
     Invisible(bool),
     /// Переключиться на сервер из списка: номер, адрес или метка.
     Server(String),
@@ -2250,6 +2647,8 @@ pub enum Command {
     SetStatus(String),
     Sort(Sort),
     Copy(String),
+    /// Новый алиас друга: `:alias <друг> <имя>`.
+    Alias { friend: String, name: String },
     Quit,
 }
 
@@ -2323,7 +2722,8 @@ pub fn parse_command(line: &str) -> Result<Command> {
                 .ok_or_else(|| anyhow!("нужен peer (friend code | hex | alias)"))?
                 .to_string(),
         ),
-        "admin" | "bans" => Command::Admin(gid_of(0)?),
+        "admin" | "bans" => Command::Admin(if rest.is_empty() { None } else { Some(gid_of(0)?) }),
+        "servers" => Command::Servers,
         "invisible" => Command::Invisible(match rest.first().map(|s| s.to_lowercase()).as_deref() {
             Some("on") => true,
             Some("off") => false,
@@ -2372,6 +2772,17 @@ pub fn parse_command(line: &str) -> Result<Command> {
                 .unwrap_or("ip")
                 .to_lowercase(),
         ),
+        "alias" => {
+            let friend = rest
+                .first()
+                .ok_or_else(|| anyhow!("alias <друг> <новое имя>"))?
+                .to_string();
+            let name = rest[1.min(rest.len())..].join(" ");
+            if name.is_empty() {
+                return Err(anyhow!("нужно новое имя друга"));
+            }
+            Command::Alias { friend, name }
+        }
         "quit" | "q" => Command::Quit,
         other => return Err(anyhow!("неизвестная команда: {other}")),
     })
@@ -2387,6 +2798,39 @@ pub fn hex32(s: &str) -> Option<[u8; 32]> {
     Some(v.try_into().unwrap())
 }
 
+/// Участники группы — кандидаты на передачу владения.
+fn admin_members(g: &GroupView) -> Vec<MemberEntry> {
+    g.peers
+        .iter()
+        .map(|p| MemberEntry {
+            pk: p.pubkey,
+            name: p.name.clone(),
+            ip: std::net::Ipv4Addr::from(p.ip),
+        })
+        .collect()
+}
+
+/// Серверы конфига для экрана «Серверы».
+fn server_entries(cfg: &Config) -> Vec<ServerEntry> {
+    cfg.servers
+        .iter()
+        .map(|s| ServerEntry {
+            label: s.label.clone(),
+            addr: s.addr.clone(),
+            pubkey: hex32(&s.pubkey).unwrap_or([0; 32]),
+        })
+        .collect()
+}
+
+/// `ip:port` или `host:port` → адрес (первый из разрешённых).
+fn resolve_addr(addr: &str) -> Option<std::net::SocketAddr> {
+    if let Ok(a) = addr.parse() {
+        return Some(a);
+    }
+    use std::net::ToSocketAddrs;
+    addr.to_socket_addrs().ok()?.next()
+}
+
 /// Сохраняет конфиг и обновляет его копию в движке (иначе UI откатит правку).
 pub fn save_cfg(eng: &Engine, cfg: Config) -> Result<()> {
     *eng.cfg.lock().unwrap() = cfg.clone();
@@ -2394,34 +2838,54 @@ pub fn save_cfg(eng: &Engine, cfg: Config) -> Result<()> {
     Ok(())
 }
 
-/// Копирование в системный буфер обмена.
-pub fn copy_to_clipboard(text: &str) {
-    #[cfg(windows)]
-    {
-        use std::io::Write;
-        if let Ok(mut child) = std::process::Command::new("clip")
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-        {
-            if let Some(stdin) = child.stdin.as_mut() {
-                let _ = stdin.write_all(text.as_bytes());
-            }
-            let _ = child.wait();
-        }
+/// Копирование в системный буфер обмена (через SSH — OSC 52 первым).
+pub fn copy_to_clipboard(text: &str) -> std::result::Result<(), String> {
+    clipboard::copy(text).map(|_| ())
+}
+
+/// Символьная клавиша в русской раскладке → та же клавиша в латинице.
+pub fn latin_key(mut key: KeyEvent) -> KeyEvent {
+    if let KeyCode::Char(c) = key.code {
+        key.code = KeyCode::Char(keymap::latin(c));
     }
-    #[cfg(not(windows))]
-    {
-        use std::io::Write;
-        if let Ok(mut child) = std::process::Command::new("pbcopy")
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-        {
-            if let Some(stdin) = child.stdin.as_mut() {
-                let _ = stdin.write_all(text.as_bytes());
-            }
-            let _ = child.wait();
-        }
+    key
+}
+
+fn invisible_msg(on: bool) -> String {
+    format!("невидимка {}", if on { "включена" } else { "выключена" })
+}
+
+/// Друг по алиасу, friend code или hex (только из списка друзей).
+pub fn resolve_friend_in(cfg: &Config, token: &str) -> Result<[u8; 32]> {
+    if let Some(f) = cfg.friends.iter().find(|f| f.alias == token) {
+        return hex32(&f.pubkey).ok_or_else(|| anyhow!("неверный pubkey друга {token}"));
     }
+    let pk = store::resolve_peer(cfg, token)?;
+    let hex = proto::hex_of(&pk);
+    if cfg.friends.iter().any(|f| f.pubkey == hex) {
+        Ok(pk)
+    } else {
+        Err(anyhow!("друг {token:?} не найден"))
+    }
+}
+
+/// Меняет алиас друга в конфиге. Алиас не пустой и не занят другим другом.
+pub fn rename_friend_in(cfg: &mut Config, pk: &[u8; 32], name: &str) -> Result<()> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(anyhow!("пустой алиас"));
+    }
+    let hex = proto::hex_of(pk);
+    if cfg.friends.iter().any(|f| f.alias == name && f.pubkey != hex) {
+        return Err(anyhow!("алиас «{name}» уже занят"));
+    }
+    let f = cfg
+        .friends
+        .iter_mut()
+        .find(|f| f.pubkey == hex)
+        .ok_or_else(|| anyhow!("друг не найден"))?;
+    f.alias = name.to_string();
+    Ok(())
 }
 
 // ---------------------------------------------------------------- тесты
@@ -2545,6 +3009,7 @@ mod tests {
             received_at: Instant::now()
                 .checked_sub(INVITE_SYNC_GRACE * 2)
                 .unwrap_or_else(Instant::now),
+            expires_at: None,
             shown_at: None,
         }
     }
@@ -2605,6 +3070,40 @@ mod tests {
         assert_eq!(shown_gid(&a), Some(7));
         assert!(a.status_msg.contains("Enter/y"));
         assert!(matches!(press(&mut a, KeyCode::Enter), Some(Cmd::Join(7))));
+    }
+
+    #[test]
+    fn смена_сервера_сбрасывает_приглашения_старого() {
+        let a1: std::net::SocketAddr = "10.0.0.1:5599".parse().unwrap();
+        let a2: std::net::SocketAddr = "10.0.0.2:5599".parse().unwrap();
+        let mut a = online();
+        a.on_server(a1);
+        a.on_invite(inv(1), false);
+        a.on_invite(inv(2), false);
+        a.on_invite(inv(3), false);
+        assert!(press(&mut a, KeyCode::Esc).is_none()); // 1 — «позже»
+        assert!(matches!(press(&mut a, KeyCode::Char('n')), Some(Cmd::DeclineInvite(2))));
+        assert_eq!(shown_gid(&a), Some(3));
+        a.stack.push(Popup::Confirm(ConfirmPopup {
+            title: String::new(),
+            message: String::new(),
+            action: ConfirmAction::LeaveGroup(9),
+        }));
+        a.stack.push(Popup::Help);
+        // Переподключение к тому же серверу ничего не трогает.
+        a.on_server(a1);
+        assert!(a.has_invite(1) && a.has_invite(3) && a.stack.len() == 3);
+        // Другой сервер: ни окна, ни очереди, ни «позже», ни окон с gid.
+        a.on_server(a2);
+        assert!(!a.has_invite(1) && !a.has_invite(3));
+        assert!(a.invites.is_empty() && a.later_invites.is_empty() && a.declined.is_empty());
+        assert!(matches!(a.stack.as_slice(), [Popup::Help]), "окна без gid остаются");
+        a.reopen_invites();
+        assert!(shown_gid(&a).is_none(), "«o» не вернёт приглашение старого сервера");
+        // Отказ на старом сервере не глушит приглашение с тем же gid на новом.
+        a.stack.clear();
+        a.on_invite(inv(2), false);
+        assert_eq!(shown_gid(&a), Some(2));
     }
 
     #[test]
@@ -2894,5 +3393,415 @@ mod tests {
         assert_eq!(parse_command("decline 4").unwrap(), Command::Decline(4));
         assert_eq!(parse_command("invites").unwrap(), Command::Invites);
         assert!(parse_command("decline").is_err());
+    }
+
+    // ---------- экраны «Управление группой» и «Серверы» ----------
+
+    fn owner_app() -> App {
+        let mut a = app();
+        a.groups = vec![
+            GroupView {
+                gid: 1,
+                name: "gamers".into(),
+                private: false,
+                mine: true,
+                online: 2,
+                total: 2,
+                my_ip: Some(0x6442_0102),
+                owner_is_me: true,
+                peers: vec![PeerView {
+                    pubkey: [2; 32],
+                    name: "bravo".into(),
+                    ip: 0x6442_0103,
+                    online: true,
+                    direct: false,
+                    rtt_ms: None,
+                    status: String::new(),
+                }],
+            },
+            GroupView {
+                gid: 2,
+                name: "чужая".into(),
+                private: false,
+                mine: true,
+                online: 1,
+                total: 2,
+                my_ip: Some(0x6442_0202),
+                owner_is_me: false,
+                peers: vec![],
+            },
+        ];
+        a.sel_group = Some(1);
+        a
+    }
+
+    fn admin_view(a: &App) -> &AdminView {
+        match a.stack.last() {
+            Some(Popup::Admin(v)) => v,
+            _ => panic!("экран управления не открыт"),
+        }
+    }
+
+    #[test]
+    fn управление_группой_открыть_получить_снять_бан_отозвать_передать() {
+        let mut a = owner_app();
+        assert!(matches!(a.open_admin(), Some(Cmd::GroupAdmin(1))));
+        assert_eq!(admin_view(&a).members.len(), 1, "кандидаты на передачу — участники группы");
+        assert!(a.admin_open(1));
+
+        a.on_admin_info(1, vec![([3; 32], "charlie".into())], vec![([4; 32], "delta".into(), 3600)]);
+        let v = admin_view(&a);
+        assert_eq!(v.bans.len(), 1);
+        assert_eq!(v.invites[0].expires_in_secs, 3600);
+
+        // Разбанить → UNBAN и повторный запрос данных.
+        let cmds = a.admin_key(key(KeyCode::Enter));
+        assert!(matches!(cmds[..], [Cmd::Unban(1, pk), Cmd::GroupAdmin(1)] if pk == [3; 32]), "{cmds:?}");
+        // Отозвать приглашение → KICK приглашённого и обновление.
+        assert!(a.admin_key(key(KeyCode::Char('2'))).is_empty());
+        let cmds = a.admin_key(key(KeyCode::Enter));
+        assert!(matches!(cmds[..], [Cmd::Kick(1, pk), Cmd::GroupAdmin(1)] if pk == [4; 32]), "{cmds:?}");
+        // r — обновить.
+        assert!(matches!(a.admin_key(key(KeyCode::Char('r')))[..], [Cmd::GroupAdmin(1)]));
+        // Передача — только после явного «y».
+        assert!(a.admin_key(key(KeyCode::Char('3'))).is_empty());
+        assert!(a.admin_key(key(KeyCode::Enter)).is_empty(), "Enter лишь открывает подтверждение");
+        assert!(admin_view(&a).confirm.is_some());
+        assert!(a.admin_key(key(KeyCode::Enter)).is_empty(), "повторный Enter не передаёт");
+        let cmds = a.admin_key(key(KeyCode::Char('y')));
+        assert!(matches!(cmds[..], [Cmd::Transfer(1, pk)] if pk == [2; 32]), "{cmds:?}");
+        assert!(a.stack.is_empty(), "после передачи экран закрыт");
+    }
+
+    #[test]
+    fn управление_группой_только_владельцу_и_esc_закрывает() {
+        let mut a = owner_app();
+        a.sel_group = Some(2);
+        assert!(a.open_admin().is_none());
+        assert!(a.stack.is_empty());
+        assert!(a.toasts.iter().any(|t| t.text.contains("владелец")));
+        assert!(a.open_admin_for(7).is_err());
+
+        a.sel_group = Some(1);
+        a.open_admin().unwrap();
+        // Ответ по другой группе экран не трогает.
+        a.on_admin_info(2, vec![([3; 32], "x".into())], vec![]);
+        assert!(admin_view(&a).bans.is_empty());
+        assert!(a.admin_key(key(KeyCode::Esc)).is_empty());
+        assert!(a.stack.is_empty());
+    }
+
+    #[test]
+    fn парс_команд_экранов() {
+        assert_eq!(parse_command("admin").unwrap(), Command::Admin(None));
+        assert_eq!(parse_command("admin 5").unwrap(), Command::Admin(Some(5)));
+        assert_eq!(parse_command("bans 6").unwrap(), Command::Admin(Some(6)));
+        assert!(parse_command("admin x").is_err());
+        assert_eq!(parse_command("servers").unwrap(), Command::Servers);
+    }
+
+    fn servers_cfg() -> Config {
+        let mut cfg = Config::default();
+        cfg.servers = vec![
+            StoredServer { addr: "127.0.0.1:5599".into(), pubkey: proto::hex_of(&[1; 32]), label: "дом".into() },
+            StoredServer { addr: "127.0.0.2:5600".into(), pubkey: proto::hex_of(&[2; 32]), label: String::new() },
+        ];
+        cfg
+    }
+
+    /// Клавиша в экране «Серверы» и применение действия к конфигу.
+    fn srv_key(a: &mut App, cfg: &mut Config, code: KeyCode) -> (Option<Cmd>, bool) {
+        let act = match a.stack.last_mut() {
+            Some(Popup::Servers(v)) => v.handle_key(key(code)),
+            _ => panic!("экран серверов не открыт"),
+        };
+        match act {
+            Some(act) => a.servers_apply(act, cfg),
+            None => (None, false),
+        }
+    }
+
+    fn srv_type(a: &mut App, cfg: &mut Config, text: &str) {
+        for c in text.chars() {
+            srv_key(a, cfg, KeyCode::Char(c));
+        }
+    }
+
+    fn servers_view(a: &App) -> &ServersView {
+        match a.stack.last() {
+            Some(Popup::Servers(v)) => v,
+            _ => panic!("экран серверов не открыт"),
+        }
+    }
+
+    #[test]
+    fn серверы_переключение_без_перезапуска() {
+        let mut a = app();
+        let mut cfg = servers_cfg();
+        a.server_addr = "127.0.0.1:5599".into();
+        a.open_servers_with(&cfg);
+        assert_eq!(servers_view(&a).current, 0);
+        srv_key(&mut a, &mut cfg, KeyCode::Down);
+        let (cmd, save) = srv_key(&mut a, &mut cfg, KeyCode::Enter);
+        match cmd {
+            Some(Cmd::SwitchServer { addr, pubkey, .. }) => {
+                assert_eq!(addr.to_string(), "127.0.0.2:5600");
+                assert_eq!(pubkey, [2; 32]);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!save);
+        // Движок сообщил о переключении — текущий отмечен.
+        a.on_server_switched("127.0.0.2:5600".parse().unwrap());
+        assert_eq!(servers_view(&a).current, 1);
+        assert!(matches!(srv_key(&mut a, &mut cfg, KeyCode::Esc), (None, false)));
+        assert!(a.stack.is_empty());
+    }
+
+    #[test]
+    fn серверы_добавить_удалить_адаптер_сохраняются_в_конфиг() {
+        let mut a = app();
+        let mut cfg = servers_cfg();
+        a.server_addr = "127.0.0.1:5599".into();
+        a.adapter_name = "TunnelVPN".into();
+        a.open_servers_with(&cfg);
+
+        // Добавить.
+        srv_key(&mut a, &mut cfg, KeyCode::Char('a'));
+        srv_type(&mut a, &mut cfg, "10.0.0.1:7000");
+        srv_key(&mut a, &mut cfg, KeyCode::Tab);
+        srv_type(&mut a, &mut cfg, &proto::friend_code_of(&[9; 32]));
+        srv_key(&mut a, &mut cfg, KeyCode::Tab);
+        srv_type(&mut a, &mut cfg, "работа");
+        let (cmd, save) = srv_key(&mut a, &mut cfg, KeyCode::Enter);
+        assert!(cmd.is_none() && save);
+        assert_eq!(cfg.servers.len(), 3);
+        assert_eq!(cfg.servers[2].addr, "10.0.0.1:7000");
+        assert_eq!(cfg.servers[2].pubkey, proto::hex_of(&[9; 32]));
+        assert_eq!(cfg.servers[2].label, "работа");
+        assert_eq!(servers_view(&a).servers.len(), 3);
+
+        // Удалить (с подтверждением); текущий удалить нельзя.
+        srv_key(&mut a, &mut cfg, KeyCode::Home);
+        assert!(matches!(srv_key(&mut a, &mut cfg, KeyCode::Char('d')), (None, false)));
+        assert_eq!(cfg.servers.len(), 3);
+        srv_key(&mut a, &mut cfg, KeyCode::Down);
+        srv_key(&mut a, &mut cfg, KeyCode::Char('d'));
+        let (_, save) = srv_key(&mut a, &mut cfg, KeyCode::Char('y'));
+        assert!(save);
+        assert_eq!(cfg.servers.len(), 2);
+        assert!(cfg.servers.iter().all(|s| s.addr != "127.0.0.2:5600"));
+        assert_eq!(servers_view(&a).current, 0);
+
+        // Адаптер и dll — в конфиг, с пометкой о перезапуске.
+        srv_key(&mut a, &mut cfg, KeyCode::Char('e'));
+        for _ in 0.."TunnelVPN".len() {
+            srv_key(&mut a, &mut cfg, KeyCode::Backspace);
+        }
+        srv_type(&mut a, &mut cfg, "Game");
+        srv_key(&mut a, &mut cfg, KeyCode::Tab);
+        srv_type(&mut a, &mut cfg, "C:\\w.dll");
+        let (cmd, save) = srv_key(&mut a, &mut cfg, KeyCode::Enter);
+        assert!(cmd.is_none() && save);
+        assert_eq!(cfg.adapter, "Game");
+        assert_eq!(cfg.dll, "C:\\w.dll");
+        assert!(servers_view(&a).notice.as_deref().unwrap_or("").contains("после перезапуска"));
+    }
+
+    // ---------- раскладка, алиасы, невидимка ----------
+
+    struct NullTun;
+    impl crate::engine::TunDev for NullTun {
+        fn inject(&self, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        fn ensure_address(&self, _: u32) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Движок на локальном сервере, без адаптера. Сервер держим, пока жив движок.
+    fn test_engine(cfg: Config) -> (Engine, tunnel_server::Server) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir()
+            .join(format!("voidlink-tui-{}-{nanos}", std::process::id()));
+        let server = tunnel_server::Server::start(tunnel_server::Config {
+            listen: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            data_dir: dir,
+            workers: 1,
+            quiet: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], server.addr.port()));
+        let eng = crate::engine::start_with_tun(
+            std::sync::Arc::new(std::sync::Mutex::new(cfg)),
+            addr,
+            server.pubkey,
+            proto::Identity::generate(),
+            std::sync::Arc::new(NullTun),
+            std::sync::Arc::new(|_: &Config| {}),
+        )
+        .unwrap();
+        (eng, server)
+    }
+
+    fn friend_cfg() -> Config {
+        let mut cfg = Config::default();
+        cfg.friends = vec![
+            StoredFriend { pubkey: proto::hex_of(&[2; 32]), alias: "bob".into() },
+            StoredFriend { pubkey: proto::hex_of(&[3; 32]), alias: "eve".into() },
+        ];
+        cfg
+    }
+
+    fn ch(c: char) -> KeyEvent {
+        key(KeyCode::Char(c))
+    }
+
+    #[test]
+    fn русская_раскладка_нормализуется_кроме_полей_ввода() {
+        let mut a = app();
+        assert_eq!(latin_key(ch('й')).code, KeyCode::Char('q'));
+        assert_eq!(latin_key(ch('Щ')).code, KeyCode::Char('O'));
+        assert_eq!(latin_key(ch('o')).code, KeyCode::Char('o'));
+        let ctrl = KeyEvent::new(KeyCode::Char('с'), KeyModifiers::CONTROL);
+        assert_eq!(latin_key(ctrl), KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(!a.text_input_active());
+        a.filtering = true;
+        assert!(a.text_input_active(), "строка поиска — текст");
+        a.filtering = false;
+        a.open_command();
+        assert!(a.text_input_active(), "окно ввода — текст");
+        a.stack.clear();
+        a.stack.push(Popup::Help);
+        assert!(!a.text_input_active());
+    }
+
+    #[test]
+    fn хоткеи_в_русской_раскладке_через_handle_key() {
+        let (eng, _srv) = test_engine(friend_cfg());
+        let mut a = app();
+        // «з» = «p» — профиль.
+        a.handle_key(ch('з'), &eng);
+        assert!(matches!(a.stack.last(), Some(Popup::Profile)));
+        a.handle_key(key(KeyCode::Esc), &eng);
+        assert!(a.stack.is_empty());
+        // «Ж» = «:» — командная строка; в ней кириллица остаётся кириллицей.
+        a.handle_key(ch('Ж'), &eng);
+        a.handle_key(ch('ы'), &eng);
+        match a.stack.last() {
+            Some(Popup::Input(i)) => assert_eq!(i.value, "ы"),
+            _ => panic!("нет командной строки"),
+        }
+        a.stack.clear();
+        // Поиск: «/» и затем кириллица в фильтр как есть.
+        a.handle_key(ch('/'), &eng);
+        a.handle_key(ch('б'), &eng);
+        assert_eq!(a.filter, "б");
+        a.handle_key(key(KeyCode::Esc), &eng);
+        // «ы» = «s» — сортировка.
+        let before = a.sort;
+        a.handle_key(ch('ы'), &eng);
+        assert_ne!(a.sort, before);
+        // Ctrl+С (кириллица) — выход.
+        a.handle_key(KeyEvent::new(KeyCode::Char('с'), KeyModifiers::CONTROL), &eng);
+        assert!(a.quit);
+    }
+
+    #[test]
+    fn переименование_друга_клавишей_r_и_командой() {
+        let (eng, _srv) = test_engine(friend_cfg());
+        let mut a = app();
+        a.friends = vec![FriendView { alias: "bob".into(), pubkey: [2; 32], online: false, shared_groups: 0 }];
+        a.sel_friend = Some([2; 32]);
+        a.focus = Focus::Friends;
+        // «к» = «r» в списке друзей — окно алиаса с текущим именем.
+        a.handle_key(ch('к'), &eng);
+        match a.stack.last() {
+            Some(Popup::Input(i)) => {
+                assert!(matches!(i.action, InputAction::FriendAlias(pk) if pk == [2; 32]));
+                assert_eq!(i.value, "bob");
+            }
+            _ => panic!("нет окна алиаса"),
+        }
+        for _ in 0..3 {
+            a.handle_key(key(KeyCode::Backspace), &eng);
+        }
+        for c in "Боря".chars() {
+            a.handle_key(ch(c), &eng);
+        }
+        a.handle_key(key(KeyCode::Enter), &eng);
+        assert!(a.stack.is_empty());
+        let alias = |eng: &Engine, pk: [u8; 32]| {
+            let hex = proto::hex_of(&pk);
+            eng.cfg.lock().unwrap().friends.iter().find(|f| f.pubkey == hex).unwrap().alias.clone()
+        };
+        assert_eq!(alias(&eng, [2; 32]), "Боря");
+        assert_eq!(a.friends[0].alias, "Боря");
+        // :alias по алиасу; занятый алиас и неизвестный друг — ошибки.
+        a.run_command("alias eve Ева Ивановна", &eng).unwrap();
+        assert_eq!(alias(&eng, [3; 32]), "Ева Ивановна");
+        assert!(a.run_command("alias Боря Ева Ивановна", &eng).is_err());
+        assert!(a.run_command("alias nobody x", &eng).is_err());
+        // Вне списка друзей «r» — обновление списка групп.
+        a.focus = Focus::Groups;
+        a.handle_key(ch('r'), &eng);
+        assert!(a.stack.is_empty() && a.status_msg.contains("обновляем"));
+    }
+
+    #[test]
+    fn парс_алиаса_и_правка_конфига() {
+        assert_eq!(
+            parse_command("alias bob Боря Петров").unwrap(),
+            Command::Alias { friend: "bob".into(), name: "Боря Петров".into() }
+        );
+        assert!(parse_command("alias bob").is_err());
+        assert!(parse_command("alias").is_err());
+        let mut cfg = friend_cfg();
+        rename_friend_in(&mut cfg, &[2; 32], "  b2 ").unwrap();
+        assert_eq!(cfg.friends[0].alias, "b2");
+        assert!(rename_friend_in(&mut cfg, &[2; 32], " ").is_err());
+        assert!(rename_friend_in(&mut cfg, &[2; 32], "eve").is_err());
+        assert!(rename_friend_in(&mut cfg, &[4; 32], "x").is_err());
+        assert_eq!(resolve_friend_in(&cfg, "eve").unwrap(), [3; 32]);
+        assert_eq!(resolve_friend_in(&cfg, &proto::hex_of(&[2; 32])).unwrap(), [2; 32]);
+    }
+
+    #[test]
+    fn невидимка_из_настроек_и_командой() {
+        let (eng, _srv) = test_engine(Config::default());
+        let mut a = app();
+        assert!(!a.invisible);
+        a.handle_key(key(KeyCode::F(3)), &eng);
+        let row = SETTING_ROWS.iter().position(|r| *r == SettingRow::Invisible).unwrap();
+        for _ in 0..row {
+            a.handle_key(key(KeyCode::Down), &eng);
+        }
+        a.handle_key(key(KeyCode::Enter), &eng);
+        assert!(a.invisible);
+        assert!(a.toasts.iter().any(|t| t.text.contains("невидимка включена")));
+        assert!(matches!(a.stack.last(), Some(Popup::Settings(_))), "настройки остаются открытыми");
+        a.stack.clear();
+        a.run_command("invisible off", &eng).unwrap();
+        assert!(!a.invisible);
+    }
+
+    #[test]
+    fn счётчик_приглашений_для_бейджа() {
+        let mut a = online();
+        assert_eq!(a.pending_invites(), 0);
+        a.on_invite(inv(1), false);
+        a.on_invite(inv(2), false);
+        assert_eq!(a.pending_invites(), 2, "одно в окне, одно в очереди");
+        press(&mut a, KeyCode::Esc);
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.pending_invites(), 2, "отложенные тоже считаются");
+        // Клик по бейджу = «o»: снова открывает отложенные.
+        a.reopen_invites();
+        assert!(shown_gid(&a).is_some());
     }
 }
