@@ -49,7 +49,11 @@ $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
 if ($svc) {
     if ($svc.Status -ne 'Stopped') {
         Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
-        $svc.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
+        try {
+            $svc.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
+        } catch {
+            Write-Warning "Служба $ServiceName не остановилась за 30 с, продолжаю"
+        }
     }
     & sc.exe delete $ServiceName | Out-Null
 }
@@ -58,10 +62,25 @@ Get-Process -Name 'tunnel-daemon' -ErrorAction SilentlyContinue |
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 Remove-ItemProperty -Path $runKey -Name 'TunnelTray' -ErrorAction SilentlyContinue
 
-Start-Sleep -Milliseconds 500
+# Дождаться выхода процессов, державших файлы каталога
+Get-Process -Name 'tunnel-tray', 'tunnel-client', 'tunnel-daemon' -ErrorAction SilentlyContinue |
+    Wait-Process -Timeout 10 -ErrorAction SilentlyContinue
 if (Test-Path -LiteralPath $InstallDir) {
-    Remove-Item -LiteralPath $InstallDir -Recurse -Force
-    Write-Host "Удалён $InstallDir"
+    # Файлы могут быть заняты ещё долю секунды — несколько попыток
+    $removed = $false
+    for ($i = 1; $i -le 5 -and -not $removed; $i++) {
+        try {
+            Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction Stop
+            $removed = $true
+        } catch {
+            if ($i -lt 5) { Start-Sleep -Seconds 1 }
+        }
+    }
+    if ($removed) {
+        Write-Host "Удалён $InstallDir"
+    } else {
+        Write-Warning "Не удалось удалить $InstallDir (файлы заняты) — удалите вручную после перезагрузки"
+    }
 }
 
 if ($Purge) {

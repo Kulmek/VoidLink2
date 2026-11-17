@@ -1,9 +1,11 @@
 # systemd-юнит сервера VoidLink (tunnel-server).
 # Установка: infrastructure/linux/install-server.sh (или вручную в
 # /etc/systemd/system/, затем systemctl daemon-reload && systemctl enable --now tunnel-server).
-# Адрес и доп. флаги (лимиты, --workers, --metrics) — в /etc/default/tunnel-server:
+# Адрес и доп. флаги — в /etc/default/tunnel-server. Сейчас есть только
+# --workers и -q (лимиты и --metrics — с протоколом v3; неизвестный флаг
+# сервер примет за адрес и не стартует). С -q в журнале не будет Server code.
 #   TUNNEL_LISTEN=0.0.0.0:5555
-#   TUNNEL_ARGS=--workers 4 -q
+#   TUNNEL_ARGS=--workers 4
 [Unit]
 Description=VoidLink tunnel server (UDP relay/rendezvous)
 Documentation=file:///opt/tunnel/SERVER.md
@@ -25,7 +27,8 @@ ExecStart=/opt/tunnel/tunnel-server ${TUNNEL_LISTEN} --data /var/lib/tunnel $TUN
 
 Restart=on-failure
 RestartSec=2s
-# Корректное завершение: SIGTERM → сервер сохраняет server.json и выходит
+# SIGTERM: обработчика в сервере пока нет — процесс завершается сразу,
+# теряются изменения после последнего периодического сохранения (~3 с)
 KillSignal=SIGTERM
 KillMode=mixed
 TimeoutStopSec=15s

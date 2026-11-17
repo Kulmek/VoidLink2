@@ -75,7 +75,8 @@ if [[ ! -f "$DEFAULTS" ]]; then
     cat > "$DEFAULTS" <<CFG
 # Параметры tunnel-server (читаются systemd-юнитом)
 TUNNEL_LISTEN=${listen:-0.0.0.0:5555}
-# Доп. флаги, например: --workers 4 -q --max-owned-groups 32
+# Доп. флаги (сейчас есть только --workers N и -q), например: --workers 4
+# С -q в журнал не попадает Server code.
 TUNNEL_ARGS=
 CFG
     chmod 0644 "$DEFAULTS"
@@ -90,6 +91,10 @@ if [[ $start -eq 1 || $was_active -eq 1 ]]; then
     systemctl restart tunnel-server
     sleep 1
     if systemctl is-active --quiet tunnel-server; then
+        if grep -Eq '^[[:space:]]*TUNNEL_ARGS=.*(^|[[:space:]=])(-q|--quiet)([[:space:]]|$)' /etc/default/tunnel-server 2>/dev/null; then
+            echo "ВНИМАНИЕ: в TUNNEL_ARGS есть -q — Server code в журнал не пишется." >&2
+            echo "  Чтобы узнать код, временно уберите -q и перезапустите службу." >&2
+        fi
         echo "tunnel-server запущен. Server code:"
         journalctl -u tunnel-server -n 50 --no-pager -o cat | grep -m1 -o 'TUN-[A-Za-z0-9-]*' \
             || echo "  (см. journalctl -u tunnel-server)"

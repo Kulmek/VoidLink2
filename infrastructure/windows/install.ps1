@@ -32,6 +32,10 @@ function Test-Admin {
         [Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+# Нормализуем путь: хвостовой '\' перед закрывающей кавычкой ломает аргумент
+# при перезапуске через UAC ("C:\dist\" экранирует кавычку)
+$Source = (Resolve-Path -LiteralPath $Source).ProviderPath.TrimEnd('\')
+
 if (-not (Test-Admin)) {
     # Перезапуск с повышением прав (UAC)
     Write-Host 'Нужны права администратора, перезапускаю с UAC...'
@@ -40,6 +44,13 @@ if (-not (Test-Admin)) {
     if ($NoTray) { $argList += '-NoTray' }
     $p = Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs -Wait -PassThru
     exit $p.ExitCode
+}
+
+# Окно, поднятое через UAC, закрывается сразу — при ошибке держим его открытым
+trap {
+    Write-Host "Ошибка: $_" -ForegroundColor Red
+    Read-Host 'Нажмите Enter, чтобы закрыть' | Out-Null
+    exit 1
 }
 
 if (-not [Environment]::Is64BitOperatingSystem) {
