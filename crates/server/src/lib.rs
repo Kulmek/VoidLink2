@@ -3285,6 +3285,32 @@ mod tests {
     }
 
     #[test]
+    fn rotate_key_не_затирается_финальным_сохранением_при_остановке() {
+        let dir = temp_dir("rotate-stop");
+        let server = start_in(&dir, Limits::default());
+        let a = Raw::connect(server.addr, "alpha");
+        let gid = a.create("g", false).gid;
+        save_now(&server.shared);
+        let r = rotate_key(&dir).unwrap();
+        // После ротации состояние меняется (dirty), затем — остановка: её
+        // сохранение должно сохранить и новые группы, и новый ключ.
+        let gid2 = a.create("g2", false).gid;
+        a.sync();
+        server.stop();
+        let k = persist::Store::new(&dir).load_key().unwrap();
+        assert_eq!(proto::Identity { ed_seed: k.ed_seed, x_seed: k.x_seed }.ed_pub(), r.pubkey, "ключ затёрт при остановке");
+        assert_eq!(k.rotations.len(), 1);
+        let server = start_in(&dir, Limits::default());
+        assert_eq!(server.pubkey, r.pubkey);
+        {
+            let s = server.shared.state.read().unwrap();
+            assert!(s.groups.contains_key(&gid) && s.groups.contains_key(&gid2), "группы потеряны");
+        }
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn релей_под_нагрузкой() {
         const N: usize = 20_000;
         let limits = Limits { relay_rate: 1e7, relay_burst: 1e7, ..Limits::default() };
