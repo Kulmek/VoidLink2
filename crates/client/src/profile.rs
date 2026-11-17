@@ -4,7 +4,10 @@
 //! (`tunnel-client --profile <имя>`). Имя: `[A-Za-z0-9_-]{1,32}`.
 //!
 //! Экспорт identity — JSON-файл:
-//! - открытый: `{version, friend_code, ed_seed, x_seed}` (seed'ы в hex);
+//! - открытый: `{version, friend_code, ed_seed, x_seed, check}` (seed'ы в hex);
+//!   friend code связывает только ed_seed, поэтому x_seed прикрыт полем
+//!   `check = hex(keyed_hash(derive_key(CHECK_CONTEXT, ed_seed), x_seed))[..16]`
+//!   (поле необязательное: файлы без него принимаются, но x_seed не проверяется);
 //! - зашифрованный парольной фразой: `{version, friend_code, kdf, nonce, ciphertext}`,
 //!   где `ciphertext = ChaCha20-Poly1305(ed_seed || x_seed, aad = friend_code)`,
 //!   ключ выводится намеренно медленной KDF (итерированный keyed-hash blake3
@@ -114,6 +117,9 @@ struct ExportFile {
     ed_seed: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     x_seed: Option<String>,
+    /// Контроль целостности x_seed в открытом формате (см. `seed_check`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    check: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     kdf: Option<KdfParams>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -136,6 +142,16 @@ pub fn derive_key(passphrase: &str, salt: &[u8], iterations: u32) -> [u8; 32] {
         k = *blake3::keyed_hash(&k, &buf).as_bytes();
     }
     k
+}
+
+/// Контекст ключа для поля `check` открытого экспорта.
+const CHECK_CONTEXT: &str = "VoidLink identity export x_seed check v1";
+
+/// Контрольное значение x_seed, привязанное к ed_seed (16 hex-символов).
+fn seed_check(ed_seed: &[u8; 32], x_seed: &[u8; 32]) -> String {
+    let k = blake3::derive_key(CHECK_CONTEXT, ed_seed);
+    let h = blake3::keyed_hash(&k, x_seed);
+    proto::hex_of(&h.as_bytes()[..8])
 }
 
 fn hex32(s: &str, what: &str) -> Result<[u8; 32]> {
@@ -167,6 +183,7 @@ fn export_with_iterations(id: &proto::Identity, passphrase: Option<&str>, iterat
             friend_code,
             ed_seed: Some(proto::hex_of(&id.ed_seed)),
             x_seed: Some(proto::hex_of(&id.x_seed)),
+            check: Some(seed_check(&id.ed_seed, &id.x_seed)),
             kdf: None,
             nonce: None,
             ciphertext: None,
@@ -189,6 +206,7 @@ fn export_with_iterations(id: &proto::Identity, passphrase: Option<&str>, iterat
                 friend_code,
                 ed_seed: None,
                 x_seed: None,
+                check: None,
                 kdf: Some(KdfParams { alg: KDF_ALG.into(), salt: proto::hex_of(&salt), iterations }),
                 nonce: Some(proto::hex_of(&nonce)),
                 ciphertext: Some(proto::hex_of(&ct)),
@@ -221,7 +239,14 @@ fn import_with_min_iterations(data: &[u8], passphrase: Option<&str>, min_iter: u
         let (Some(ed), Some(x)) = (&f.ed_seed, &f.x_seed) else {
             bail!("в файле экспорта нет ключей");
         };
-        return identity_from_seeds(hex32(ed, "ed_seed")?, hex32(x, "x_seed")?, &f.friend_code);
+        let (ed, x) = (hex32(ed, "ed_seed")?, hex32(x, "x_seed")?);
+        if let Some(c) = &f.check {
+            ensure!(
+                c.trim().eq_ignore_ascii_case(&seed_check(&ed, &x)),
+                "x_seed в файле экспорта не сходится с контрольным полем (файл повреждён или подменён)"
+            );
+        }
+        return identity_from_seeds(ed, x, &f.friend_code);
     }
     ensure!(f.ed_seed.is_none() && f.x_seed.is_none(), "файл экспорта: открытые и зашифрованные ключи одновременно");
     let (Some(kdf), Some(nonce), Some(ct)) = (&f.kdf, &f.nonce, &f.ciphertext) else {
@@ -256,9 +281,41 @@ fn import_with_min_iterations(data: &[u8], passphrase: Option<&str>, min_iter: u
 /// Записывает экспорт identity в файл (через временный файл + rename).
 pub fn export_to_file(path: &Path, id: &proto::Identity, passphrase: Option<&str>) -> Result<()> {
     let data = export_identity(id, passphrase)?;
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, &data).with_context(|| format!("запись {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("запись {}", path.display()))?;
+    // Имя tmp дописывается к имени файла (а не меняет расширение), чтобы не
+    // задеть посторонний файл и не совпасть с целевым.
+    let mut s = path.as_os_str().to_owned();
+    s.push(".tmp");
+    let tmp = PathBuf::from(s);
+    let res = write_private(&tmp, &data)
+        .and_then(|()| std::fs::rename(&tmp, path).with_context(|| format!("запись {}", path.display())));
+    if res.is_err() {
+        // Не оставляем на диске открытые seed'ы.
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
+}
+
+/// Пишет файл, доступный только владельцу (0600 на Unix): в экспорте могут
+/// лежать открытые seed'ы.
+fn write_private(path: &Path, data: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let ctx = || format!("запись {}", path.display());
+    let mut f = opts.open(path).with_context(ctx)?;
+    // Если файл уже существовал, mode() не применится — права ставим явно.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600)).with_context(ctx)?;
+    }
+    f.write_all(data).with_context(ctx)?;
+    f.sync_all().with_context(ctx)?;
     Ok(())
 }
 
@@ -403,6 +460,50 @@ mod tests {
         let mut plain: serde_json::Value = serde_json::from_slice(&export_identity(&id, None).unwrap()).unwrap();
         plain["version"] = 99.into();
         assert!(imp(&serde_json::to_vec(&plain).unwrap(), None).err().expect("ожидалась ошибка").to_string().contains("версия"));
+    }
+
+    #[test]
+    fn контроль_x_seed() {
+        let id = proto::Identity::generate();
+        let data = export_identity(&id, None).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        assert_eq!(v["check"].as_str().unwrap().len(), 16);
+        // Подменённый x_seed ловится контрольным полем.
+        let mut t = v.clone();
+        t["x_seed"] = proto::hex_of(&[9u8; 32]).into();
+        let err = imp(&serde_json::to_vec(&t).unwrap(), None).err().expect("ожидалась ошибка").to_string();
+        assert!(err.contains("контрольным"), "{err}");
+        // Старый файл без check принимается.
+        let mut t = v.clone();
+        t.as_object_mut().unwrap().remove("check");
+        assert!(same(&imp(&serde_json::to_vec(&t).unwrap(), None).unwrap(), &id));
+    }
+
+    #[test]
+    fn экспорт_в_файл() {
+        let dir = std::env::temp_dir().join(format!("vl-export-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("backup.json");
+        // Посторонний файл с «заменённым расширением» не трогаем.
+        let bystander = dir.join("backup.tmp");
+        std::fs::write(&bystander, b"keep").unwrap();
+        let id = proto::Identity::generate();
+        export_to_file(&target, &id, None).unwrap();
+        assert_eq!(std::fs::read(&bystander).unwrap(), b"keep");
+        assert!(!dir.join("backup.json.tmp").exists());
+        assert!(same(&import_from_file(&target, None).unwrap(), &id));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        // Цель с расширением .tmp тоже работает.
+        let t2 = dir.join("x.tmp");
+        export_to_file(&t2, &id, None).unwrap();
+        assert!(same(&import_from_file(&t2, None).unwrap(), &id));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
