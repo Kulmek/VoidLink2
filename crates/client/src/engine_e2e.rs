@@ -207,6 +207,7 @@ fn start_server_with(dir: &std::path::Path, port: u16, limits: tunnel_server::Li
         workers: 4,
         quiet: true,
         limits,
+        ..Default::default()
     })
     .expect("сервер стартует")
 }
@@ -762,7 +763,7 @@ fn e2e_битый_server_json_не_затирается() {
         data_dir: dir.clone(),
         workers: 1,
         quiet: true,
-        limits: tunnel_server::Limits::default(),
+        ..Default::default()
     });
     assert!(r.is_err(), "сервер не должен стартовать с битым server.json");
     assert_eq!(std::fs::read(&path).unwrap(), b"{ not json", "файл не тронут");
@@ -1464,6 +1465,10 @@ fn e2e_открытые_ответы_не_обрывают_подключени�
 
     stop.store(true, Ordering::Relaxed);
     thread.join().unwrap();
+    server.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Кикнутый с отстающей ревизией (дельта не дошла — повод для GET_GROUP):
 /// ответ с ревизией новее его своей, но не новее кика, группу не возвращает —
 /// граница запоздания берётся из KICKED, а не из своей ревизии.
