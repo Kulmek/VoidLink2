@@ -8,7 +8,14 @@
 //!
 //! Запросы обрабатываются по одному: ограничены размер заголовков и время
 //! на чтение/запись, поэтому медленный клиент (slowloris) не держит поток
-//! дольше таймаута.
+//! дольше таймаута (`READ_DEADLINE` < 1 с — нормальный скрейп приходит одним
+//! пакетом). Этого мало против целенаправленной атаки: поэтому эндпоинт
+//! рассчитан на локальный/приватный интерфейс — по умолчанию `DEFAULT_ADDR`
+//! (127.0.0.1), наружу (0.0.0.0) его не выставлять.
+//!
+//! Датчики выставляйте из авторитетного количества (`set(&m.sessions,
+//! sessions.len())` раз в тик); если всё же нужен инкремент/декремент —
+//! `inc`/`dec`, причём `dec` не уходит ниже нуля.
 
 #![allow(dead_code)] // подключается при интеграции
 
@@ -25,11 +32,15 @@ use anyhow::{Context, Result};
 /// Максимальный размер заголовков запроса.
 const MAX_REQUEST: usize = 4096;
 /// Общий лимит времени на чтение запроса (защита от slowloris).
-const READ_DEADLINE: Duration = Duration::from_secs(3);
+const READ_DEADLINE: Duration = Duration::from_millis(750);
 /// Таймаут записи ответа.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Как часто поток проверяет флаг остановки, пока нет подключений.
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
+
+/// Адрес эндпоинта по умолчанию: только локальный интерфейс.
+pub const DEFAULT_ADDR: SocketAddr =
+    SocketAddr::V4(std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 9100));
 
 /// Колбэк проверки здоровья.
 pub type HealthFn = Arc<dyn Fn() -> bool + Send + Sync>;
@@ -66,6 +77,20 @@ impl Metrics {
     #[inline]
     pub fn inc(c: &AtomicU64, n: u64) {
         c.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Уменьшить датчик на 1, не уходя ниже нуля (декремент раньше
+    /// парного инкремента в гонке даёт 0, а не ~1.8e19).
+    #[inline]
+    pub fn dec(g: &AtomicU64) {
+        // CAS-цикл вручную: `fetch_update` в новых toolchain помечен устаревшим.
+        let mut cur = g.load(Ordering::Relaxed);
+        while cur > 0 {
+            match g.compare_exchange_weak(cur, cur - 1, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return,
+                Err(actual) => cur = actual,
+            }
+        }
     }
 
     /// Выставить датчик.
@@ -263,6 +288,17 @@ mod tests {
         let mut out = String::new();
         s.read_to_string(&mut out).unwrap();
         out
+    }
+
+    #[test]
+    fn gauge_dec_saturates() {
+        let m = Metrics::new();
+        Metrics::dec(&m.sessions);
+        assert_eq!(m.sessions.load(Ordering::Relaxed), 0);
+        Metrics::inc(&m.sessions, 2);
+        Metrics::dec(&m.sessions);
+        assert_eq!(m.sessions.load(Ordering::Relaxed), 1);
+        assert!(DEFAULT_ADDR.ip().is_loopback());
     }
 
     #[test]

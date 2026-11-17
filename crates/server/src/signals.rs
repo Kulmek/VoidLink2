@@ -4,8 +4,15 @@
 //! Windows: Ctrl+C (SIGINT), Ctrl+Break (SIGBREAK) и SIGTERM через CRT,
 //! их регистрирует signal-hook.
 //!
+//! Windows: закрытие окна консоли, выход из системы и выключение
+//! (CTRL_CLOSE/LOGOFF/SHUTDOWN_EVENT) CRT в сигналы не переводит — их ловит
+//! отдельный `SetConsoleCtrlHandler`, который выставляет тот же флаг и даёт
+//! главному циклу несколько секунд на финальный persist.
+//!
 //! Обработчик сигнала только выставляет атомарный флаг (async-signal-safe),
 //! главный цикл проверяет `requested()` или блокируется в `wait()`.
+//! Повторный сигнал, пришедший, когда флаг уже стоит (корректное завершение
+//! зависло), завершает процесс сразу с кодом 1.
 
 #![allow(dead_code)] // подключается при интеграции
 
@@ -18,9 +25,6 @@ use anyhow::{Context, Result};
 
 /// Шаг опроса флага в `wait()`.
 const POLL: Duration = Duration::from_millis(50);
-
-#[cfg(windows)]
-const SIGBREAK: i32 = 21;
 
 /// Хэндл завершения: клонируется и передаётся в воркеры.
 #[derive(Clone)]
@@ -38,9 +42,16 @@ impl Shutdown {
     pub fn install() -> Result<Self> {
         let s = Self::new();
         for sig in signals() {
+            // Порядок важен: условный выход регистрируется первым и видит флаг
+            // ещё не выставленным при первом сигнале, а при втором — уже
+            // выставленным, и тогда завершает процесс.
+            signal_hook::flag::register_conditional_shutdown(sig, 1, s.flag.clone())
+                .with_context(|| format!("не удалось поставить обработчик сигнала {sig}"))?;
             signal_hook::flag::register(sig, s.flag.clone())
                 .with_context(|| format!("не удалось поставить обработчик сигнала {sig}"))?;
         }
+        #[cfg(windows)]
+        console::install(s.flag.clone())?;
         Ok(s)
     }
 
@@ -95,8 +106,58 @@ fn signals() -> Vec<i32> {
 
 #[cfg(windows)]
 fn signals() -> Vec<i32> {
-    use signal_hook::consts::{SIGINT, SIGTERM};
+    use signal_hook::consts::{SIGBREAK, SIGINT, SIGTERM};
     vec![SIGINT, SIGTERM, SIGBREAK]
+}
+
+/// Закрытие консоли / выход из системы / выключение на Windows.
+#[cfg(windows)]
+mod console {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, OnceLock};
+    use std::thread;
+    use std::time::Duration;
+
+    use anyhow::{Result, bail};
+    use windows_sys::Win32::Foundation::{FALSE, TRUE};
+    use windows_sys::core::BOOL;
+    use windows_sys::Win32::System::Console::{
+        CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT, SetConsoleCtrlHandler,
+    };
+
+    /// Сколько ждать после выставления флага. Windows даёт ~5 с на
+    /// CTRL_CLOSE_EVENT, после возврата из обработчика процесс убивается.
+    const GRACE: Duration = Duration::from_secs(4);
+
+    static FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+
+    unsafe extern "system" fn handler(ctrl: u32) -> BOOL {
+        match ctrl {
+            CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT => {
+                if let Some(f) = FLAG.get() {
+                    f.store(true, Ordering::SeqCst);
+                }
+                // Обработчик выполняется в отдельном потоке — можно спать,
+                // пока главный цикл завершается.
+                thread::sleep(GRACE);
+                TRUE
+            }
+            // Ctrl+C / Ctrl+Break отдаём дальше — их обрабатывает CRT/signal-hook.
+            _ => FALSE,
+        }
+    }
+
+    pub fn install(flag: Arc<AtomicBool>) -> Result<()> {
+        if FLAG.set(flag).is_err() {
+            // Уже установлен ранее (повторный `install()`): обработчик один на процесс.
+            return Ok(());
+        }
+        // SAFETY: `handler` — корректная функция с сигнатурой PHANDLER_ROUTINE.
+        if unsafe { SetConsoleCtrlHandler(Some(handler), TRUE) } == FALSE {
+            bail!("не удалось поставить обработчик событий консоли");
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
