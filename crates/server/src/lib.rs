@@ -73,8 +73,9 @@ const LOAD_MARGIN: u32 = 1 << 16;
 /// обходит постоянно.
 const MAX_INVITES_PER_GROUP: usize = 64;
 const MAX_BANS_PER_GROUP: usize = 256;
-/// Лимитер HELLO по IP: шардов и записей в шарде (новые адреса сверх —
-/// без ответа, пока housekeeping не забудет молчащие).
+/// Лимитер HELLO по IP: шардов и записей в шарде. Переполненный шард
+/// сначала выбрасывает восполнившиеся корзины (без потери состояния: новая
+/// корзина та же), и только если таких нет — новым адресам отказ.
 const IP_SHARDS: usize = 16;
 const IP_SHARD_MAX: usize = 4096;
 const STATS_EVERY: Duration = Duration::from_secs(300);
@@ -385,6 +386,30 @@ impl Bucket {
             false
         }
     }
+
+    /// Запас уже восполнился до `burst`: такая корзина неотличима от новой,
+    /// её можно забыть без ослабления лимита.
+    fn refilled(&self, rate: f64, burst: f64, now: Instant) -> bool {
+        self.tokens + now.saturating_duration_since(self.last).as_secs_f64() * rate >= burst
+    }
+}
+
+/// Жетон лимитера HELLO из шарда `m` для ключа `key`. Шард с `cap`
+/// записями чистится от восполнившихся корзин; не помогло — отказ новому
+/// адресу (поток с подменой адресов не раздувает карту и не вытесняет
+/// корзины тех, кто реально исчерпал запас).
+fn ip_take(m: &mut HashMap<IpAddr, Bucket>, key: IpAddr, rate: f64, burst: f64, cap: usize) -> bool {
+    if let Some(b) = m.get_mut(&key) {
+        return b.take(rate, burst);
+    }
+    if m.len() >= cap {
+        let now = Instant::now();
+        m.retain(|_, b| !b.refilled(rate, burst, now));
+        if m.len() >= cap {
+            return false;
+        }
+    }
+    m.entry(key).or_insert_with(|| Bucket::new(burst)).take(rate, burst)
 }
 
 struct Session {
@@ -618,14 +643,7 @@ impl Shared {
         let (rate, burst) = (self.limits.hello_rate, self.limits.hello_burst);
         let key = ip_key(ip);
         let shard = self.ip_hash.hash_one(key) as usize % IP_SHARDS;
-        let mut m = self.per_ip[shard].lock().unwrap();
-        if let Some(b) = m.get_mut(&key) {
-            return b.take(rate, burst);
-        }
-        if m.len() >= IP_SHARD_MAX {
-            return false;
-        }
-        m.entry(key).or_insert_with(|| Bucket::new(burst)).take(rate, burst)
+        ip_take(&mut self.per_ip[shard].lock().unwrap(), key, rate, burst, IP_SHARD_MAX)
     }
 
     /// Жетон общего бюджета открытых ответов.
@@ -970,9 +988,11 @@ fn housekeeping(sh: Arc<Shared>) {
         if sh.list_dirty.swap(false, Ordering::Relaxed) {
             broadcast_group_list(&sh);
         }
-        // Лимитер по IP: забыть давно молчащих.
+        // Лимитер по IP: забыть восполнившиеся корзины (раньше — не
+        // сбрасывать запас исчерпавшим его, даже при медленном `hello_rate`).
+        let (rate, burst, now) = (sh.limits.hello_rate, sh.limits.hello_burst, Instant::now());
         for shard in &sh.per_ip {
-            shard.lock().unwrap().retain(|_, b| b.last.elapsed() < Duration::from_secs(60));
+            shard.lock().unwrap().retain(|_, b| !b.refilled(rate, burst, now));
         }
         if last_save.elapsed() >= SAVE_EVERY {
             last_save = Instant::now();
@@ -2841,6 +2861,37 @@ mod tests {
         assert!(recv_plain(&sock, ctrl::UNSUPPORTED, Duration::from_millis(500)).is_none());
         server.stop();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn карта_лимитера_ip_ограничена_и_не_забывает_исчерпавших() {
+        let ip = |i: u32| IpAddr::V4(Ipv4Addr::from(i));
+        let mut m = HashMap::new();
+        // Медленный лимит: исчерпавшие запас не восполняются за тест.
+        let (rate, burst) = (0.001, 2.0);
+        for i in 0..8 {
+            assert!(ip_take(&mut m, ip(i), rate, burst, 8));
+            assert!(ip_take(&mut m, ip(i), rate, burst, 8));
+            assert!(!ip_take(&mut m, ip(i), rate, burst, 8));
+        }
+        // Карта полна исчерпавшими: новому адресу отказ, карта не растёт.
+        assert!(!ip_take(&mut m, ip(100), rate, burst, 8));
+        assert_eq!(m.len(), 8);
+        // Восполнившиеся корзины вытесняются, лимит у исчерпавших остаётся.
+        let mut m = HashMap::new();
+        let (rate, burst) = (1e9, 2.0);
+        for i in 0..8 {
+            assert!(ip_take(&mut m, ip(i), rate, burst, 8));
+        }
+        assert!(ip_take(&mut m, ip(100), rate, burst, 8), "восполнившиеся — вытеснить");
+        assert!(m.len() <= 8);
+        // IPv6 из одного /64 — одна запись.
+        let mut m = HashMap::new();
+        for i in 0..100u128 {
+            let a = std::net::Ipv6Addr::from((0x2001_0db8_0001_0002u128 << 64) | i);
+            ip_take(&mut m, ip_key(IpAddr::V6(a)), 0.001, 1000.0, 8);
+        }
+        assert_eq!(m.len(), 1);
     }
 
     #[test]
