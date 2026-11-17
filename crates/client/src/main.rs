@@ -35,6 +35,7 @@ mod dns;
 mod engine;
 #[cfg(test)]
 mod engine_e2e;
+mod ipv6;
 mod store;
 mod tun;
 mod tui;
