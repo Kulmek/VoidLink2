@@ -19,7 +19,9 @@
 //!   RESET на IP-адрес;
 //! - мусор и чужие фреймы отбрасываются молча, без записи в лог.
 
+pub mod metrics;
 pub mod persist;
+pub mod signals;
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
