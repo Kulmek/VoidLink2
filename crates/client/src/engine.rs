@@ -37,7 +37,17 @@ use tunnel_protocol as proto;
 
 use crate::store::Config;
 
+#[cfg(windows)]
 const RING_CAPACITY: u32 = 0x40_0000; // 4 MiB
+
+/// Имя адаптера по умолчанию: Windows — имя wintun-адаптера, Linux — имя
+/// TUN-интерфейса, macOS — игнорируется (ядро само выдаёт utunN).
+#[cfg(windows)]
+pub const DEFAULT_ADAPTER: &str = "TunnelVPN";
+#[cfg(target_os = "linux")]
+pub const DEFAULT_ADAPTER: &str = "voidlink0";
+#[cfg(not(any(windows, target_os = "linux")))]
+pub const DEFAULT_ADAPTER: &str = "utun";
 /// Шаг цикла движка (верхняя граница задержки таймеров).
 const TICK: Duration = Duration::from_millis(100);
 /// RTT-зонд онлайн-пирам. Для прямых каналов он же держит NAT-маппинг.
@@ -630,12 +640,14 @@ pub trait TunDev: Send + Sync {
     fn ensure_address(&self, ip: u32) -> Result<()>;
 }
 
+#[cfg(windows)]
 struct WintunDev {
     adapter: Arc<wintun::Adapter>,
     session: Arc<wintun::Session>,
     configured: Mutex<HashSet<u32>>,
 }
 
+#[cfg(windows)]
 impl TunDev for WintunDev {
     fn inject(&self, packet: &[u8]) -> Result<()> {
         let len: u16 = packet.len().try_into().context("packet too large")?;
@@ -651,6 +663,31 @@ impl TunDev for WintunDev {
     fn ensure_address(&self, ip: u32) -> Result<()> {
         let mut cfg = self.configured.lock().unwrap();
         crate::tun::ensure_address(&self.adapter, &mut cfg, ip)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl TunDev for crate::tun_linux::LinuxTun {
+    fn inject(&self, packet: &[u8]) -> Result<()> {
+        self.write(packet)
+    }
+
+    fn ensure_address(&self, ip: u32) -> Result<()> {
+        // `ip addr replace <ip>/24` сам добавляет маршрут на /24 группы.
+        crate::tun_linux::LinuxTun::ensure_address(self, ip)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl TunDev for crate::tun_macos::Utun {
+    fn inject(&self, packet: &[u8]) -> Result<()> {
+        self.write(packet).context("запись в utun")?;
+        Ok(())
+    }
+
+    fn ensure_address(&self, ip: u32) -> Result<()> {
+        // ifconfig inet + route add на /24 группы.
+        crate::tun_macos::Utun::ensure_address(self, ip)
     }
 }
 
@@ -1196,8 +1233,11 @@ impl CtrlConn {
 
 // ---------- запуск ----------
 
-/// Загружает Wintun, создаёт адаптер, запускает потоки и возвращает дескриптор
-/// движка. Первое подключение выполняется синхронно (ошибка видна вызывающему).
+/// Создаёт TUN-устройство платформы (Windows — Wintun, Linux — /dev/net/tun,
+/// macOS — utun), запускает потоки и возвращает дескриптор движка.
+/// `adapter_name`: имя wintun-адаптера / Linux-интерфейса; на macOS
+/// игнорируется (номер utunN выбирает ядро). `dll` — только Windows.
+/// Первое подключение выполняется синхронно (ошибка видна вызывающему).
 pub fn start(
     cfg: Arc<Mutex<Config>>,
     server: SocketAddr,
@@ -1208,19 +1248,68 @@ pub fn start(
     save: Arc<dyn Fn(&Config) + Send + Sync>,
 ) -> Result<Engine> {
     let mtu = cfg.lock().unwrap().mtu();
-    let wintun = crate::tun::load_wintun_dll(dll.as_deref())?;
-    let adapter = crate::tun::create_adapter(&wintun, adapter_name)?;
-    crate::tun::set_mtu(&adapter, mtu)?;
-    crate::tun::allow_firewall(adapter_name);
-    let session = Arc::new(adapter.start_session(RING_CAPACITY)?);
-    let dev = Arc::new(WintunDev {
-        adapter,
-        session: session.clone(),
-        configured: Mutex::new(HashSet::new()),
-    });
-    let eng = start_with_tun(cfg, server, server_pub, identity, dev, save)?;
-    spawn_tun_reader(session, eng.env.clone());
-    Ok(eng)
+    #[cfg(windows)]
+    {
+        let wintun = crate::tun::load_wintun_dll(dll.as_deref())?;
+        let adapter = crate::tun::create_adapter(&wintun, adapter_name)?;
+        crate::tun::set_mtu(&adapter, mtu)?;
+        crate::tun::allow_firewall(adapter_name);
+        let session = Arc::new(adapter.start_session(RING_CAPACITY)?);
+        let dev = Arc::new(WintunDev {
+            adapter,
+            session: session.clone(),
+            configured: Mutex::new(HashSet::new()),
+        });
+        let eng = start_with_tun(cfg, server, server_pub, identity, dev, save)?;
+        spawn_tun_reader(session, eng.env.clone());
+        Ok(eng)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = dll;
+        // Имя по умолчанию Windows-адаптера на Linux не годится (регистр,
+        // длина) — берём voidlink0, если задано пусто или виндовое имя.
+        let name = if adapter_name.is_empty() || adapter_name == "TunnelVPN" {
+            DEFAULT_ADAPTER
+        } else {
+            adapter_name
+        };
+        let dev = Arc::new(crate::tun_linux::LinuxTun::open(name, mtu).with_context(|| {
+            format!("не удалось создать TUN-интерфейс {name} (запусти от root или дай CAP_NET_ADMIN)")
+        })?);
+        eprintln!("[tun] interface {} up, mtu {mtu}", dev.name());
+        let eng = start_with_tun(cfg, server, server_pub, identity, dev.clone(), save)?;
+        let fd = std::os::fd::AsRawFd::as_raw_fd(dev.as_ref());
+        let rd = dev.clone();
+        spawn_unix_tun_reader(fd, move |buf| rd.read(buf).map(Some), eng.env.clone());
+        Ok(eng)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (dll, adapter_name);
+        let dev = Arc::new(
+            crate::tun_macos::Utun::open(mtu).context("не удалось создать utun (запусти через sudo)")?,
+        );
+        let eng = start_with_tun(cfg, server, server_pub, identity, dev.clone(), save)?;
+        let fd = dev.raw_fd();
+        let rd = dev.clone();
+        spawn_unix_tun_reader(
+            fd,
+            move |buf| match rd.read(buf) {
+                Ok(n) => Ok(Some(n)),
+                // Обрезанный пакет или чужое семейство — пропускаем.
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => Ok(None),
+                Err(e) => Err(anyhow::Error::from(e).context("чтение из utun")),
+            },
+            eng.env.clone(),
+        );
+        Ok(eng)
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (cfg, server, server_pub, identity, adapter_name, dll, save, mtu);
+        anyhow::bail!("TUN не поддерживается на этой платформе")
+    }
 }
 
 /// Метка сервера из конфига.
@@ -2544,6 +2633,7 @@ fn punch_round(env: &Env) {
 
 // ---------- фоновые потоки ----------
 
+#[cfg(windows)]
 fn spawn_tun_reader(session: Arc<wintun::Session>, env: Arc<Env>) {
     thread::Builder::new()
         .name("tun".into())
@@ -2554,6 +2644,49 @@ fn spawn_tun_reader(session: Arc<wintun::Session>, env: Arc<Env>) {
                     Err(_) => break,
                 };
                 route_packet(&env, pkt.bytes());
+            }
+        })
+        .expect("spawn tun thread");
+}
+
+/// Поток чтения TUN на Linux/macOS: poll с таймаутом, чтобы поток (и с ним
+/// `Arc` устройства, т.е. fd) завершился вскоре после остановки движка, даже
+/// если пакетов нет. `read` возвращает длину пакета, `None` — пакет пропустить.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn spawn_unix_tun_reader<R>(fd: std::os::fd::RawFd, read: R, env: Arc<Env>)
+where
+    R: Fn(&mut [u8]) -> Result<Option<usize>> + Send + 'static,
+{
+    thread::Builder::new()
+        .name("tun".into())
+        .spawn(move || {
+            let mut buf = vec![0u8; 65535];
+            while !env.quitting() {
+                let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+                // SAFETY: pfd — валидный указатель на один pollfd.
+                let rc = unsafe { libc::poll(&mut pfd, 1, 250) };
+                if rc < 0 {
+                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    break;
+                }
+                if rc == 0 {
+                    continue;
+                }
+                if pfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+                    eprintln!("[tun] устройство закрыто или в ошибке");
+                    break;
+                }
+                match read(&mut buf) {
+                    Ok(Some(0)) => break,
+                    Ok(Some(n)) => route_packet(&env, &buf[..n]),
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!("[tun] {e:#}");
+                        break;
+                    }
+                }
             }
         })
         .expect("spawn tun thread");

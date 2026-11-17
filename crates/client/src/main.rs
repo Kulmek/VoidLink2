@@ -46,6 +46,7 @@ mod snapshot;
 mod profile;
 mod store;
 mod tcp_link;
+#[cfg(windows)]
 mod tun;
 #[cfg(target_os = "linux")]
 mod tun_linux;
@@ -65,7 +66,7 @@ use store::{Config, StoredFriend, StoredServer};
 
 fn main() -> Result<()> {
     let mut dir = store::default_dir();
-    let mut adapter = "TunnelVPN".to_string();
+    let mut adapter = engine::DEFAULT_ADAPTER.to_string();
     let mut dll: Option<String> = None;
     let mut server_sel: Option<String> = None;
     let mut debug = false;
@@ -82,6 +83,9 @@ fn main() -> Result<()> {
             adapter = args.get(i + 1).context("--adapter требует значение")?.clone();
             args.drain(i..=i + 1);
         } else if a == "--dll" {
+            if !cfg!(windows) {
+                bail!("--dll нужен только на Windows (wintun.dll)");
+            }
             dll = Some(args.get(i + 1).context("--dll требует значение")?.clone());
             args.drain(i..=i + 1);
         } else if a == "--server" {
@@ -540,6 +544,17 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Подсказка по флагам `run` для текущей ОС.
+fn run_flags_help() -> &'static str {
+    if cfg!(windows) {
+        "--adapter <имя wintun-адаптера> --dll <путь к wintun.dll>; нужен запуск от администратора"
+    } else if cfg!(target_os = "linux") {
+        "--adapter <имя интерфейса, по умолчанию voidlink0>; нужен root или CAP_NET_ADMIN"
+    } else {
+        "адаптер — utunN, выбирается автоматически; нужен запуск через sudo"
+    }
+}
+
 fn usage() {
     println!(
         r#"tunnel-client (протокол v3) — Hamachi-подобный VPN
@@ -561,13 +576,14 @@ global: --dir <path> --debug --server <N|addr|label> (по умолчанию �
   friend-groups <peer>
   add-friend <code> [alias] | del-friend <alias> | friends
   invisible on|off            невидимка: другие видят вас офлайн
-  run                         поднять туннель (global: --adapter --dll --server <N>)
+  run                         поднять туннель (global: --adapter --dll --server <N>, см. ниже)
   tui                         то же, но с графическим интерфейсом (ratatui)
 peer = friend code (TUN-…) | hex | alias
 
 Если при запуске tui имя или сервер не заданы — сначала открывается
 экран первичной настройки (Enter — применить, Esc — отмена)."#
     );
+    println!("run/tui: {}", run_flags_help());
 }
 
 fn bail_if_empty(s: &str, msg: &str) {
