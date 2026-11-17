@@ -8,6 +8,9 @@ use crate::model::{Action, Conn, TrayGroup, TrayInvite, TrayState};
 
 pub trait TrayBackend {
     /// Текущий снимок; вызывается по таймеру (раз в ~500 мс), не должен блокировать надолго.
+    /// IPC-реализация обязана заполнять `TrayState::kicked` из событий демона
+    /// (Kicked / GroupDeleted), накопленных с прошлого вызова, и отдавать каждое
+    /// один раз: трей не угадывает исключение по разнице снимков.
     fn state(&self) -> TrayState;
     /// Действие демона (группы, приглашения, остановка). Локальные действия
     /// (`Action::is_local`) трей выполняет сам и сюда не передаёт.
@@ -36,6 +39,7 @@ impl StubBackend {
                 TrayGroup { gid: 2, name: "работа".into(), joined: false },
             ],
             invites: vec![TrayInvite { gid: 3, group_name: "игры".into(), from: "друг".into() }],
+            kicked: Vec::new(),
             tui_open: false,
         })
     }

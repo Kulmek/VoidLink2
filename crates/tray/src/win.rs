@@ -12,7 +12,7 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, KillTimer, MB_ICONERROR, MB_OK, MSG, MessageBoxW, PostQuitMessage,
-    RegisterWindowMessageW, SW_HIDE, SetTimer, TranslateMessage, WM_TIMER,
+    SW_HIDE, SetTimer, TranslateMessage, WM_TIMER,
 };
 
 use crate::backend::TrayBackend;
@@ -37,9 +37,8 @@ pub fn error_box(text: &str) {
 
 /// Главный цикл трея; возвращается по «Выход».
 pub fn run(backend: &dyn TrayBackend, mode: NotifyMode) -> Result<(), String> {
-    // Explorer рассылает TaskbarCreated всем окнам верхнего уровня после
-    // перезапуска; скрытое окно tray-icon получает его через наш цикл.
-    let taskbar_created = unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) };
+    // TaskbarCreated (перезапуск explorer) обрабатывает сам tray-icon в своей
+    // оконной процедуре (remove + register), здесь его не ловим.
     let mut ui = Ui::new(backend, mode);
     ui.refresh();
     ui.recreate()?;
@@ -54,11 +53,6 @@ pub fn run(backend: &dyn TrayBackend, mode: NotifyMode) -> Result<(), String> {
         unsafe {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
-        }
-        if taskbar_created != 0 && msg.message == taskbar_created {
-            // tray-icon сам перерегистрирует значок, но после перезапуска
-            // explorer он мог стартовать раньше панели — пересоздаём целиком.
-            let _ = ui.recreate();
         }
         let clicked = ui.drain_menu_events();
         if msg.message == WM_TIMER || clicked {
@@ -98,9 +92,8 @@ impl<'a> Ui<'a> {
         }
     }
 
-    /// Создать значок заново из текущего состояния (старт, TaskbarCreated).
+    /// Создать значок из текущего состояния (старт).
     fn recreate(&mut self) -> Result<(), String> {
-        self.tray = None; // Drop снимает старый значок
         let color = model::icon_color(self.state.conn);
         self.menu = model::build_menu(&self.state);
         self.tip = model::tooltip(&self.state);
@@ -150,6 +143,12 @@ impl<'a> Ui<'a> {
             any = true;
             let Some(a) = Action::from_id(ev.id().as_ref()) else { continue };
             self.notifier.on_action(a);
+            if matches!(a, Action::ToggleGroup { .. }) {
+                // muda сам переключил галочку CheckMenuItem по клику; если демон
+                // ещё не применил (или отклонил) действие, модель не изменится —
+                // принудительно пересобираем меню из модели на ближайшем refresh.
+                self.menu.clear();
+            }
             if a.is_local() {
                 self.local(a);
             } else {

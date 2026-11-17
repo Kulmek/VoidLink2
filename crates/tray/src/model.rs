@@ -3,7 +3,7 @@
 //! `win.rs` только переводит модель в `tray-icon`/`muda`.
 #![allow(dead_code)] // подключается при интеграции (на не-Windows используется только в тестах)
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 /// Состояние связи с демоном и сервером.
@@ -34,6 +34,13 @@ pub struct TrayInvite {
     pub from: String,
 }
 
+/// Событие «группа недоступна» от демона.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrayKick {
+    pub gid: u32,
+    pub group_name: String,
+}
+
 /// Снимок для трея; его отдаёт `TrayBackend::state()`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrayState {
@@ -46,6 +53,10 @@ pub struct TrayState {
     pub my_code: Option<String>,
     pub groups: Vec<TrayGroup>,
     pub invites: Vec<TrayInvite>,
+    /// Группы, из которых нас исключили или которые удалили, — события демона
+    /// (Kicked / GroupDeleted) с прошлого вызова `state()`. Бэкенд отдаёт каждое
+    /// один раз; свой выход (меню, CLI, TUI) сюда не попадает.
+    pub kicked: Vec<TrayKick>,
     /// Открыт ли сейчас TUI (для политики уведомлений).
     pub tui_open: bool,
 }
@@ -59,6 +70,7 @@ impl Default for TrayState {
             my_code: None,
             groups: Vec::new(),
             invites: Vec::new(),
+            kicked: Vec::new(),
             tui_open: false,
         }
     }
@@ -310,6 +322,7 @@ pub const DISCONNECT_NOTIFY_AFTER: Duration = Duration::from_secs(30);
 pub enum Notice {
     Invite { gid: u32, group_name: String, from: String },
     /// Группа пропала без нашего выхода: исключили или удалили.
+    /// Источник — только `TrayState::kicked` (события демона), не разница снимков.
     Kicked { gid: u32, group_name: String },
     Disconnected,
 }
@@ -333,12 +346,9 @@ impl Notice {
 #[derive(Debug, Default)]
 pub struct Notifier {
     pub mode: NotifyMode,
+    /// Ещё не было ни одного снимка с живым демоном.
     first: bool,
     seen_invites: HashSet<u32>,
-    /// Группы, в которых мы были: gid → имя.
-    joined: HashMap<u32, String>,
-    /// Выходы, начатые нами (через меню), — не считаются исключением.
-    own_leaves: HashSet<u32>,
     /// С какого момента нет связи (только после того, как она была).
     down_since: Option<Instant>,
     was_connected: bool,
@@ -350,14 +360,14 @@ impl Notifier {
         Self { mode, first: true, ..Default::default() }
     }
 
-    /// Отметить своё действие (вызывать при клике до `act`).
+    /// Отметить своё действие (вызывать при клике до `act`/локального выполнения).
     pub fn on_action(&mut self, a: Action) {
         match a {
-            Action::ToggleGroup { gid, join: false } => {
-                self.own_leaves.insert(gid);
-            }
-            Action::ToggleGroup { gid, join: true } => {
-                self.own_leaves.remove(&gid);
+            // Остановку пользователь запросил сам — обрыв после неё не «Нет связи».
+            Action::StopTunnel | Action::Exit => {
+                self.was_connected = false;
+                self.down_since = None;
+                self.down_notified = false;
             }
             _ => {}
         }
@@ -366,12 +376,12 @@ impl Notifier {
     /// Новый снимок → уведомления, прошедшие политику `mode`.
     pub fn observe(&mut self, s: &TrayState, now: Instant) -> Vec<Notice> {
         let mut out = Vec::new();
-        let first = std::mem::replace(&mut self.first, false);
-
-        // Приглашения: новые gid (на первом снимке — молча запоминаем).
-        // Без демона список пуст не по-настоящему — не сверяем, иначе после
-        // возврата службы все старые приглашения всплывут как новые.
+        // Приглашения: новые gid (на первом живом снимке — молча запоминаем).
+        // Без демона список пуст не по-настоящему — не сверяем и базу не
+        // ставим, иначе после старта/возврата службы старые приглашения
+        // всплывут как новые.
         if s.conn != Conn::DaemonDown {
+            let first = std::mem::replace(&mut self.first, false);
             if !first {
                 for i in &s.invites {
                     if !self.seen_invites.contains(&i.gid) {
@@ -382,18 +392,10 @@ impl Notifier {
             self.seen_invites = s.invites.iter().map(|i| i.gid).collect();
         }
 
-        // Исключение: была joined-группа, стала не joined/пропала, а выход не наш.
-        // Сверяем только на живом снимке: при обрыве списки могут быть пустыми.
-        if s.conn == Conn::Connected {
-            let now_joined: HashMap<u32, String> =
-                s.groups.iter().filter(|g| g.joined).map(|g| (g.gid, g.name.clone())).collect();
-            for (gid, name) in &self.joined {
-                if !now_joined.contains_key(gid) && !self.own_leaves.contains(gid) {
-                    out.push(Notice::Kicked { gid: *gid, group_name: name.clone() });
-                }
-            }
-            self.own_leaves.retain(|g| now_joined.contains_key(g));
-            self.joined = now_joined;
+        // Исключение/удаление группы — только по событиям демона: по разнице
+        // снимков нельзя отличить kick от своего выхода через CLI/TUI.
+        for k in &s.kicked {
+            out.push(Notice::Kicked { gid: k.gid, group_name: k.group_name.clone() });
         }
 
         // Обрыв > 30 с: один раз за эпизод, только если связь была.
@@ -438,6 +440,7 @@ mod tests {
                 TrayGroup { gid: 2, name: "работа".into(), joined: false },
             ],
             invites: vec![TrayInvite { gid: 7, group_name: "игры".into(), from: "петя".into() }],
+            kicked: Vec::new(),
             tui_open: false,
         }
     }
@@ -578,27 +581,43 @@ mod tests {
     }
 
     #[test]
-    fn notify_kicked_but_not_own_leave() {
+    fn notify_kicked_only_from_daemon_events() {
         let t0 = Instant::now();
         let mut n = Notifier::new(NotifyMode::Always);
+        n.observe(&st(), t0);
+
+        // Группа пропала из снимка (свой выход через CLI/TUI) — молча.
         let mut s = st();
-        s.groups[1].joined = true;
-        n.observe(&s, t0);
+        s.groups.remove(0);
+        assert!(n.observe(&s, t0).is_empty());
 
-        // Свой выход из gid 1 — молча; gid 2 пропал сам — исключение.
-        n.on_action(Action::ToggleGroup { gid: 1, join: false });
-        let mut s2 = s.clone();
-        s2.groups[0].joined = false;
-        s2.groups.remove(1);
-        assert_eq!(n.observe(&s2, t0), vec![Notice::Kicked { gid: 2, group_name: "работа".into() }]);
+        // Событие демона — уведомляем.
+        s.kicked.push(TrayKick { gid: 2, group_name: "работа".into() });
+        assert_eq!(n.observe(&s, t0), vec![Notice::Kicked { gid: 2, group_name: "работа".into() }]);
+    }
 
-        // Обрыв с пустым списком групп не считается исключением.
-        let mut s3 = s2.clone();
-        s3.groups[0].joined = true;
-        n.observe(&s3, t0);
+    #[test]
+    fn notify_no_disconnect_after_own_stop() {
+        let t0 = Instant::now();
+        let mut n = Notifier::new(NotifyMode::Always);
+        n.observe(&st(), t0);
+        n.on_action(Action::StopTunnel);
         let down = TrayState { conn: Conn::DaemonDown, ..Default::default() };
         assert!(n.observe(&down, t0).is_empty());
-        assert!(n.observe(&s3, t0).is_empty());
+        assert!(n.observe(&down, t0 + Duration::from_secs(31)).is_empty());
+        assert!(n.observe(&down, t0 + Duration::from_secs(120)).is_empty());
+    }
+
+    #[test]
+    fn notify_no_old_invites_when_daemon_starts_later() {
+        let t0 = Instant::now();
+        let mut n = Notifier::new(NotifyMode::Always);
+        let down = TrayState { conn: Conn::DaemonDown, ..Default::default() };
+        assert!(n.observe(&down, t0).is_empty());
+        assert!(n.observe(&st(), t0).is_empty(), "первый живой снимок — база");
+        let mut s = st();
+        s.invites.push(TrayInvite { gid: 8, group_name: "кино".into(), from: "оля".into() });
+        assert_eq!(n.observe(&s, t0).len(), 1);
     }
 
     #[test]
