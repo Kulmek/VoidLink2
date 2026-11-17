@@ -1,7 +1,8 @@
-//! Клиент туннеля v2: CLI-диспетчер.
+//! Клиент туннеля (протокол v3): CLI-диспетчер.
 //!
-//! Глобальные флаги: `--dir <путь>` (каталог конфига), `--debug`.
-//! Для `run` дополнительно: `--adapter <имя>`, `--dll <путь>`, `--server <N|addr|label>`.
+//! Глобальные флаги: `--dir <путь>` (каталог конфига), `--debug`,
+//! `--server <N|addr|label>` (по умолчанию — последний использованный).
+//! Для `run` дополнительно: `--adapter <имя>`, `--dll <путь>`.
 //!
 //! Подкоманды:
 //!   id                          — friend code и ключи identity
@@ -19,12 +20,16 @@
 //!   invite <gid> <peer>         — пригласить (владелец)
 //!   kick <gid> <peer>           — исключить (владелец)
 //!   ban <gid> <peer>            — забанить (владелец)
+//!   unban <gid> <peer>          — снять бан (владелец)
+//!   bans <gid>                  — баны и неотвеченные приглашения (владелец)
+//!   transfer <gid> <peer>       — передать группу участнику (владелец)
 //!   rename <gid> <имя>          — переименовать (владелец)
 //!   delete <gid>                — удалить группу (владелец)
 //!   friend-groups <peer>        — группы друга
 //!   add-friend <code> [alias]   — добавить друга локально
 //!   del-friend <alias>          — удалить друга
 //!   friends                     — список друзей
+//!   invisible on|off            — невидимка (другие видят нас офлайн)
 //!   run                         — поднять туннель (autojoin-группы)
 //!   tui                         — поднять туннель с графическим интерфейсом
 //!
@@ -155,8 +160,8 @@ fn main() -> Result<()> {
             println!("удалено");
         }
         "groups" => with_server(&cfg, server_sel.as_deref(), |server, pub_key, cfg2| {
-            let conn = engine::CtrlConn::connect(cfg2, server, &pub_key, &identity)?;
-            conn.send_ctrl(ctrl::LIST_GROUPS, &payloads::enc_gid(0));
+            let conn = connect(&store, cfg2, server, &pub_key, &identity)?;
+            conn.send_ctrl(ctrl::LIST_GROUPS, &[]);
             let p = conn.wait_for(ctrl::GROUP_LIST, std::time::Duration::from_secs(10))?;
             let items = payloads::dec_group_list(&p)?;
             if items.is_empty() {
@@ -180,15 +185,23 @@ fn main() -> Result<()> {
             let name: String = rest.iter().filter(|a| *a != "--private").cloned().collect::<Vec<_>>().join(" ");
             bail_if_empty(&name, "usage: create <имя> [--private]");
             with_server(&cfg, server_sel.as_deref(), |server, pub_key, cfg2| {
-                let conn = engine::CtrlConn::connect(cfg2, server, &pub_key, &identity)?;
+                let conn = connect(&store, cfg2, server, &pub_key, &identity)?;
+                // После HELLO3 сервер шлёт GROUP_STATE каждой нашей группы:
+                // созданная — та, которой нет среди своих в списке.
+                conn.send_ctrl(ctrl::LIST_GROUPS, &[]);
+                let p = conn.wait_for(ctrl::GROUP_LIST, std::time::Duration::from_secs(10))?;
+                let known: std::collections::HashSet<u32> =
+                    payloads::dec_group_list(&p)?.iter().filter(|g| g.mine).map(|g| g.gid).collect();
                 conn.send_ctrl(ctrl::CREATE_GROUP, &payloads::enc_create_group(&name, private));
-                let p = conn.wait_for(ctrl::GROUP_STATE, std::time::Duration::from_secs(10))?;
-                let st = payloads::dec_group_state(&p)?;
+                let st = loop {
+                    let p = conn.wait_for(ctrl::GROUP_STATE, std::time::Duration::from_secs(10))?;
+                    let st = payloads::dec_group_state(&p)?;
+                    if !st.deleted && !known.contains(&st.gid) {
+                        break st;
+                    }
+                };
                 println!("группа {} \"{}\" создана, мой IP {}", st.gid, st.name, proto::ip_str(st.my_ip));
-                if !cfg2.autojoin.contains(&st.gid) {
-                    let mut c = Config::clone(cfg2);
-                    c.autojoin.push(st.gid);
-                    save(&c)?;
+                if autojoin_add(&store, server, st.gid)? {
                     println!("добавлена в autojoin");
                 }
                 Ok(())
@@ -197,15 +210,21 @@ fn main() -> Result<()> {
         "join" => {
             let gid = parse_gid(rest.first())?;
             with_server(&cfg, server_sel.as_deref(), |server, pub_key, cfg2| {
-                let conn = engine::CtrlConn::connect(cfg2, server, &pub_key, &identity)?;
+                let conn = connect(&store, cfg2, server, &pub_key, &identity)?;
                 conn.send_ctrl(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
-                let p = conn.wait_for(ctrl::GROUP_STATE, std::time::Duration::from_secs(10))?;
-                let st = payloads::dec_group_state(&p)?;
+                // Своё состояние — по gid (GROUP_STATE шлётся и на GET_GROUP).
+                let st = loop {
+                    let p = conn.wait_for(ctrl::GROUP_STATE, std::time::Duration::from_secs(10))?;
+                    let st = payloads::dec_group_state(&p)?;
+                    if st.gid == gid {
+                        break st;
+                    }
+                };
+                if st.deleted {
+                    bail!("группа {gid} удалена");
+                }
                 println!("вошёл в {} \"{}\", мой IP {}", st.gid, st.name, proto::ip_str(st.my_ip));
-                if !cfg2.autojoin.contains(&gid) {
-                    let mut c = Config::clone(cfg2);
-                    c.autojoin.push(gid);
-                    save(&c)?;
+                if autojoin_add(&store, server, gid)? {
                     println!("добавлена в autojoin");
                 }
                 Ok(())
@@ -213,11 +232,11 @@ fn main() -> Result<()> {
         }
         "invites" => with_server(&cfg, server_sel.as_deref(), |server, pub_key, cfg2| {
             // Сервер шлёт первое окно (до 16) неотвеченных приглашений сразу
-            // после HELLO (потерянное запрашивается повтором HELLO), остальные
-            // дочитываются окнами LIST_INVITES.
-            let conn = engine::CtrlConn::connect(cfg2, server, &pub_key, &identity)?;
+            // после HELLO3 (потерянное запрашивается LIST_INVITES с 0),
+            // остальные дочитываются окнами LIST_INVITES.
+            let conn = connect(&store, cfg2, server, &pub_key, &identity)?;
             let Some(mut list) = conn.invite_list()? else {
-                bail!("список приглашений не получен (старая версия сервера или потеря пакетов) — повторите");
+                bail!("список приглашений не получен (потеря пакетов) — повторите");
             };
             let mut items = Vec::new();
             let complete = loop {
@@ -238,7 +257,12 @@ fn main() -> Result<()> {
                     .find(|f| f.pubkey == proto::hex_of(&inv.from_pubkey))
                     .map(|f| f.alias.clone())
                     .unwrap_or_else(|| inv.from_name.clone());
-                println!("{:>4}  {:<20} от {from}", inv.gid, inv.group_name);
+                println!(
+                    "{:>4}  {:<20} от {from} (истекает через {})",
+                    inv.gid,
+                    inv.group_name,
+                    engine::fmt_secs(inv.expires_in)
+                );
             }
             if items.is_empty() {
                 println!("(приглашений нет)");
@@ -253,11 +277,11 @@ fn main() -> Result<()> {
         "decline" => {
             let gid = parse_gid(rest.first())?;
             with_server(&cfg, server_sel.as_deref(), |server, pub_key, cfg2| {
-                let conn = engine::CtrlConn::connect(cfg2, server, &pub_key, &identity)?;
-                // Список после HELLO: его нет — старый сервер (0x0E он молча
-                // игнорирует, «отклонено» было бы неправдой).
+                let conn = connect(&store, cfg2, server, &pub_key, &identity)?;
+                // Без списка не проверить, есть ли приглашение («отклонено»
+                // было бы неправдой: DECLINE идемпотентен).
                 let Some(mut list) = conn.invite_list()? else {
-                    bail!("список приглашений не получен (старая версия сервера или потеря пакетов) — отказ не отправлен");
+                    bail!("список приглашений не получен (потеря пакетов) — отказ не отправлен");
                 };
                 // Окно после HELLO — первые 16 по gid; gid дальше него —
                 // окно с самого gid (иначе отказ от несуществующего
@@ -294,27 +318,27 @@ fn main() -> Result<()> {
         "leave" => {
             let gid = parse_gid(rest.first())?;
             with_server(&cfg, server_sel.as_deref(), |server, pub_key, cfg2| {
-                let conn = engine::CtrlConn::connect(cfg2, server, &pub_key, &identity)?;
+                let conn = connect(&store, cfg2, server, &pub_key, &identity)?;
                 conn.send_ctrl(ctrl::LEAVE_GROUP, &payloads::enc_gid(gid));
                 conn.wait_for(ctrl::CTRL_PING, std::time::Duration::from_secs(3)).ok(); // ждём ERROR
-                let mut c = Config::clone(cfg2);
-                c.autojoin.retain(|g| *g != gid);
-                save(&c)?;
+                autojoin_remove(&store, server, gid)?;
                 println!("вышел из {gid} (autojoin снят)");
                 Ok(())
             })?;
         }
-        "invite" | "kick" | "ban" => {
+        "invite" | "kick" | "ban" | "unban" | "transfer" => {
             let gid = parse_gid(rest.first())?;
             let peer = rest.get(1).context(format!("usage: {cmd} <gid> <peer (code|hex|alias)>"))?;
             let target = store::resolve_peer(&cfg, peer)?;
             let typ = match cmd.as_str() {
                 "invite" => ctrl::INVITE,
                 "kick" => ctrl::KICK,
-                _ => ctrl::BAN,
+                "ban" => ctrl::BAN,
+                "unban" => ctrl::UNBAN,
+                _ => ctrl::TRANSFER_OWNER,
             };
             with_server(&cfg, server_sel.as_deref(), |server, pub_key, cfg2| {
-                let conn = engine::CtrlConn::connect(cfg2, server, &pub_key, &identity)?;
+                let conn = connect(&store, cfg2, server, &pub_key, &identity)?;
                 conn.send_ctrl(typ, &payloads::enc_gid_target(gid, &target));
                 let r = conn.wait_for(ctrl::CTRL_PING, std::time::Duration::from_secs(3));
                 if let Err(e) = r {
@@ -331,7 +355,7 @@ fn main() -> Result<()> {
             let name = rest[1.min(rest.len())..].join(" ");
             bail_if_empty(&name, "usage: rename <gid> <имя>");
             with_server(&cfg, server_sel.as_deref(), |server, pub_key, cfg2| {
-                let conn = engine::CtrlConn::connect(cfg2, server, &pub_key, &identity)?;
+                let conn = connect(&store, cfg2, server, &pub_key, &identity)?;
                 conn.send_ctrl(ctrl::RENAME_GROUP, &payloads::enc_rename(gid, &name));
                 let r = conn.wait_for(ctrl::CTRL_PING, std::time::Duration::from_secs(3));
                 if let Err(e) = r {
@@ -346,7 +370,7 @@ fn main() -> Result<()> {
         "delete" => {
             let gid = parse_gid(rest.first())?;
             with_server(&cfg, server_sel.as_deref(), |server, pub_key, cfg2| {
-                let conn = engine::CtrlConn::connect(cfg2, server, &pub_key, &identity)?;
+                let conn = connect(&store, cfg2, server, &pub_key, &identity)?;
                 conn.send_ctrl(ctrl::DELETE_GROUP, &payloads::enc_gid(gid));
                 let r = conn.wait_for(ctrl::CTRL_PING, std::time::Duration::from_secs(3));
                 if let Err(e) = r {
@@ -354,9 +378,7 @@ fn main() -> Result<()> {
                         bail!("{e}");
                     }
                 }
-                let mut c = Config::clone(cfg2);
-                c.autojoin.retain(|g| *g != gid);
-                save(&c)?;
+                autojoin_remove(&store, server, gid)?;
                 println!("группа {gid} удалена");
                 Ok(())
             })?;
@@ -365,10 +387,16 @@ fn main() -> Result<()> {
             let peer = rest.first().context("usage: friend-groups <peer>")?;
             let target = store::resolve_peer(&cfg, peer)?;
             with_server(&cfg, server_sel.as_deref(), |server, pub_key, cfg2| {
-                let conn = engine::CtrlConn::connect(cfg2, server, &pub_key, &identity)?;
+                let conn = connect(&store, cfg2, server, &pub_key, &identity)?;
                 conn.send_ctrl(ctrl::FRIEND_GROUPS, &payloads::enc_pubkey(&target));
-                let p = conn.wait_for(ctrl::FRIEND_GROUPS_RESP, std::time::Duration::from_secs(10))?;
-                let items = payloads::dec_friend_groups(&p)?;
+                // Ответ — о ком спрошено (target в ответе).
+                let items = loop {
+                    let p = conn.wait_for(ctrl::FRIEND_GROUPS_RESP, std::time::Duration::from_secs(10))?;
+                    let f = payloads::dec_friend_groups(&p)?;
+                    if f.target == target {
+                        break f.groups;
+                    }
+                };
                 if items.is_empty() {
                     println!("(у друга нет видимых групп)");
                 }
@@ -377,6 +405,55 @@ fn main() -> Result<()> {
                 }
                 Ok(())
             })?;
+        }
+        "bans" => {
+            let gid = parse_gid(rest.first())?;
+            with_server(&cfg, server_sel.as_deref(), |server, pub_key, cfg2| {
+                let conn = connect(&store, cfg2, server, &pub_key, &identity)?;
+                conn.send_ctrl(ctrl::GROUP_ADMIN, &payloads::enc_gid(gid));
+                let info = loop {
+                    let p = conn.wait_for(ctrl::ADMIN_INFO, std::time::Duration::from_secs(10))?;
+                    let a = payloads::dec_admin_info(&p)?;
+                    if a.gid == gid {
+                        break a;
+                    }
+                };
+                let who = |pk: &[u8; 32], name: &str| {
+                    let alias = cfg2.friends.iter().find(|f| f.pubkey == proto::hex_of(pk)).map(|f| f.alias.clone());
+                    let shown = alias.unwrap_or_else(|| if name.is_empty() { "(без имени)".into() } else { name.to_string() });
+                    format!("{shown:<20} {}", proto::friend_code_of(pk))
+                };
+                println!("баны группы {gid}:");
+                if info.bans.is_empty() {
+                    println!("  (нет)");
+                }
+                for b in &info.bans {
+                    println!("  {}", who(&b.pubkey, &b.name));
+                }
+                println!("неотвеченные приглашения:");
+                if info.invites.is_empty() {
+                    println!("  (нет)");
+                }
+                for i in &info.invites {
+                    println!("  {}  истекает через {}", who(&i.pubkey, &i.name), engine::fmt_secs(i.expires_in));
+                }
+                println!("снять бан: unban {gid} <peer> · отозвать приглашение: kick {gid} <peer>");
+                Ok(())
+            })?;
+        }
+        "invisible" => {
+            let on = match rest.first().map(|s| s.as_str()) {
+                Some("on") => true,
+                Some("off") => false,
+                _ => bail!("usage: invisible on|off"),
+            };
+            cfg.invisible = on;
+            save(&cfg)?;
+            // Флаг уходит в HELLO3: на сервере он живёт, пока жива сессия.
+            println!(
+                "невидимка {}: применится при следующем подключении (tui/run)",
+                if on { "включена" } else { "выключена" }
+            );
         }
         "add-friend" => {
             let code = rest.first().context("usage: add-friend <code> [alias]")?;
@@ -424,10 +501,15 @@ fn main() -> Result<()> {
             let (server, pub_key) = pick_server(&cfg, server_sel.as_deref())?;
             save(&cfg)?;
             let cfg = Arc::new(cfg);
+            let store = Arc::new(store::Store::new(&dir));
             if !tui_mode {
-                engine::run(cfg, server, pub_key, identity.clone(), &adapter, dll)?;
+                // Автовход, ротация ключа сервера, невидимка — в client.json.
+                let save_store = store.clone();
+                let save = Arc::new(move |c: &Config| {
+                    let _ = save_store.save(c);
+                });
+                engine::run(cfg, server, pub_key, identity.clone(), &adapter, dll, save)?;
             } else {
-                let store = Arc::new(store::Store::new(&dir));
                 tui::run(
                     cfg,
                     server,
@@ -450,8 +532,8 @@ fn main() -> Result<()> {
 
 fn usage() {
     println!(
-        r#"tunnel-client v2 — Hamachi-подобный VPN
-global: --dir <path> --debug
+        r#"tunnel-client (протокол v3) — Hamachi-подобный VPN
+global: --dir <path> --debug --server <N|addr|label> (по умолчанию — последний использованный)
   id                          friend code и identity
   set-name <имя>              имя профиля
   set-status <текст>          статус
@@ -462,9 +544,13 @@ global: --dir <path> --debug
   join <gid> | leave <gid> | delete <gid>
   invites | decline <gid>     приглашения: список / отклонить
   invite <gid> <peer> | kick <gid> <peer> | ban <gid> <peer>
+  unban <gid> <peer>          снять бан
+  bans <gid>                  баны и неотвеченные приглашения (владелец)
+  transfer <gid> <peer>       передать группу участнику
   rename <gid> <имя>
   friend-groups <peer>
   add-friend <code> [alias] | del-friend <alias> | friends
+  invisible on|off            невидимка: другие видят вас офлайн
   run                         поднять туннель (global: --adapter --dll --server <N>)
   tui                         то же, но с графическим интерфейсом (ratatui)
 peer = friend code (TUN-…) | hex | alias
@@ -494,12 +580,19 @@ fn find_server(cfg: &Config, tok: &str) -> Option<usize> {
     tok.parse::<usize>().ok().filter(|n| *n < cfg.servers.len())
 }
 
-/// Выбор сервера: --server <N|addr|label> или первый в списке.
+/// Выбор сервера: --server <N|addr|label>, иначе последний использованный
+/// (`active_server`, его же автовход), иначе первый в списке.
 fn pick_server(cfg: &Config, sel: Option<&str>) -> Result<(SocketAddr, [u8; 32])> {
+    let active = cfg
+        .servers
+        .iter()
+        .find(|s| s.addr.parse::<SocketAddr>().is_ok_and(|a| a.to_string() == cfg.active_server));
     let entry = match sel {
         // Раньше `--server N` всегда выбирал первый сервер.
         Some(tok) => &cfg.servers[find_server(cfg, tok).with_context(|| format!("сервер {tok:?} не найден"))?],
-        None => cfg.servers.first().context("нет серверов; добавь: add-server <addr> <code>")?,
+        None => active
+            .or(cfg.servers.first())
+            .context("нет серверов; добавь: add-server <addr> <code>")?,
     };
     let addr: SocketAddr = entry.addr.parse().context("bad server addr")?;
     let pkv = proto::hex_to_bytes(&entry.pubkey).context("bad server pubkey")?;
@@ -507,6 +600,54 @@ fn pick_server(cfg: &Config, sel: Option<&str>) -> Result<(SocketAddr, [u8; 32])
     let mut pk = [0u8; 32];
     pk.copy_from_slice(&pkv);
     Ok((addr, pk))
+}
+
+/// Правка client.json по свежей копии с диска: CLI-команда не затирает
+/// то, что успела записать раньше (ротация ключа сервера, автовход).
+fn persist<T>(store: &store::Store, f: impl FnOnce(&mut Config) -> T) -> Result<T> {
+    let mut c = store.load().context("чтение конфига")?;
+    let r = f(&mut c);
+    store.save(&c).context("запись конфига")?;
+    Ok(r)
+}
+
+/// Одноразовое соединение с сервером. Ключ, перезакреплённый по цепочке
+/// ротации (WELCOME), сразу сохраняется.
+fn connect(
+    store: &store::Store,
+    cfg: &Config,
+    server: SocketAddr,
+    pub_key: &[u8; 32],
+    identity: &proto::Identity,
+) -> Result<engine::CtrlConn> {
+    let conn = engine::CtrlConn::connect(cfg, server, pub_key, identity)?;
+    if let Some(new_ed) = conn.rotated {
+        persist(store, |c| c.repin_server(server, &new_ed))?;
+        eprintln!(
+            "ключ сервера {server} сменён по цепочке ротации; закреплён новый: {}",
+            proto::friend_code_of(&new_ed)
+        );
+    }
+    Ok(conn)
+}
+
+/// Автовход в `gid` сервера `server`. `true` — добавлен.
+fn autojoin_add(store: &store::Store, server: SocketAddr, gid: u32) -> Result<bool> {
+    persist(store, |c| {
+        c.activate_server(server);
+        let add = !c.autojoin.contains(&gid);
+        if add {
+            c.autojoin.push(gid);
+        }
+        add
+    })
+}
+
+fn autojoin_remove(store: &store::Store, server: SocketAddr, gid: u32) -> Result<()> {
+    persist(store, |c| {
+        c.activate_server(server);
+        c.autojoin.retain(|g| *g != gid);
+    })
 }
 
 /// Выполняет замыкание с выбранным сервером.

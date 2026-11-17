@@ -508,7 +508,7 @@ impl App {
                         name: p.name.clone(),
                         ip: p.ip,
                         online: p.online,
-                        direct: p.direct,
+                        direct: p.direct(),
                         rtt_ms: p.rtt_ms,
                         status: p.status.clone(),
                     })
@@ -676,10 +676,50 @@ impl App {
                     self.log(MsgKind::Warn, msg.clone());
                     self.toast(MsgKind::Warn, msg);
                 }
-                E::Kicked { gid, name } => {
-                    let msg = format!("вас исключили из группы {gid} «{name}»");
+                E::Kicked { gid, name, banned } => {
+                    self.drop_invite(gid);
+                    let msg = if banned {
+                        format!("вас забанили в группе {gid} «{name}»")
+                    } else {
+                        format!("вас исключили из группы {gid} «{name}»")
+                    };
                     self.log(MsgKind::Error, msg.clone());
                     self.toast(MsgKind::Error, msg);
+                }
+                E::DirectLost { gid, ip, name } => {
+                    self.log(
+                        MsgKind::Warn,
+                        format!(
+                            "прямой канал с {name} ({}) в {gid} потерян — через релей",
+                            proto::ip_str(ip)
+                        ),
+                    );
+                }
+                E::ServerKeyRotated { addr, new_code } => {
+                    let msg = format!("ключ сервера {addr} сменён по цепочке ротации: {new_code}");
+                    self.log(MsgKind::Warn, msg.clone());
+                    self.toast(MsgKind::Warn, msg);
+                }
+                E::ServerSwitched { addr, label } => {
+                    let msg = if label.is_empty() {
+                        format!("переключено на сервер {addr}")
+                    } else {
+                        format!("переключено на сервер {label} ({addr})")
+                    };
+                    self.log(MsgKind::Info, msg.clone());
+                    self.toast(MsgKind::Info, msg);
+                }
+                // Экран администрирования — позже; пока сводка в журнал.
+                E::AdminInfo { gid, bans, invites } => {
+                    let names = |v: Vec<String>| if v.is_empty() { "—".to_string() } else { v.join(", ") };
+                    let bans = names(bans.into_iter().map(|(_, n)| n).collect());
+                    let invites = names(
+                        invites
+                            .into_iter()
+                            .map(|(_, n, exp)| format!("{n} ({})", crate::engine::fmt_secs(exp)))
+                            .collect(),
+                    );
+                    self.log(MsgKind::Info, format!("группа {gid}: баны: {bans}; приглашения: {invites}"));
                 }
                 E::PeerOnline { gid, ip, name } => {
                     self.log(
@@ -701,7 +741,7 @@ impl App {
                     self.log(MsgKind::Ok, msg.clone());
                     self.toast(MsgKind::Ok, msg);
                 }
-                E::Invite { gid, group_name, from_pubkey, from_name } => {
+                E::Invite { gid, group_name, from_pubkey, from_name, .. } => {
                     // Уже в группе или в автовходе (движок войдёт сам) — окно
                     // не показываем: сервер повторяет приглашения после HELLO.
                     let skip = eng.groups.lock().unwrap().contains_key(&gid)
@@ -2094,6 +2134,34 @@ impl App {
                 let pk = self.resolve_peer(eng, &peer)?;
                 let _ = eng.cmds.send(Cmd::Ban(gid, pk));
             }
+            Command::Unban(gid, peer) => {
+                let pk = self.resolve_peer(eng, &peer)?;
+                let _ = eng.cmds.send(Cmd::Unban(gid, pk));
+            }
+            Command::Transfer(gid, peer) => {
+                let pk = self.resolve_peer(eng, &peer)?;
+                let _ = eng.cmds.send(Cmd::Transfer(gid, pk));
+            }
+            Command::Admin(gid) => {
+                let _ = eng.cmds.send(Cmd::GroupAdmin(gid));
+            }
+            Command::Invisible(on) => {
+                let _ = eng.cmds.send(Cmd::SetInvisible(on));
+                self.toast(MsgKind::Ok, format!("невидимка {}", if on { "включена" } else { "выключена" }));
+            }
+            Command::Server(tok) => {
+                let cfg = eng.cfg.lock().unwrap().clone();
+                let s = cfg
+                    .servers
+                    .iter()
+                    .find(|s| s.addr == tok || (!s.label.is_empty() && s.label == tok))
+                    .or_else(|| tok.parse::<usize>().ok().and_then(|n| cfg.servers.get(n)))
+                    .ok_or_else(|| anyhow!("сервер {tok:?} не найден"))?;
+                let addr: std::net::SocketAddr =
+                    s.addr.parse().map_err(|_| anyhow!("неверный адрес сервера {}", s.addr))?;
+                let pubkey = hex32(&s.pubkey).ok_or_else(|| anyhow!("неверный ключ сервера"))?;
+                let _ = eng.cmds.send(Cmd::SwitchServer { addr, pubkey, label: s.label.clone() });
+            }
             Command::AddFriend { code, alias } => {
                 let pk = proto::Identity::parse_friend_code(&code)?;
                 let hex = proto::hex_of(&pk);
@@ -2169,6 +2237,13 @@ pub enum Command {
     Invite(u32, String),
     Kick(u32, String),
     Ban(u32, String),
+    Unban(u32, String),
+    Transfer(u32, String),
+    /// Баны и неотвеченные приглашения группы (владелец).
+    Admin(u32),
+    Invisible(bool),
+    /// Переключиться на сервер из списка: номер, адрес или метка.
+    Server(String),
     AddFriend { code: String, alias: String },
     DelFriend(String),
     SetName(String),
@@ -2234,6 +2309,29 @@ pub fn parse_command(line: &str) -> Result<Command> {
             gid_of(0)?,
             rest.get(1)
                 .ok_or_else(|| anyhow!("нужен peer (friend code | hex | alias)"))?
+                .to_string(),
+        ),
+        "unban" => Command::Unban(
+            gid_of(0)?,
+            rest.get(1)
+                .ok_or_else(|| anyhow!("нужен peer (friend code | hex | alias)"))?
+                .to_string(),
+        ),
+        "transfer" => Command::Transfer(
+            gid_of(0)?,
+            rest.get(1)
+                .ok_or_else(|| anyhow!("нужен peer (friend code | hex | alias)"))?
+                .to_string(),
+        ),
+        "admin" | "bans" => Command::Admin(gid_of(0)?),
+        "invisible" => Command::Invisible(match rest.first().map(|s| s.to_lowercase()).as_deref() {
+            Some("on") => true,
+            Some("off") => false,
+            _ => return Err(anyhow!("invisible on|off")),
+        }),
+        "server" => Command::Server(
+            rest.first()
+                .ok_or_else(|| anyhow!("нужен сервер: номер, адрес или метка"))?
                 .to_string(),
         ),
         "friend" => {

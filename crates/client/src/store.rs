@@ -2,10 +2,28 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use tunnel_protocol as proto;
 
-#[derive(Clone, Serialize, Deserialize, Default)]
+/// MTU адаптера по умолчанию: 1500 минус заголовки IP/UDP и фрейма группы
+/// с запасом под IPv6 и PPPoE.
+pub const DEFAULT_MTU: usize = 1400;
+/// Разумные пределы MTU: меньше 576 IPv4 не гарантирует, больше 1500 —
+/// внешний пакет почти везде фрагментируется.
+pub const MTU_MIN: usize = 576;
+pub const MTU_MAX: usize = 1500;
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_mtu() -> usize {
+    DEFAULT_MTU
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub identity: Option<StoredIdentity>,
@@ -23,6 +41,87 @@ pub struct Config {
     /// Тема оформления TUI: dark | light | contrast.
     #[serde(default)]
     pub theme: String,
+    /// Сообщать серверу LAN-адрес (CANDIDATES): пиры в одной сети
+    /// соединяются напрямую, без NAT.
+    #[serde(default = "default_true")]
+    pub lan_discovery: bool,
+    /// MTU адаптера (см. [`Config::mtu`] — с ограничением пределами).
+    #[serde(default = "default_mtu")]
+    pub mtu: usize,
+    /// Невидимка: другие участники видят нас офлайн (флаг HELLO3, PRESENCE).
+    #[serde(default)]
+    pub invisible: bool,
+    /// Сервер, к которому относится `autojoin` (адрес `ip:port`). Пусто —
+    /// старый конфиг: список считается списком первого же сервера.
+    #[serde(default)]
+    pub active_server: String,
+    /// Списки автовхода остальных серверов: gid у каждого сервера свои,
+    /// и при смене сервера чужие gid вошли бы в посторонние группы.
+    #[serde(default)]
+    pub autojoin_by_server: BTreeMap<String, Vec<u32>>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            identity: None,
+            name: String::new(),
+            status: String::new(),
+            servers: Vec::new(),
+            friends: Vec::new(),
+            autojoin: Vec::new(),
+            theme: String::new(),
+            lan_discovery: true,
+            mtu: DEFAULT_MTU,
+            invisible: false,
+            active_server: String::new(),
+            autojoin_by_server: BTreeMap::new(),
+        }
+    }
+}
+
+impl Config {
+    /// MTU адаптера в разумных пределах (руками вписанный 0 или 9000 не
+    /// ломают туннель).
+    pub fn mtu(&self) -> usize {
+        self.mtu.clamp(MTU_MIN, MTU_MAX)
+    }
+
+    /// Делает `addr` текущим сервером: `autojoin` прежнего откладывается,
+    /// восстанавливается список нового. `true` — конфиг изменился (сохранить).
+    pub fn activate_server(&mut self, addr: SocketAddr) -> bool {
+        let key = addr.to_string();
+        if self.active_server == key {
+            return false;
+        }
+        let prev = std::mem::replace(&mut self.active_server, key.clone());
+        if prev.is_empty() {
+            // Старый конфиг без active_server: список — этого сервера.
+            return true;
+        }
+        let old = std::mem::take(&mut self.autojoin);
+        if old.is_empty() {
+            self.autojoin_by_server.remove(&prev);
+        } else {
+            self.autojoin_by_server.insert(prev, old);
+        }
+        self.autojoin = self.autojoin_by_server.remove(&key).unwrap_or_default();
+        true
+    }
+
+    /// Закреплённый ключ сервера `addr` (после ротации по цепочке).
+    /// `true` — запись найдена и изменена.
+    pub fn repin_server(&mut self, addr: SocketAddr, pubkey: &[u8; 32]) -> bool {
+        let hex = proto::hex_of(pubkey);
+        let mut changed = false;
+        for s in self.servers.iter_mut() {
+            if s.addr.parse::<SocketAddr>().ok() == Some(addr) && s.pubkey != hex {
+                s.pubkey = hex.clone();
+                changed = true;
+            }
+        }
+        changed
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -120,4 +219,54 @@ pub fn resolve_peer(cfg: &Config, token: &str) -> Result<[u8; 32]> {
         return Ok(v.try_into().unwrap());
     }
     anyhow::bail!("не найден peer по токену {token:?} (ни friend code, ни hex, ни alias)")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn старый_конфиг_получает_умолчания() {
+        let cfg: Config = serde_json::from_str(r#"{"name":"a","autojoin":[3]}"#).unwrap();
+        assert!(cfg.lan_discovery && !cfg.invisible);
+        assert_eq!(cfg.mtu(), DEFAULT_MTU);
+        let d = Config::default();
+        assert!(d.lan_discovery);
+        assert_eq!(d.mtu, DEFAULT_MTU);
+        let wild = Config { mtu: 9000, ..Config::default() };
+        assert_eq!(wild.mtu(), MTU_MAX);
+        let zero = Config { mtu: 0, ..Config::default() };
+        assert_eq!(zero.mtu(), MTU_MIN);
+    }
+
+    #[test]
+    fn автовход_у_каждого_сервера_свой() {
+        let a: SocketAddr = "1.1.1.1:5555".parse().unwrap();
+        let b: SocketAddr = "2.2.2.2:5555".parse().unwrap();
+        // Старый конфиг: список принадлежит первому активированному серверу.
+        let mut cfg = Config { autojoin: vec![1, 2], ..Config::default() };
+        assert!(cfg.activate_server(a));
+        assert_eq!(cfg.autojoin, vec![1, 2]);
+        assert!(!cfg.activate_server(a));
+        assert!(cfg.activate_server(b));
+        assert!(cfg.autojoin.is_empty(), "gid сервера A не входят на B");
+        cfg.autojoin.push(7);
+        assert!(cfg.activate_server(a));
+        assert_eq!(cfg.autojoin, vec![1, 2]);
+        assert!(cfg.activate_server(b));
+        assert_eq!(cfg.autojoin, vec![7]);
+    }
+
+    #[test]
+    fn перезакрепление_ключа_по_адресу() {
+        let a: SocketAddr = "1.1.1.1:5555".parse().unwrap();
+        let mut cfg = Config {
+            servers: vec![StoredServer { addr: a.to_string(), pubkey: "00".into(), label: String::new() }],
+            ..Config::default()
+        };
+        assert!(cfg.repin_server(a, &[0xab; 32]));
+        assert_eq!(cfg.servers[0].pubkey, proto::hex_of(&[0xab; 32]));
+        assert!(!cfg.repin_server(a, &[0xab; 32]));
+        assert!(!cfg.repin_server("9.9.9.9:1".parse().unwrap(), &[1; 32]));
+    }
 }
