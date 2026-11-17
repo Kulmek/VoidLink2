@@ -1386,3 +1386,83 @@ fn e2e_запоздавший_group_state_не_возвращает_отозва
     server.stop();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Посредник-«подделыватель»: на каждый HELLO3 клиента сначала шлёт ему
+/// неаутентифицированные UNSUPPORTED, RESET, WELCOME с битой подписью и
+/// WELCOME, подписанный чужим ключом (под наш ed/eph), — и лишь потом
+/// пересылает HELLO3 серверу. Остальное — прозрачно.
+fn spoofing_proxy(server: SocketAddr) -> (SocketAddr, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+    let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    sock.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+    let addr = sock.local_addr().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop2 = stop.clone();
+    let thread = std::thread::spawn(move || {
+        let stranger = proto::Identity::generate();
+        let mut buf = vec![0u8; 65_535];
+        let mut client: Option<SocketAddr> = None;
+        while !stop2.load(Ordering::Relaxed) {
+            let Ok((n, src)) = sock.recv_from(&mut buf) else { continue };
+            if src == server {
+                if let Some(c) = client {
+                    let _ = sock.send_to(&buf[..n], c);
+                }
+                continue;
+            }
+            client = Some(src);
+            if let Ok((ctrl::HELLO3, body)) = proto::split_frame(&buf[..n])
+                && let Ok(h) = proto::Hello3::decode(body)
+            {
+                let eph = proto::EphemeralKey::generate();
+                let forged = proto::Welcome::encode(&stranger, &eph.public(), &[], &h.ed_pub, &h.eph_pub);
+                let mut bad_sig = forged.clone();
+                *bad_sig.last_mut().unwrap() ^= 0xff;
+                let frames = [
+                    proto::plain_frame(ctrl::UNSUPPORTED, &proto::handshake::enc_unsupported("подделка")),
+                    proto::plain_frame(ctrl::RESET, &[]),
+                    proto::plain_frame(ctrl::WELCOME, &bad_sig),
+                    proto::plain_frame(ctrl::WELCOME, &forged),
+                ];
+                for f in frames {
+                    let _ = sock.send_to(&f, src);
+                }
+            }
+            let _ = sock.send_to(&buf[..n], server);
+        }
+    });
+    (addr, stop, thread)
+}
+
+#[test]
+fn e2e_открытые_ответы_не_обрывают_подключение() {
+    let dir = temp_dir("forged-plain");
+    let server = start_server(&dir, 0);
+    let (addr, stop, thread) = spoofing_proxy(local(server.addr));
+
+    // CLI (CtrlConn): поддельные UNSUPPORTED/RESET/WELCOME не обрывают
+    // рукопожатие — подлинный WELCOME принимается, команда работает.
+    let id = proto::Identity::generate();
+    let t0 = Instant::now();
+    let conn = engine::CtrlConn::connect(&Config::default(), addr, &server.pubkey, &id)
+        .expect("CtrlConn подключается сквозь подделки");
+    assert!(t0.elapsed() < Duration::from_secs(5), "без ожидания таймаута");
+    assert!(conn.rotated.is_none());
+    conn.invite_list().expect("ответ сервера после подделок");
+    drop(conn);
+
+    // Движок: первое подключение тоже не обрывается и не шлёт Error.
+    let mut n = Node::start_via("forged", addr, server.pubkey, proto::Identity::generate());
+    n.wait("подключён", T, |e| matches!(e, Event::Connected(_)));
+    n.drain();
+    assert!(
+        !n.seen.iter().any(|e| matches!(e, Event::Error(_))),
+        "подделки не дают ошибок: {:?}",
+        n.seen
+    );
+    drop(n);
+
+    stop.store(true, Ordering::Relaxed);
+    thread.join().unwrap();
+    server.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}

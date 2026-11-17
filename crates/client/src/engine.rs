@@ -1530,9 +1530,9 @@ fn first_connect(env: &Env, in_rx: &mpsc::Receiver<Input>, st: &mut State) -> Re
             }
             return Ok(());
         }
-        if let Some(e) = st.hs_error.take() {
-            anyhow::bail!(e);
-        }
+        // Неаутентифицированные ответы (UNSUPPORTED, RESET, чужой WELCOME)
+        // попытку не обрывают: подлинный WELCOME ждётся до таймаута, а они
+        // лишь объясняют его (`Handshake::advisory`).
         let now = Instant::now();
         if now > deadline {
             let msg = st.hs.as_ref().map(|h| h.timeout_msg()).unwrap_or_default();
@@ -1649,9 +1649,11 @@ fn on_server_frame(env: &Env, st: &mut State, typ: u8, body: &[u8]) {
             }
         }
         ctrl::UNSUPPORTED => {
-            // Ответ на наш HELLO3: вне рукопожатия — чужой/поддельный.
-            if st.hs.is_some() {
-                st.hs_fail(env, unsupported_msg(body));
+            // Ответ на наш HELLO3 (вне рукопожатия — чужой/поддельный). Не
+            // аутентифицирован: лишь подсказка, если подлинного WELCOME так и
+            // не будет (см. tick).
+            if let Some(hs) = st.hs.as_mut() {
+                hs.advisory = Some(unsupported_msg(body));
             }
         }
         ctrl::RESET => {
@@ -1696,8 +1698,12 @@ fn on_welcome(env: &Env, st: &mut State, body: &[u8]) {
                 return;
             }
             Ok(None) => {}
+            // Подпись не от закреплённого ключа: подделать такой WELCOME
+            // может любой, кто видит наш HELLO3, — ждём подлинный дальше.
             Err(e) => {
-                st.hs_fail(env, format!("{e:#}"));
+                if let Some(hs) = st.hs.as_mut() {
+                    hs.advisory = Some(format!("{e:#}"));
+                }
                 return;
             }
         }
@@ -1747,6 +1753,16 @@ fn tick(env: &Env, st: &mut State, now: Instant) {
     if !st.connected() {
         if st.hs.is_none() {
             st.new_attempt();
+        }
+        // Подсказка неаутентифицированного ответа — событием, только когда
+        // подлинного WELCOME нет дольше CONNECT_TIMEOUT.
+        let advice = st
+            .hs
+            .as_ref()
+            .filter(|hs| now.duration_since(hs.started) > CONNECT_TIMEOUT)
+            .and_then(|hs| hs.advisory.clone());
+        if let Some(msg) = advice {
+            st.hs_fail(env, msg);
         }
         if now >= st.next_hello {
             st.send_hello(env);
