@@ -7,8 +7,8 @@
 
 use std::net::SocketAddr;
 
-use crate::{put_bool, put_pub, put_str, put_u16, put_u32, str_wire_len, Reader, FRAG_MAX_PAYLOAD};
-use anyhow::{bail, ensure, Result};
+use crate::{FRAG_MAX_PAYLOAD, Reader, put_bool, put_pub, put_str, put_u16, put_u32, str_wire_len};
+use anyhow::{Result, bail, ensure};
 
 /// Наибольшее число адресов-кандидатов (CANDIDATES, MemberInfo).
 pub const MAX_CANDIDATES: usize = 4;
@@ -247,7 +247,19 @@ pub fn dec_group_state(p: &[u8]) -> Result<GroupState> {
     for _ in 0..n {
         members.push(read_member(&mut r)?);
     }
-    Ok(GroupState { gid, rev, epoch, revoke_prev, name, owner, private, key, deleted, my_ip, members })
+    Ok(GroupState {
+        gid,
+        rev,
+        epoch,
+        revoke_prev,
+        name,
+        owner,
+        private,
+        key,
+        deleted,
+        my_ip,
+        members,
+    })
 }
 
 /// Тело дельты GROUP_UPDATE.
@@ -258,7 +270,11 @@ pub enum GroupDelta {
     /// kind 2: участник удалён.
     Removed([u8; 32]),
     /// kind 3: метаданные группы.
-    Meta { name: String, owner: [u8; 32], private: bool },
+    Meta {
+        name: String,
+        owner: [u8; 32],
+        private: bool,
+    },
 }
 
 impl GroupDelta {
@@ -296,7 +312,11 @@ pub fn enc_group_update(u: &GroupUpdate) -> Vec<u8> {
     match &u.delta {
         GroupDelta::Member(m) => put_member(&mut v, m),
         GroupDelta::Removed(pk) => put_pub(&mut v, pk),
-        GroupDelta::Meta { name, owner, private } => {
+        GroupDelta::Meta {
+            name,
+            owner,
+            private,
+        } => {
             put_str(&mut v, name);
             put_pub(&mut v, owner);
             put_bool(&mut v, *private);
@@ -317,10 +337,22 @@ pub fn dec_group_update(p: &[u8]) -> Result<GroupUpdate> {
     let delta = match r.u8()? {
         1 => GroupDelta::Member(read_member(&mut r)?),
         2 => GroupDelta::Removed(r.pub_key()?),
-        3 => GroupDelta::Meta { name: r.str()?, owner: r.pub_key()?, private: r.boolean()? },
+        3 => GroupDelta::Meta {
+            name: r.str()?,
+            owner: r.pub_key()?,
+            private: r.boolean()?,
+        },
         k => bail!("GROUP_UPDATE: неизвестный kind {k}"),
     };
-    Ok(GroupUpdate { gid, rev, base_rev, epoch, revoke_prev, key, delta })
+    Ok(GroupUpdate {
+        gid,
+        rev,
+        base_rev,
+        epoch,
+        revoke_prev,
+        key,
+        delta,
+    })
 }
 
 /// GROUP_LIST: сводка по группам (свои + публичные).
@@ -466,7 +498,11 @@ pub fn dec_invite_list(p: &[u8]) -> Result<InviteList> {
     for _ in 0..n {
         items.push(read_invite(&mut r)?);
     }
-    Ok(InviteList { from, items, complete })
+    Ok(InviteList {
+        from,
+        items,
+        complete,
+    })
 }
 
 /// INVITE_DECLINED: `gid | group_name str | by pk | by_name str`.
@@ -519,7 +555,12 @@ pub fn enc_kicked(k: &Kicked) -> Vec<u8> {
 
 pub fn dec_kicked(p: &[u8]) -> Result<Kicked> {
     let mut r = Reader::new(p);
-    Ok(Kicked { gid: r.u32()?, group_name: r.str()?, banned: r.boolean()?, rev: r.u32()? })
+    Ok(Kicked {
+        gid: r.u32()?,
+        group_name: r.str()?,
+        banned: r.boolean()?,
+        rev: r.u32()?,
+    })
 }
 
 /// Забаненный в ADMIN_INFO. `name` — последнее известное серверу имя.
@@ -585,12 +626,19 @@ pub fn dec_admin_info(p: &[u8]) -> Result<AdminInfo> {
     let nb = r.u16()? as usize;
     let mut bans = Vec::with_capacity(r.capacity_for(nb, 33));
     for _ in 0..nb {
-        bans.push(BanEntry { pubkey: r.pub_key()?, name: r.str()? });
+        bans.push(BanEntry {
+            pubkey: r.pub_key()?,
+            name: r.str()?,
+        });
     }
     let ni = r.u16()? as usize;
     let mut invites = Vec::with_capacity(r.capacity_for(ni, 37));
     for _ in 0..ni {
-        invites.push(PendingInvite { pubkey: r.pub_key()?, name: r.str()?, expires_in: r.u32()? });
+        invites.push(PendingInvite {
+            pubkey: r.pub_key()?,
+            name: r.str()?,
+            expires_in: r.u32()?,
+        });
     }
     Ok(AdminInfo { gid, bans, invites })
 }
@@ -712,8 +760,15 @@ pub(crate) mod tests {
         let enc = enc_group_state(&g);
         assert_eq!(dec_group_state(&enc).unwrap(), g);
         truncations_fail(&enc, dec_group_state);
-        let deleted = GroupState { deleted: true, members: vec![], ..g };
-        assert_eq!(dec_group_state(&enc_group_state(&deleted)).unwrap(), deleted);
+        let deleted = GroupState {
+            deleted: true,
+            members: vec![],
+            ..g
+        };
+        assert_eq!(
+            dec_group_state(&enc_group_state(&deleted)).unwrap(),
+            deleted
+        );
     }
 
     #[test]
@@ -740,7 +795,11 @@ pub(crate) mod tests {
         assert_eq!(got.candidates, vec![sa("1.2.3.4:5")]);
         // n_cand > 4 — ошибка.
         let mut bad = v.clone();
-        let at = bad.len() - (1 + m.candidates[..4].iter().map(|a| 1 + a.to_string().len()).sum::<usize>());
+        let at = bad.len()
+            - (1 + m.candidates[..4]
+                .iter()
+                .map(|a| 1 + a.to_string().len())
+                .sum::<usize>());
         bad[at] = 5;
         assert!(read_member(&mut Reader::new(&bad)).is_err());
     }
@@ -759,14 +818,24 @@ pub(crate) mod tests {
         let deltas = [
             GroupDelta::Member(member(2)),
             GroupDelta::Removed([7; 32]),
-            GroupDelta::Meta { name: "новое".into(), owner: [8; 32], private: false },
+            GroupDelta::Meta {
+                name: "новое".into(),
+                owner: [8; 32],
+                private: false,
+            },
         ];
         for d in deltas {
-            let u = GroupUpdate { delta: d, ..base.clone() };
+            let u = GroupUpdate {
+                delta: d,
+                ..base.clone()
+            };
             let enc = enc_group_update(&u);
             assert_eq!(dec_group_update(&enc).unwrap(), u);
             truncations_fail(&enc, dec_group_update);
-            assert!(enc.len() <= crate::FRAG_THRESHOLD, "дельта влезает без FRAG");
+            assert!(
+                enc.len() <= crate::FRAG_THRESHOLD,
+                "дельта влезает без FRAG"
+            );
         }
         let mut enc = enc_group_update(&base);
         enc[4 * 4 + 1 + 32] = 4;
@@ -776,8 +845,26 @@ pub(crate) mod tests {
     #[test]
     fn group_list_туда_обратно() {
         let items = vec![
-            GroupSummary { gid: 1, name: "a".into(), private: false, mine: true, online: 2, total: 3, rev: 9, epoch: 4 },
-            GroupSummary { gid: 2, name: "б".into(), private: true, mine: false, online: 0, total: 1, rev: 0, epoch: 0 },
+            GroupSummary {
+                gid: 1,
+                name: "a".into(),
+                private: false,
+                mine: true,
+                online: 2,
+                total: 3,
+                rev: 9,
+                epoch: 4,
+            },
+            GroupSummary {
+                gid: 2,
+                name: "б".into(),
+                private: true,
+                mine: false,
+                online: 0,
+                total: 1,
+                rev: 0,
+                epoch: 0,
+            },
         ];
         let enc = enc_group_list(&items);
         assert_eq!(dec_group_list(&enc).unwrap(), items);
@@ -802,7 +889,12 @@ pub(crate) mod tests {
         assert_eq!(dec_invite(&enc).unwrap(), i);
         truncations_fail(&enc, dec_invite);
 
-        let d = InviteDeclined { gid: 7, group_name: "игра".into(), by_pubkey: [9; 32], by_name: "bravo".into() };
+        let d = InviteDeclined {
+            gid: 7,
+            group_name: "игра".into(),
+            by_pubkey: [9; 32],
+            by_name: "bravo".into(),
+        };
         let enc = enc_invite_declined(&d);
         assert_eq!(dec_invite_declined(&enc).unwrap(), d);
         truncations_fail(&enc, dec_invite_declined);
@@ -810,14 +902,26 @@ pub(crate) mod tests {
 
     #[test]
     fn список_приглашений_туда_обратно() {
-        let l = InviteList { from: 0, items: vec![inv(1), inv(7)], complete: true };
+        let l = InviteList {
+            from: 0,
+            items: vec![inv(1), inv(7)],
+            complete: true,
+        };
         let enc = enc_invite_list(&l);
         assert_eq!(dec_invite_list(&enc).unwrap(), l);
         truncations_fail(&enc, dec_invite_list);
-        let empty = InviteList { from: 5, items: vec![], complete: false };
+        let empty = InviteList {
+            from: 5,
+            items: vec![],
+            complete: false,
+        };
         assert_eq!(dec_invite_list(&enc_invite_list(&empty)).unwrap(), empty);
         // Больше 255 — обрезается, complete снимается.
-        let big = InviteList { from: 0, items: (0..300).map(inv).collect(), complete: true };
+        let big = InviteList {
+            from: 0,
+            items: (0..300).map(inv).collect(),
+            complete: true,
+        };
         let got = dec_invite_list(&enc_invite_list(&big)).unwrap();
         assert_eq!(got.items.len(), 255);
         assert!(!got.complete);
@@ -825,41 +929,86 @@ pub(crate) mod tests {
 
     #[test]
     fn окно_списка_приглашений_покрывает_от_from_до_последнего() {
-        let part = InviteList { from: 10, items: vec![inv(12), inv(20)], complete: false };
+        let part = InviteList {
+            from: 10,
+            items: vec![inv(12), inv(20)],
+            complete: false,
+        };
         assert!(!part.covers(9), "до from — не известно");
         assert!(part.covers(10) && part.covers(15) && part.covers(20));
-        assert!(!part.covers(21), "после последнего в неполном — не известно");
+        assert!(
+            !part.covers(21),
+            "после последнего в неполном — не известно"
+        );
         assert_eq!(part.next_from(), Some(21));
-        let full = InviteList { complete: true, ..part.clone() };
+        let full = InviteList {
+            complete: true,
+            ..part.clone()
+        };
         assert!(full.covers(300) && !full.covers(9));
         assert_eq!(full.next_from(), None);
-        let none = InviteList { from: 0, items: vec![], complete: true };
+        let none = InviteList {
+            from: 0,
+            items: vec![],
+            complete: true,
+        };
         assert!(none.covers(0) && none.covers(u32::MAX));
-        let last = InviteList { from: 0, items: vec![inv(u32::MAX)], complete: false };
+        let last = InviteList {
+            from: 0,
+            items: vec![inv(u32::MAX)],
+            complete: false,
+        };
         assert_eq!(last.next_from(), None, "без переполнения");
     }
 
     #[test]
     fn kicked_admin_friend_туда_обратно() {
-        let k = Kicked { gid: 5, group_name: "игра".into(), banned: true, rev: 42 };
+        let k = Kicked {
+            gid: 5,
+            group_name: "игра".into(),
+            banned: true,
+            rev: 42,
+        };
         let enc = enc_kicked(&k);
         assert_eq!(dec_kicked(&enc).unwrap(), k);
         truncations_fail(&enc, dec_kicked);
 
         let a = AdminInfo {
             gid: 5,
-            bans: vec![BanEntry { pubkey: [1; 32], name: "плохой".into() }, BanEntry { pubkey: [2; 32], name: String::new() }],
-            invites: vec![PendingInvite { pubkey: [3; 32], name: "c".into(), expires_in: 100 }],
+            bans: vec![
+                BanEntry {
+                    pubkey: [1; 32],
+                    name: "плохой".into(),
+                },
+                BanEntry {
+                    pubkey: [2; 32],
+                    name: String::new(),
+                },
+            ],
+            invites: vec![PendingInvite {
+                pubkey: [3; 32],
+                name: "c".into(),
+                expires_in: 100,
+            }],
         };
         let enc = enc_admin_info(&a);
         assert_eq!(dec_admin_info(&enc).unwrap(), a);
         truncations_fail(&enc, dec_admin_info);
-        let empty = AdminInfo { gid: 1, bans: vec![], invites: vec![] };
+        let empty = AdminInfo {
+            gid: 1,
+            bans: vec![],
+            invites: vec![],
+        };
         assert_eq!(dec_admin_info(&enc_admin_info(&empty)).unwrap(), empty);
 
         let f = FriendGroups {
             target: [6; 32],
-            groups: vec![FriendGroup { gid: 1, name: "x".into(), private: false, shared: true }],
+            groups: vec![FriendGroup {
+                gid: 1,
+                name: "x".into(),
+                private: false,
+                shared: true,
+            }],
         };
         let enc = enc_friend_groups(&f);
         assert_eq!(dec_friend_groups(&enc).unwrap(), f);
@@ -871,8 +1020,17 @@ pub(crate) mod tests {
         let long = "ж".repeat(127);
         let a = AdminInfo {
             gid: 1,
-            bans: (0..2000).map(|i| BanEntry { pubkey: [(i % 256) as u8; 32], name: long.clone() }).collect(),
-            invites: vec![PendingInvite { pubkey: [0; 32], name: "x".into(), expires_in: 1 }],
+            bans: (0..2000)
+                .map(|i| BanEntry {
+                    pubkey: [(i % 256) as u8; 32],
+                    name: long.clone(),
+                })
+                .collect(),
+            invites: vec![PendingInvite {
+                pubkey: [0; 32],
+                name: "x".into(),
+                expires_in: 1,
+            }],
         };
         let enc = enc_admin_info(&a);
         assert!(enc.len() <= FRAG_MAX_PAYLOAD);
@@ -896,9 +1054,17 @@ pub(crate) mod tests {
             endpoint: Some(v6),
             candidates: vec![v6; 4],
         };
-        let g = GroupState { name: long, members: vec![m; 253], ..group_state() };
+        let g = GroupState {
+            name: long,
+            members: vec![m; 253],
+            ..group_state()
+        };
         let enc = enc_group_state(&g);
-        assert!(enc.len() <= FRAG_MAX_PAYLOAD, "{} > {FRAG_MAX_PAYLOAD}", enc.len());
+        assert!(
+            enc.len() <= FRAG_MAX_PAYLOAD,
+            "{} > {FRAG_MAX_PAYLOAD}",
+            enc.len()
+        );
     }
 
     #[test]
@@ -924,13 +1090,22 @@ pub(crate) mod tests {
     fn простые_кодеки() {
         assert_eq!(dec_gid(&enc_gid(200)).unwrap(), 200);
         assert_eq!(dec_u32(&enc_u32(u32::MAX)).unwrap(), u32::MAX);
-        assert_eq!(dec_gid_target(&enc_gid_target(4, &[5; 32])).unwrap(), (4, [5; 32]));
+        assert_eq!(
+            dec_gid_target(&enc_gid_target(4, &[5; 32])).unwrap(),
+            (4, [5; 32])
+        );
         assert!(dec_gid_target(&enc_gid_target(4, &[5; 32])[..35]).is_err());
-        assert_eq!(dec_rename(&enc_rename(4, "имя")).unwrap(), (4, "имя".to_string()));
+        assert_eq!(
+            dec_rename(&enc_rename(4, "имя")).unwrap(),
+            (4, "имя".to_string())
+        );
         assert_eq!(dec_status(&enc_status("ок")).unwrap(), "ок");
         assert_eq!(dec_error(&enc_error("ошибка")).unwrap(), "ошибка");
         assert_eq!(dec_pubkey(&enc_pubkey(&[3; 32])).unwrap(), [3; 32]);
-        assert_eq!(dec_create_group(&enc_create_group("g", true)).unwrap(), ("g".to_string(), true));
+        assert_eq!(
+            dec_create_group(&enc_create_group("g", true)).unwrap(),
+            ("g".to_string(), true)
+        );
         assert_eq!(dec_ping(&enc_ping(77)).unwrap(), 77);
         assert!(dec_gid(&[1, 2, 3]).is_err());
         assert!(dec_ping(&[0; 7]).is_err());

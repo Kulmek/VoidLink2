@@ -16,10 +16,10 @@ pub mod snapshot;
 pub mod store;
 pub mod tcp_link;
 // Wintun — только Windows; на Linux/macOS — tun_linux / tun_macos.
+pub mod tui;
 #[cfg(windows)]
 pub mod tun;
 #[cfg(target_os = "linux")]
 pub mod tun_linux;
 #[cfg(target_os = "macos")]
 pub mod tun_macos;
-pub mod tui;

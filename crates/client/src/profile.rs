@@ -52,7 +52,8 @@ pub fn validate_profile_name(name: &str) -> Result<()> {
     ensure!(!name.is_empty(), "имя профиля пустое");
     ensure!(name.len() <= 32, "имя профиля длиннее 32 символов");
     ensure!(
-        name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+        name.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
         "имя профиля может содержать только латиницу, цифры, '_' и '-'"
     );
     Ok(())
@@ -156,11 +157,15 @@ fn seed_check(ed_seed: &[u8; 32], x_seed: &[u8; 32]) -> String {
 
 fn hex32(s: &str, what: &str) -> Result<[u8; 32]> {
     let v = proto::hex_to_bytes(s.trim()).with_context(|| format!("{what}: не hex"))?;
-    v.try_into().map_err(|_| anyhow!("{what}: ожидалось 32 байта"))
+    v.try_into()
+        .map_err(|_| anyhow!("{what}: ожидалось 32 байта"))
 }
 
 fn identity_from_seeds(ed: [u8; 32], x: [u8; 32], friend_code: &str) -> Result<proto::Identity> {
-    let id = proto::Identity { ed_seed: ed, x_seed: x };
+    let id = proto::Identity {
+        ed_seed: ed,
+        x_seed: x,
+    };
     let claimed = proto::Identity::parse_friend_code(friend_code)
         .map_err(|e| anyhow!("некорректный friend code в файле: {e}"))?;
     ensure!(
@@ -175,7 +180,11 @@ pub fn export_identity(id: &proto::Identity, passphrase: Option<&str>) -> Result
     export_with_iterations(id, passphrase, KDF_ITERATIONS)
 }
 
-fn export_with_iterations(id: &proto::Identity, passphrase: Option<&str>, iterations: u32) -> Result<Vec<u8>> {
+fn export_with_iterations(
+    id: &proto::Identity,
+    passphrase: Option<&str>,
+    iterations: u32,
+) -> Result<Vec<u8>> {
     let friend_code = id.friend_code();
     let file = match passphrase {
         None => ExportFile {
@@ -199,7 +208,13 @@ fn export_with_iterations(id: &proto::Identity, passphrase: Option<&str>, iterat
             plain[..32].copy_from_slice(&id.ed_seed);
             plain[32..].copy_from_slice(&id.x_seed);
             let ct = ChaCha20Poly1305::new((&key).into())
-                .encrypt(&Nonce::from(nonce), Payload { msg: &plain, aad: friend_code.as_bytes() })
+                .encrypt(
+                    &Nonce::from(nonce),
+                    Payload {
+                        msg: &plain,
+                        aad: friend_code.as_bytes(),
+                    },
+                )
                 .map_err(|_| anyhow!("ошибка шифрования"))?;
             ExportFile {
                 version: EXPORT_VERSION,
@@ -207,7 +222,11 @@ fn export_with_iterations(id: &proto::Identity, passphrase: Option<&str>, iterat
                 ed_seed: None,
                 x_seed: None,
                 check: None,
-                kdf: Some(KdfParams { alg: KDF_ALG.into(), salt: proto::hex_of(&salt), iterations }),
+                kdf: Some(KdfParams {
+                    alg: KDF_ALG.into(),
+                    salt: proto::hex_of(&salt),
+                    iterations,
+                }),
                 nonce: Some(proto::hex_of(&nonce)),
                 ciphertext: Some(proto::hex_of(&ct)),
             }
@@ -227,7 +246,11 @@ pub fn import_identity(data: &[u8], passphrase: Option<&str>) -> Result<proto::I
     import_with_min_iterations(data, passphrase, KDF_MIN_ITERATIONS)
 }
 
-fn import_with_min_iterations(data: &[u8], passphrase: Option<&str>, min_iter: u32) -> Result<proto::Identity> {
+fn import_with_min_iterations(
+    data: &[u8],
+    passphrase: Option<&str>,
+    min_iter: u32,
+) -> Result<proto::Identity> {
     let f: ExportFile = serde_json::from_slice(data).context("файл экспорта: некорректный JSON")?;
     ensure!(
         f.version == EXPORT_VERSION,
@@ -248,7 +271,10 @@ fn import_with_min_iterations(data: &[u8], passphrase: Option<&str>, min_iter: u
         }
         return identity_from_seeds(ed, x, &f.friend_code);
     }
-    ensure!(f.ed_seed.is_none() && f.x_seed.is_none(), "файл экспорта: открытые и зашифрованные ключи одновременно");
+    ensure!(
+        f.ed_seed.is_none() && f.x_seed.is_none(),
+        "файл экспорта: открытые и зашифрованные ключи одновременно"
+    );
     let (Some(kdf), Some(nonce), Some(ct)) = (&f.kdf, &f.nonce, &f.ciphertext) else {
         bail!("файл экспорта: неполные поля шифрования");
     };
@@ -262,13 +288,23 @@ fn import_with_min_iterations(data: &[u8], passphrase: Option<&str>, min_iter: u
         kdf.iterations
     );
     let salt = proto::hex_to_bytes(&kdf.salt).context("соль KDF: не hex")?;
-    ensure!(salt.len() == SALT_LEN, "соль KDF: ожидалось {SALT_LEN} байт");
+    ensure!(
+        salt.len() == SALT_LEN,
+        "соль KDF: ожидалось {SALT_LEN} байт"
+    );
     let nonce = proto::hex_to_bytes(nonce).context("nonce: не hex")?;
-    let nonce = Nonce::try_from(nonce.as_slice()).map_err(|_| anyhow!("nonce: ожидалось {NONCE_LEN} байт"))?;
+    let nonce = Nonce::try_from(nonce.as_slice())
+        .map_err(|_| anyhow!("nonce: ожидалось {NONCE_LEN} байт"))?;
     let ct = proto::hex_to_bytes(ct).context("ciphertext: не hex")?;
     let key = derive_key(pass, &salt, kdf.iterations);
     let plain = ChaCha20Poly1305::new((&key).into())
-        .decrypt(&nonce, Payload { msg: &ct, aad: f.friend_code.as_bytes() })
+        .decrypt(
+            &nonce,
+            Payload {
+                msg: &ct,
+                aad: f.friend_code.as_bytes(),
+            },
+        )
         .map_err(|_| anyhow!("неверная парольная фраза или файл повреждён"))?;
     ensure!(plain.len() == 64, "файл экспорта: неверная длина ключей");
     let ed: [u8; 32] = plain[..32].try_into().unwrap();
@@ -286,8 +322,9 @@ pub fn export_to_file(path: &Path, id: &proto::Identity, passphrase: Option<&str
     let mut s = path.as_os_str().to_owned();
     s.push(".tmp");
     let tmp = PathBuf::from(s);
-    let res = write_private(&tmp, &data)
-        .and_then(|()| std::fs::rename(&tmp, path).with_context(|| format!("запись {}", path.display())));
+    let res = write_private(&tmp, &data).and_then(|()| {
+        std::fs::rename(&tmp, path).with_context(|| format!("запись {}", path.display()))
+    });
     if res.is_err() {
         // Не оставляем на диске открытые seed'ы.
         let _ = std::fs::remove_file(&tmp);
@@ -312,7 +349,8 @@ fn write_private(path: &Path, data: &[u8]) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        f.set_permissions(std::fs::Permissions::from_mode(0o600)).with_context(ctx)?;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(ctx)?;
     }
     f.write_all(data).with_context(ctx)?;
     f.sync_all().with_context(ctx)?;
@@ -328,9 +366,14 @@ pub fn import_from_file(path: &Path, passphrase: Option<&str>) -> Result<proto::
 /// Кладёт identity в конфиг. Если там уже другая identity — ошибка без `force`.
 /// Та же самая identity — no-op. Возвращает true, если конфиг изменён.
 pub fn apply_identity(cfg: &mut Config, id: &proto::Identity, force: bool) -> Result<bool> {
-    let new = StoredIdentity { ed_seed: proto::hex_of(&id.ed_seed), x_seed: proto::hex_of(&id.x_seed) };
+    let new = StoredIdentity {
+        ed_seed: proto::hex_of(&id.ed_seed),
+        x_seed: proto::hex_of(&id.x_seed),
+    };
     if let Some(cur) = &cfg.identity {
-        if cur.ed_seed.eq_ignore_ascii_case(&new.ed_seed) && cur.x_seed.eq_ignore_ascii_case(&new.x_seed) {
+        if cur.ed_seed.eq_ignore_ascii_case(&new.ed_seed)
+            && cur.x_seed.eq_ignore_ascii_case(&new.x_seed)
+        {
             return Ok(false);
         }
         ensure!(
@@ -362,11 +405,25 @@ mod tests {
         for ok in ["a", "work", "Home_2", "x-y", &"z".repeat(32)] {
             assert!(validate_profile_name(ok).is_ok(), "{ok}");
         }
-        for bad in ["", &"z".repeat(33), "a b", "../x", "a/b", "a\\b", ".", "..", "имя", "a.b"] {
+        for bad in [
+            "",
+            &"z".repeat(33),
+            "a b",
+            "../x",
+            "a/b",
+            "a\\b",
+            ".",
+            "..",
+            "имя",
+            "a.b",
+        ] {
             assert!(validate_profile_name(bad).is_err(), "{bad}");
         }
         let base = Path::new("/base");
-        assert_eq!(profile_dir_in(base, "work").unwrap(), base.join("profiles").join("work"));
+        assert_eq!(
+            profile_dir_in(base, "work").unwrap(),
+            base.join("profiles").join("work")
+        );
         assert!(profile_dir_in(base, "..").is_err());
     }
 
@@ -405,7 +462,10 @@ mod tests {
         assert!(!text.contains(&proto::hex_of(&id.ed_seed)));
         assert!(!text.contains(&proto::hex_of(&id.x_seed)));
         assert!(same(&imp(&data, Some("пароль 123")).unwrap(), &id));
-        let err = imp(&data, None).err().expect("ожидалась ошибка").to_string();
+        let err = imp(&data, None)
+            .err()
+            .expect("ожидалась ошибка")
+            .to_string();
         assert!(err.contains("парольную фразу"), "{err}");
     }
 
@@ -420,14 +480,23 @@ mod tests {
         assert!(same(&import_identity(&data, Some("secret")).unwrap(), &id));
         // Файл с заниженными итерациями боевой импорт не принимает.
         let weak = export_with_iterations(&id, Some("secret"), T_ITER).unwrap();
-        assert!(import_identity(&weak, Some("secret")).err().expect("ожидалась ошибка").to_string().contains("итераций"));
+        assert!(
+            import_identity(&weak, Some("secret"))
+                .err()
+                .expect("ожидалась ошибка")
+                .to_string()
+                .contains("итераций")
+        );
     }
 
     #[test]
     fn неверная_фраза() {
         let id = proto::Identity::generate();
         let data = export_with_iterations(&id, Some("right"), T_ITER).unwrap();
-        let err = imp(&data, Some("wrong")).err().expect("ожидалась ошибка").to_string();
+        let err = imp(&data, Some("wrong"))
+            .err()
+            .expect("ожидалась ошибка")
+            .to_string();
         assert!(err.contains("неверная парольная фраза"), "{err}");
     }
 
@@ -457,9 +526,16 @@ mod tests {
 
         // Мусор и чужая версия.
         assert!(imp(b"not json", None).is_err());
-        let mut plain: serde_json::Value = serde_json::from_slice(&export_identity(&id, None).unwrap()).unwrap();
+        let mut plain: serde_json::Value =
+            serde_json::from_slice(&export_identity(&id, None).unwrap()).unwrap();
         plain["version"] = 99.into();
-        assert!(imp(&serde_json::to_vec(&plain).unwrap(), None).err().expect("ожидалась ошибка").to_string().contains("версия"));
+        assert!(
+            imp(&serde_json::to_vec(&plain).unwrap(), None)
+                .err()
+                .expect("ожидалась ошибка")
+                .to_string()
+                .contains("версия")
+        );
     }
 
     #[test]
@@ -471,12 +547,18 @@ mod tests {
         // Подменённый x_seed ловится контрольным полем.
         let mut t = v.clone();
         t["x_seed"] = proto::hex_of(&[9u8; 32]).into();
-        let err = imp(&serde_json::to_vec(&t).unwrap(), None).err().expect("ожидалась ошибка").to_string();
+        let err = imp(&serde_json::to_vec(&t).unwrap(), None)
+            .err()
+            .expect("ожидалась ошибка")
+            .to_string();
         assert!(err.contains("контрольным"), "{err}");
         // Старый файл без check принимается.
         let mut t = v.clone();
         t.as_object_mut().unwrap().remove("check");
-        assert!(same(&imp(&serde_json::to_vec(&t).unwrap(), None).unwrap(), &id));
+        assert!(same(
+            &imp(&serde_json::to_vec(&t).unwrap(), None).unwrap(),
+            &id
+        ));
     }
 
     #[test]
@@ -510,12 +592,17 @@ mod tests {
     fn friend_code_не_совпадает() {
         let id = proto::Identity::generate();
         let other = proto::Identity::generate();
-        let mut v: serde_json::Value = serde_json::from_slice(&export_identity(&id, None).unwrap()).unwrap();
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&export_identity(&id, None).unwrap()).unwrap();
         v["friend_code"] = other.friend_code().into();
-        let err = imp(&serde_json::to_vec(&v).unwrap(), None).err().expect("ожидалась ошибка").to_string();
+        let err = imp(&serde_json::to_vec(&v).unwrap(), None)
+            .err()
+            .expect("ожидалась ошибка")
+            .to_string();
         assert!(err.contains("не соответствует"), "{err}");
         // Подменённый seed при исходном коде — тоже ошибка.
-        let mut v: serde_json::Value = serde_json::from_slice(&export_identity(&id, None).unwrap()).unwrap();
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&export_identity(&id, None).unwrap()).unwrap();
         v["ed_seed"] = proto::hex_of(&other.ed_seed).into();
         assert!(imp(&serde_json::to_vec(&v).unwrap(), None).is_err());
     }
@@ -533,7 +620,12 @@ mod tests {
         assert!(apply_identity(&mut cfg, &got, false).unwrap());
         assert!(!apply_identity(&mut cfg, &got, false).unwrap());
         let other = proto::Identity::generate();
-        assert!(apply_identity(&mut cfg, &other, false).expect_err("ожидалась ошибка").to_string().contains("--force"));
+        assert!(
+            apply_identity(&mut cfg, &other, false)
+                .expect_err("ожидалась ошибка")
+                .to_string()
+                .contains("--force")
+        );
         assert!(same(&crate::store::ensure_identity(&mut cfg), &id));
         assert!(apply_identity(&mut cfg, &other, true).unwrap());
         assert!(same(&crate::store::ensure_identity(&mut cfg), &other));

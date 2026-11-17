@@ -239,7 +239,9 @@ pub fn validate_sid(sid: &str) -> Result<()> {
         .strip_prefix("S-1-")
         .with_context(|| format!("неверный SID «{sid}»: ожидается S-1-…"))?;
     if rest.is_empty()
-        || rest.split('-').any(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()))
+        || rest
+            .split('-')
+            .any(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()))
     {
         bail!("неверный SID «{sid}»");
     }
@@ -250,7 +252,9 @@ pub fn validate_sid(sid: &str) -> Result<()> {
 /// чтение/запись; `P` — без наследования.
 pub fn pipe_sddl(owner_sid: &str) -> Result<String> {
     validate_sid(owner_sid)?;
-    Ok(format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;{owner_sid})"))
+    Ok(format!(
+        "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;{owner_sid})"
+    ))
 }
 
 /// Разбор содержимого `owner.sid` (пробелы/перевод строки по краям допустимы).
@@ -263,8 +267,12 @@ pub fn parse_owner_sid(text: &str) -> Result<String> {
 /// Чтение `owner.sid` из каталога данных.
 pub fn read_owner_sid(data_dir: &Path) -> Result<String> {
     let path = owner_sid_path(data_dir);
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("нет SID владельца ({}): служба не установлена?", path.display()))?;
+    let text = std::fs::read_to_string(&path).with_context(|| {
+        format!(
+            "нет SID владельца ({}): служба не установлена?",
+            path.display()
+        )
+    })?;
     parse_owner_sid(&text)
 }
 
@@ -419,7 +427,10 @@ pub fn shortcut_script(spec: &ShortcutSpec) -> String {
 /// Аргументы `powershell.exe` для скрипта через `-EncodedCommand`
 /// (base64 от UTF-16LE): никаких проблем с кавычками командной строки.
 pub fn powershell_args(script: &str) -> Vec<String> {
-    let utf16: Vec<u8> = script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    let utf16: Vec<u8> = script
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .collect();
     vec![
         "-NoProfile".into(),
         "-NonInteractive".into(),
@@ -435,12 +446,24 @@ pub fn base64(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
         out.push(T[(n >> 18) as usize & 63] as char);
         out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -455,7 +478,10 @@ mod tests {
             data_dir_from(Some(OsStr::new("D:\\PD"))),
             PathBuf::from("D:\\PD").join("tunnel")
         );
-        assert_eq!(data_dir_from(None), PathBuf::from(r"C:\ProgramData").join("tunnel"));
+        assert_eq!(
+            data_dir_from(None),
+            PathBuf::from(r"C:\ProgramData").join("tunnel")
+        );
         assert_eq!(data_dir_from(Some(OsStr::new(""))), data_dir_from(None));
     }
 
@@ -474,7 +500,15 @@ mod tests {
     fn sid_validation() {
         validate_sid("S-1-5-18").unwrap();
         validate_sid("S-1-5-21-1004336348-1177238915-682003330-1001").unwrap();
-        for bad in ["", "S-1-", "S-1-5-", "S-1-5--1", "s-1-5-18", "S-1-5-18)(A;;GA;;;WD", "X-1-5"] {
+        for bad in [
+            "",
+            "S-1-",
+            "S-1-5-",
+            "S-1-5--1",
+            "s-1-5-18",
+            "S-1-5-18)(A;;GA;;;WD",
+            "X-1-5",
+        ] {
             assert!(validate_sid(bad).is_err(), "{bad}");
         }
     }
@@ -490,7 +524,10 @@ mod tests {
 
     #[test]
     fn owner_sid_parse() {
-        assert_eq!(parse_owner_sid(" S-1-5-21-7-1001\r\n").unwrap(), "S-1-5-21-7-1001");
+        assert_eq!(
+            parse_owner_sid(" S-1-5-21-7-1001\r\n").unwrap(),
+            "S-1-5-21-7-1001"
+        );
         assert!(parse_owner_sid("мусор").is_err());
     }
 
@@ -586,13 +623,20 @@ mod tests {
         assert_eq!(o.service_name, SERVICE_NAME);
         assert_eq!(o.daemon_exe, Path::new("/pf/Tunnel").join(DAEMON_EXE));
         assert_eq!(o.service_args, ["service"]);
-        assert_eq!(o.tray_exe.as_deref(), Some(Path::new("/pf/Tunnel").join(TRAY_EXE).as_path()));
+        assert_eq!(
+            o.tray_exe.as_deref(),
+            Some(Path::new("/pf/Tunnel").join(TRAY_EXE).as_path())
+        );
         let sc = o.shortcut.unwrap();
         assert_eq!(sc.aumid, AUMID);
         assert_eq!(sc.lnk, start_menu_shortcut(Path::new("/ad"), SHORTCUT_NAME));
         assert_eq!(o.user_appdata.as_deref(), Some(Path::new("/ad")));
         assert!(o.owner_sid.is_none());
-        assert!(InstallOptions::for_layout(Path::new("/pf"), None).shortcut.is_none());
+        assert!(
+            InstallOptions::for_layout(Path::new("/pf"), None)
+                .shortcut
+                .is_none()
+        );
         let u = UninstallOptions::standard(true, Some(Path::new("/ad")));
         assert!(u.purge && u.remove_run_key);
         assert_eq!(u.shortcut_lnk, Some(sc.lnk));

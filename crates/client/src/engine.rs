@@ -373,20 +373,34 @@ impl GroupSess {
     /// от сервера (правило 5 — до расшифровки). Иначе любой, кто знает наш
     /// адрес и gid, заставлял бы нас тянуть GROUP_STATE целиком (а сервер —
     /// слать его). Поверх — пауза с удвоением и предел в минуту.
-    fn epoch_hint(&mut self, h: &proto::GroupHeader, src: SocketAddr, is_relay: bool, now: Instant) -> bool {
+    fn epoch_hint(
+        &mut self,
+        h: &proto::GroupHeader,
+        src: SocketAddr,
+        is_relay: bool,
+        now: Instant,
+    ) -> bool {
         if h.epoch <= self.epoch {
             return false;
         }
-        let from_peer = h.src != self.my_ip && self.members.get(&h.src).is_some_and(|p| p.knows(src));
+        let from_peer =
+            h.src != self.my_ip && self.members.get(&h.src).is_some_and(|p| p.knows(src));
         (is_relay || from_peer) && self.hint_due(h.epoch, now)
     }
 
     /// Пора ли сигналить «эпоха `epoch` новее нашей» (GET_GROUP).
     fn hint_due(&mut self, epoch: u32, now: Instant) -> bool {
-        if self.sync_hint.is_some_and(|t| now.duration_since(t) < self.hint_gap) {
+        if self
+            .sync_hint
+            .is_some_and(|t| now.duration_since(t) < self.hint_gap)
+        {
             return false;
         }
-        while self.hint_log.front().is_some_and(|t| now.duration_since(*t) >= HINT_WINDOW) {
+        while self
+            .hint_log
+            .front()
+            .is_some_and(|t| now.duration_since(*t) >= HINT_WINDOW)
+        {
             self.hint_log.pop_front();
         }
         if self.hint_log.len() >= HINT_MAX_PER_WINDOW {
@@ -403,7 +417,12 @@ impl GroupSess {
 
     /// Заголовок и счётчик следующего фрейма к `dst` (текущий ключ).
     fn next_frame(&mut self, gid: u32, dst: u32) -> (proto::SymKey, proto::GroupHeader, u64) {
-        let h = proto::GroupHeader { gid, src: self.my_ip, dst, epoch: self.epoch };
+        let h = proto::GroupHeader {
+            gid,
+            src: self.my_ip,
+            dst,
+            epoch: self.epoch,
+        };
         let c = self.cur.tx;
         // Как SendCounter: обёртка повторила бы nonce.
         self.cur.tx = c.checked_add(1).expect("nonce counter exhausted");
@@ -414,8 +433,18 @@ impl GroupSess {
     /// среди адресов пира от сервера и пир онлайн. Окна повторов не
     /// трогаются: они принадлежат ключу (сброс открыл бы дорогу повторам, а
     /// память и так ограничена составом группы на ключ).
-    fn upsert_member(&mut self, gid: u32, m: &payloads::MemberInfo, now: Instant, events: &mut Vec<Event>) {
-        let old_ip = self.members.iter().find(|(_, p)| p.pubkey == m.pubkey).map(|(ip, _)| *ip);
+    fn upsert_member(
+        &mut self,
+        gid: u32,
+        m: &payloads::MemberInfo,
+        now: Instant,
+        events: &mut Vec<Event>,
+    ) {
+        let old_ip = self
+            .members
+            .iter()
+            .find(|(_, p)| p.pubkey == m.pubkey)
+            .map(|(ip, _)| *ip);
         let prev = old_ip.and_then(|ip| self.members.remove(&ip));
         let prev = prev.as_ref();
         let mut peer = PeerSess {
@@ -439,15 +468,27 @@ impl GroupSess {
                     peer.last_direct = prev.and_then(|p| p.last_direct);
                 }
                 // Пир онлайн, но сменил адрес: канал на старом недействителен.
-                Some(_) => events.push(Event::DirectLost { gid, ip: m.ip, name: m.name.clone() }),
+                Some(_) => events.push(Event::DirectLost {
+                    gid,
+                    ip: m.ip,
+                    name: m.name.clone(),
+                }),
                 None => {}
             }
         }
         if prev.map(|p| p.online) != Some(m.online) {
             if m.online {
-                events.push(Event::PeerOnline { gid, ip: m.ip, name: m.name.clone() });
+                events.push(Event::PeerOnline {
+                    gid,
+                    ip: m.ip,
+                    name: m.name.clone(),
+                });
             } else if prev.is_some() {
-                events.push(Event::PeerOffline { gid, ip: m.ip, name: m.name.clone() });
+                events.push(Event::PeerOffline {
+                    gid,
+                    ip: m.ip,
+                    name: m.name.clone(),
+                });
             }
         }
         self.members.insert(m.ip, peer);
@@ -527,26 +568,69 @@ impl Meta {
 pub enum Event {
     Connected(SocketAddr),
     Disconnected(String),
-    GroupJoined { gid: u32, name: String, my_ip: u32 },
-    GroupLeft { gid: u32, name: String },
-    GroupDeleted { gid: u32, name: String },
+    GroupJoined {
+        gid: u32,
+        name: String,
+        my_ip: u32,
+    },
+    GroupLeft {
+        gid: u32,
+        name: String,
+    },
+    GroupDeleted {
+        gid: u32,
+        name: String,
+    },
     /// Нас исключили из группы (KICKED); `banned` — с баном.
-    Kicked { gid: u32, name: String, banned: bool },
-    PeerOnline { gid: u32, ip: u32, name: String },
-    PeerOffline { gid: u32, ip: u32, name: String },
+    Kicked {
+        gid: u32,
+        name: String,
+        banned: bool,
+    },
+    PeerOnline {
+        gid: u32,
+        ip: u32,
+        name: String,
+    },
+    PeerOffline {
+        gid: u32,
+        ip: u32,
+        name: String,
+    },
     /// Установлен прямой p2p-канал с пиром.
-    Direct { gid: u32, ip: u32, name: String },
+    Direct {
+        gid: u32,
+        ip: u32,
+        name: String,
+    },
     /// Прямой канал с онлайн-пиром потерян (таймаут или смена адреса) —
     /// трафик идёт через релей, PUNCH продолжается.
-    DirectLost { gid: u32, ip: u32, name: String },
+    DirectLost {
+        gid: u32,
+        ip: u32,
+        name: String,
+    },
     /// Приглашение в группу (в т.ч. повторная доставка неотвеченного после
     /// HELLO3 — UI должен убирать дубликаты по gid). `expires_in` — секунд
     /// до истечения на момент отправки сервером.
-    Invite { gid: u32, group_name: String, from_pubkey: [u8; 32], from_name: String, expires_in: u32 },
+    Invite {
+        gid: u32,
+        group_name: String,
+        from_pubkey: [u8; 32],
+        from_name: String,
+        expires_in: u32,
+    },
     /// Приглашённый отклонил наше приглашение (мы — владелец группы).
-    InviteDeclined { gid: u32, group_name: String, by_pubkey: [u8; 32], by_name: String },
+    InviteDeclined {
+        gid: u32,
+        group_name: String,
+        by_pubkey: [u8; 32],
+        by_name: String,
+    },
     /// Приглашение больше недействительно: группу удалили до ответа.
-    InviteRevoked { gid: u32 },
+    InviteRevoked {
+        gid: u32,
+    },
     /// Сервер прислал окно списка неотвеченных приглашений (после HELLO3,
     /// отказа, входа, отзыва BAN/KICK): приглашения с gid ≥ `from`, не больше
     /// 16. Других gid в покрытом окне уже нет — UI снимает их окна.
@@ -554,18 +638,35 @@ pub enum Event {
     /// последнего gid в нём, следующее движок дочитывает сам
     /// (LIST_INVITES). Каждое из `gids` перед этим пришло как
     /// [`Event::Invite`].
-    InvitesSynced { gids: Vec<u32>, from: u32, complete: bool },
+    InvitesSynced {
+        gids: Vec<u32>,
+        from: u32,
+        complete: bool,
+    },
     /// Ответ FRIEND_GROUPS_RESP: группы пира `pubkey` (из самого ответа).
-    FriendGroups { pubkey: [u8; 32], items: Vec<payloads::FriendGroup> },
+    FriendGroups {
+        pubkey: [u8; 32],
+        items: Vec<payloads::FriendGroup>,
+    },
     /// ADMIN_INFO (владельцу): баны (pk, имя) и неотвеченные приглашения
     /// (pk, имя, секунд до истечения).
-    AdminInfo { gid: u32, bans: Vec<([u8; 32], String)>, invites: Vec<([u8; 32], String, u32)> },
+    AdminInfo {
+        gid: u32,
+        bans: Vec<([u8; 32], String)>,
+        invites: Vec<([u8; 32], String, u32)>,
+    },
     /// Ключ сервера сменён по цепочке ротации от закреплённого: новый ключ
     /// закреплён и сохранён в client.json.
-    ServerKeyRotated { addr: SocketAddr, new_code: String },
+    ServerKeyRotated {
+        addr: SocketAddr,
+        new_code: String,
+    },
     /// Движок переключён на другой сервер (`Cmd::SwitchServer`); группы
     /// прежнего сервера забыты (каждая — `GroupLeft`).
-    ServerSwitched { addr: SocketAddr, label: String },
+    ServerSwitched {
+        addr: SocketAddr,
+        label: String,
+    },
     Error(String),
     Notice(String),
 }
@@ -574,7 +675,10 @@ pub enum Event {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Cmd {
     RefreshList,
-    Create { name: String, private: bool },
+    Create {
+        name: String,
+        private: bool,
+    },
     Join(u32),
     Leave(u32),
     Delete(u32),
@@ -595,23 +699,41 @@ pub enum Cmd {
     /// Невидимка: сохраняется в конфиге и шлётся серверу (PRESENCE).
     SetInvisible(bool),
     /// Переключиться на другой сервер без перезапуска (адаптер остаётся).
-    SwitchServer { addr: SocketAddr, pubkey: [u8; 32], label: String },
+    SwitchServer {
+        addr: SocketAddr,
+        pubkey: [u8; 32],
+        label: String,
+    },
     /// Переключить автовход в группу (локальная настройка).
     ToggleAutojoin(u32),
     FriendGroups([u8; 32]),
     /// Друг в конфиг (PLAN.md 7.1): тот же pubkey — обновить alias.
-    AddFriend { pubkey: [u8; 32], alias: String },
+    AddFriend {
+        pubkey: [u8; 32],
+        alias: String,
+    },
     /// Удалить друга из конфига.
     DelFriend([u8; 32]),
     /// Alias друга (переименование; друга нет — `Event::Error`).
-    SetAlias { pubkey: [u8; 32], alias: String },
+    SetAlias {
+        pubkey: [u8; 32],
+        alias: String,
+    },
     /// Сервер в конфиг (`addr` — `ip:port`); тот же адрес — обновить ключ и
     /// метку.
-    AddServer { addr: String, pubkey: [u8; 32], label: String },
+    AddServer {
+        addr: String,
+        pubkey: [u8; 32],
+        label: String,
+    },
     /// Удалить сервер по индексу; текущий сервер движка не удаляется.
-    DelServer { idx: usize },
+    DelServer {
+        idx: usize,
+    },
     /// Сервер по умолчанию (первый в списке — его берёт следующий запуск).
-    SetPrimaryServer { idx: usize },
+    SetPrimaryServer {
+        idx: usize,
+    },
     /// Подсказка «сеть могла смениться» (выход из сна): новое рукопожатие
     /// сразу, без ожидания таймеров и бэкоффа; группы и адаптер — те же.
     Reconnect,
@@ -678,7 +800,14 @@ impl Engine {
     /// Фрейм группы текущим ключом и следующим счётчиком движка, но с
     /// произвольными src/dst (тесты подделки src_ip).
     #[cfg(test)]
-    pub fn craft_frame(&self, gid: u32, typ: u8, src: u32, dst: u32, payload: &[u8]) -> Option<Vec<u8>> {
+    pub fn craft_frame(
+        &self,
+        gid: u32,
+        typ: u8,
+        src: u32,
+        dst: u32,
+        payload: &[u8],
+    ) -> Option<Vec<u8>> {
         let mut g = self.env.groups.lock().unwrap();
         let gs = g.get_mut(&gid)?;
         let (k, mut h, c) = gs.next_frame(gid, dst);
@@ -788,7 +917,10 @@ impl TunDev for WintunDev {
         let idx = self.if_index()?;
         let mut c = std::process::Command::new("netsh");
         c.args([
-            "interface", "ipv4", "add", "route",
+            "interface",
+            "ipv4",
+            "add",
+            "route",
             &format!("{}/32", crate::dns::DNS_ADDR),
             &idx.to_string(),
             "store=active",
@@ -801,12 +933,20 @@ impl TunDev for WintunDev {
 fn configure_os_dns(ifname: &str) -> Result<()> {
     if cfg!(windows) {
         let mut c = std::process::Command::new("powershell");
-        c.args(["-NoProfile", "-NonInteractive", "-Command", &crate::dns::windows_nrpt_add()]);
+        c.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &crate::dns::windows_nrpt_add(),
+        ]);
         run_cmd(c, "NRPT")
     } else if cfg!(target_os = "macos") {
         std::fs::create_dir_all("/etc/resolver").context("/etc/resolver")?;
-        std::fs::write(crate::dns::MACOS_RESOLVER_PATH, crate::dns::macos_resolver_content())
-            .context(crate::dns::MACOS_RESOLVER_PATH)
+        std::fs::write(
+            crate::dns::MACOS_RESOLVER_PATH,
+            crate::dns::macos_resolver_content(),
+        )
+        .context(crate::dns::MACOS_RESOLVER_PATH)
     } else {
         for argv in crate::dns::linux_resolvectl_setup(ifname) {
             let mut c = std::process::Command::new(&argv[0]);
@@ -888,7 +1028,9 @@ impl Env {
         };
         if ok {
             self.stats.tx_pkts.fetch_add(1, Ordering::Relaxed);
-            self.stats.tx_bytes.fetch_add(frame.len() as u64, Ordering::Relaxed);
+            self.stats
+                .tx_bytes
+                .fetch_add(frame.len() as u64, Ordering::Relaxed);
         }
     }
 
@@ -933,7 +1075,11 @@ fn bind_addr(server: SocketAddr) -> SocketAddr {
 
 /// Флаги HELLO3 из настроек.
 fn hello_flags(cfg: &Config) -> u8 {
-    if cfg.invisible { handshake::HELLO_FLAG_INVISIBLE } else { 0 }
+    if cfg.invisible {
+        handshake::HELLO_FLAG_INVISIBLE
+    } else {
+        0
+    }
 }
 
 /// Текст ошибки на UNSUPPORTED.
@@ -1004,17 +1150,33 @@ impl Handshake {
         }
     }
 
-    fn hello(&self, id: &proto::Identity, name: &str, flags: u8, cookie: Option<&[u8; 16]>) -> Vec<u8> {
+    fn hello(
+        &self,
+        id: &proto::Identity,
+        name: &str,
+        flags: u8,
+        cookie: Option<&[u8; 16]>,
+    ) -> Vec<u8> {
         let body = proto::Hello3::encode(id, &self.eph.public(), name, flags, cookie);
         proto::plain_frame(ctrl::HELLO3, &body)
     }
 
     /// CHALLENGE → HELLO3 с cookie (тот же eph). `None` — фрейм не тот или
     /// лимит (один HELLO3 с cookie на CHALLENGE, не чаще `COOKIE_GAP`).
-    fn on_challenge(&mut self, id: &proto::Identity, name: &str, flags: u8, body: &[u8], now: Instant) -> Option<Vec<u8>> {
+    fn on_challenge(
+        &mut self,
+        id: &proto::Identity,
+        name: &str,
+        flags: u8,
+        body: &[u8],
+        now: Instant,
+    ) -> Option<Vec<u8>> {
         let cookie = handshake::dec_challenge(body).ok()?;
         self.saw_challenge = true;
-        if self.last_cookie.is_some_and(|t| now.duration_since(t) < COOKIE_GAP) {
+        if self
+            .last_cookie
+            .is_some_and(|t| now.duration_since(t) < COOKIE_GAP)
+        {
             return None;
         }
         self.last_cookie = Some(now);
@@ -1055,10 +1217,15 @@ fn accept_welcome(
     };
     let pin = proto::resolve_pin(pinned, &w)
         .context("WELCOME: подпись не от закреплённого сервера (неверный код сервера?)")?;
-    let Ok(keys) = proto::session_keys(proto::Role::Client, id, eph, &w.server_x, &w.server_eph) else {
+    let Ok(keys) = proto::session_keys(proto::Role::Client, id, eph, &w.server_x, &w.server_eph)
+    else {
         return Ok(None);
     };
-    Ok(Some(Accepted { server_eph: w.server_eph, keys, pin }))
+    Ok(Some(Accepted {
+        server_eph: w.server_eph,
+        keys,
+        pin,
+    }))
 }
 
 /// Ключи одной серверной сессии: свой счётчик, окно повторов и сборка FRAG
@@ -1088,7 +1255,10 @@ struct CtrlSession {
 
 impl CtrlSession {
     fn new(eph: proto::EphemeralKey, acc: Accepted) -> Self {
-        let mut s = Self { eph, keysets: Vec::new() };
+        let mut s = Self {
+            eph,
+            keysets: Vec::new(),
+        };
         s.add(acc);
         s
     }
@@ -1140,7 +1310,9 @@ impl CtrlSession {
             if !k.rx.check(ctr) {
                 return None;
             }
-            proto::open_ctrl(&k.keys.rx, typ, body).ok().map(|(_, pt)| (i, pt))
+            proto::open_ctrl(&k.keys.rx, typ, body)
+                .ok()
+                .map(|(_, pt)| (i, pt))
         })?;
         if !self.keysets[i].rx.commit(ctr) {
             return None;
@@ -1209,7 +1381,10 @@ impl CtrlConn {
         let mut buf = vec![0u8; 65_535];
         let mut tcp: Option<TcpLink> = None;
         if cfg.transport == TransportMode::Tcp {
-            tcp = Some(TcpLink::connect(server, TCP_CONNECT_TIMEOUT).with_context(|| format!("TCP {server}"))?);
+            tcp = Some(
+                TcpLink::connect(server, TCP_CONNECT_TIMEOUT)
+                    .with_context(|| format!("TCP {server}"))?,
+            );
         }
         // HELLO3 по UDP без единого ответа — для фолбэка на TCP.
         let mut udp_hellos = 0u32;
@@ -1229,7 +1404,12 @@ impl CtrlConn {
                         Err(_) => udp_hellos = 0,
                     }
                 }
-                ctrl_send(&sock, tcp.as_ref(), &hs.hello(identity, &cfg.name, flags, None), server)?;
+                ctrl_send(
+                    &sock,
+                    tcp.as_ref(),
+                    &hs.hello(identity, &cfg.name, flags, None),
+                    server,
+                )?;
                 if tcp.is_none() {
                     udp_hellos += 1;
                 }
@@ -1298,7 +1478,10 @@ impl CtrlConn {
     /// бы ключи всех групп). `None` — списка нет и после повторов.
     pub fn invite_list(&self) -> Result<Option<payloads::InviteList>> {
         self.send_ctrl(ctrl::CTRL_PING, &[]);
-        let (typ, p) = self.wait_any(&[ctrl::INVITE_LIST, ctrl::CTRL_PONG], Duration::from_secs(5))?;
+        let (typ, p) = self.wait_any(
+            &[ctrl::INVITE_LIST, ctrl::CTRL_PONG],
+            Duration::from_secs(5),
+        )?;
         if typ == ctrl::INVITE_LIST {
             return Ok(Some(payloads::dec_invite_list(&p)?));
         }
@@ -1362,7 +1545,9 @@ impl CtrlConn {
             }
         }
         let deadline = Instant::now() + timeout;
-        self.sock.set_read_timeout(Some(Duration::from_millis(200))).ok();
+        self.sock
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .ok();
         let mut buf = vec![0u8; 65_535];
         // RESET открыт и подделывается кем угодно: он считается, только если
         // за `RESET_GRACE` до и после него от сервера не было ничего подлинного.
@@ -1375,7 +1560,8 @@ impl CtrlConn {
             if now > deadline {
                 anyhow::bail!("таймаут ожидания {expect:02x?} от сервера");
             }
-            let Some(frame) = ctrl_recv(&self.sock, self.tcp.as_ref(), self.server, &mut buf) else {
+            let Some(frame) = ctrl_recv(&self.sock, self.tcp.as_ref(), self.server, &mut buf)
+            else {
                 continue;
             };
             let (typ, body) = match proto::split_frame(&frame) {
@@ -1387,7 +1573,9 @@ impl CtrlConn {
                 // создал новую сессию (HELLO3 дошёл с другого адреса).
                 ctrl::WELCOME => {
                     let mut s = self.sess.lock().unwrap();
-                    if let Ok(Some(acc)) = accept_welcome(&self.identity, &s.eph, &self.pinned, body) {
+                    if let Ok(Some(acc)) =
+                        accept_welcome(&self.identity, &s.eph, &self.pinned, body)
+                    {
                         s.add(acc);
                     }
                     continue;
@@ -1417,7 +1605,12 @@ impl CtrlConn {
 }
 
 /// Фрейм серверу CLI-соединения: по TCP, если он поднят, иначе по UDP.
-fn ctrl_send(sock: &UdpSocket, tcp: Option<&TcpLink>, frame: &[u8], server: SocketAddr) -> std::io::Result<()> {
+fn ctrl_send(
+    sock: &UdpSocket,
+    tcp: Option<&TcpLink>,
+    frame: &[u8],
+    server: SocketAddr,
+) -> std::io::Result<()> {
     match tcp {
         Some(t) => t.send(frame),
         None => sock.send_to(frame, server).map(|_| ()),
@@ -1425,7 +1618,12 @@ fn ctrl_send(sock: &UdpSocket, tcp: Option<&TcpLink>, frame: &[u8], server: Sock
 }
 
 /// Следующий фрейм от сервера (ждёт ~200 мс): `None` — ничего или чужой.
-fn ctrl_recv(sock: &UdpSocket, tcp: Option<&TcpLink>, server: SocketAddr, buf: &mut [u8]) -> Option<Vec<u8>> {
+fn ctrl_recv(
+    sock: &UdpSocket,
+    tcp: Option<&TcpLink>,
+    server: SocketAddr,
+    buf: &mut [u8],
+) -> Option<Vec<u8>> {
     match tcp {
         Some(t) => {
             let r = t.recv_timeout(Duration::from_millis(200));
@@ -1476,7 +1674,8 @@ pub fn start(
         let dns_on = cfg.lock().unwrap().dns;
         let eng = start_with_tun(cfg, server, server_pub, identity, dev, save)?;
         if dns_on && let Err(e) = configure_os_dns(adapter_name) {
-            eng.env.emit(Event::Notice(format!("DNS для .vl не настроен: {e}")));
+            eng.env
+                .emit(Event::Notice(format!("DNS для .vl не настроен: {e}")));
         }
         spawn_tun_reader(session, eng.env.clone());
         Ok(eng)
@@ -1498,7 +1697,8 @@ pub fn start(
         let dns_on = cfg.lock().unwrap().dns;
         let eng = start_with_tun(cfg, server, server_pub, identity, dev.clone(), save)?;
         if dns_on && let Err(e) = configure_os_dns(dev.name()) {
-            eng.env.emit(Event::Notice(format!("DNS для .vl не настроен: {e}")));
+            eng.env
+                .emit(Event::Notice(format!("DNS для .vl не настроен: {e}")));
         }
         let fd = std::os::fd::AsRawFd::as_raw_fd(dev.as_ref());
         let rd = dev.clone();
@@ -1509,12 +1709,14 @@ pub fn start(
     {
         let _ = (dll, adapter_name);
         let dev = Arc::new(
-            crate::tun_macos::Utun::open(mtu).context("не удалось создать utun (запусти через sudo)")?,
+            crate::tun_macos::Utun::open(mtu)
+                .context("не удалось создать utun (запусти через sudo)")?,
         );
         let dns_on = cfg.lock().unwrap().dns;
         let eng = start_with_tun(cfg, server, server_pub, identity, dev.clone(), save)?;
         if dns_on && let Err(e) = configure_os_dns("") {
-            eng.env.emit(Event::Notice(format!("DNS для .vl не настроен: {e}")));
+            eng.env
+                .emit(Event::Notice(format!("DNS для .vl не настроен: {e}")));
         }
         let fd = dev.raw_fd();
         let rd = dev.clone();
@@ -1532,7 +1734,16 @@ pub fn start(
     }
     #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
-        let _ = (cfg, server, server_pub, identity, adapter_name, dll, save, mtu);
+        let _ = (
+            cfg,
+            server,
+            server_pub,
+            identity,
+            adapter_name,
+            dll,
+            save,
+            mtu,
+        );
         anyhow::bail!("TUN не поддерживается на этой платформе")
     }
 }
@@ -1662,7 +1873,11 @@ enum Input {
     Cmd(Cmd),
     /// Не групповой фрейм от сервера (открытые рукопожатия/RESET или шифр).
     /// `via_tcp` — пришёл по TCP-каналу.
-    Server { typ: u8, body: Vec<u8>, via_tcp: bool },
+    Server {
+        typ: u8,
+        body: Vec<u8>,
+        via_tcp: bool,
+    },
     /// Фрейм группы новее известной эпохи: пропущена ротация — GET_GROUP.
     NeedGroup(u32),
 }
@@ -1698,7 +1913,13 @@ fn rx_loop(env: Arc<Env>, in_tx: mpsc::Sender<Input>) {
 
 /// Разбор входящей датаграммы (UDP или кадра TCP): `false` — движок
 /// остановлен.
-fn dispatch(env: &Env, in_tx: &mpsc::Sender<Input>, src: SocketAddr, datagram: &[u8], via_tcp: bool) -> bool {
+fn dispatch(
+    env: &Env,
+    in_tx: &mpsc::Sender<Input>,
+    src: SocketAddr,
+    datagram: &[u8],
+    via_tcp: bool,
+) -> bool {
     let Ok((typ, body)) = proto::split_frame(datagram) else {
         return true;
     };
@@ -1910,7 +2131,9 @@ fn ensure_transport(env: &Env, st: &mut State) {
     if !want {
         return;
     }
-    let Some((env_arc, in_tx)) = st.rx_ctx.clone() else { return };
+    let Some((env_arc, in_tx)) = st.rx_ctx.clone() else {
+        return;
+    };
     let server = env.server();
     match TcpLink::connect(server, TCP_CONNECT_TIMEOUT) {
         Ok(link) => {
@@ -1918,7 +2141,9 @@ fn ensure_transport(env: &Env, st: &mut State) {
             *env.tcp.lock().unwrap() = Some(link.clone());
             env.meta.lock().unwrap().transport = Transport::Tcp;
             if mode == TransportMode::Auto {
-                env.emit(Event::Notice(format!("UDP до сервера {server} не отвечает — связь через TCP")));
+                env.emit(Event::Notice(format!(
+                    "UDP до сервера {server} не отвечает — связь через TCP"
+                )));
             }
             let _ = thread::Builder::new()
                 .name("tcp-rx".into())
@@ -2174,7 +2399,10 @@ fn establish(env: &Env, st: &mut State, eph: proto::EphemeralKey, acc: Accepted)
         env.update_cfg(|c| {
             c.repin_server(addr, &new_ed);
         });
-        env.emit(Event::ServerKeyRotated { addr, new_code: proto::friend_code_of(&new_ed) });
+        env.emit(Event::ServerKeyRotated {
+            addr,
+            new_code: proto::friend_code_of(&new_ed),
+        });
     }
     let was = st.connected();
     st.sess = Some(CtrlSession::new(eph, acc));
@@ -2270,7 +2498,11 @@ fn tick(env: &Env, st: &mut State, now: Instant) {
             let due: Vec<u32> = st
                 .want_group
                 .iter()
-                .filter(|g| st.last_get.get(g).is_none_or(|t| now.duration_since(*t) >= GET_GROUP_EVERY))
+                .filter(|g| {
+                    st.last_get
+                        .get(g)
+                        .is_none_or(|t| now.duration_since(*t) >= GET_GROUP_EVERY)
+                })
                 .copied()
                 .collect();
             for gid in due {
@@ -2352,7 +2584,12 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
             // Выход — сразу локально; LEAVE повторяется, пока сервер не
             // подтвердит (иначе потерянный LEAVE или запоздавший
             // GROUP_STATE возвращали группу обратно).
-            let name = env.groups.lock().unwrap().remove(&gid).map(|g| g.name.clone());
+            let name = env
+                .groups
+                .lock()
+                .unwrap()
+                .remove(&gid)
+                .map(|g| g.name.clone());
             env.autojoin_remove(gid);
             st.want_group.remove(&gid);
             st.leaving.insert(gid, Instant::now());
@@ -2362,7 +2599,11 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
             }
             return;
         }
-        Cmd::SwitchServer { addr, pubkey, label } => {
+        Cmd::SwitchServer {
+            addr,
+            pubkey,
+            label,
+        } => {
             switch_server(env, st, addr, pubkey, label);
             return;
         }
@@ -2386,7 +2627,9 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
         _ => {}
     }
     if !st.connected() {
-        env.emit(Event::Error("нет связи с сервером — команда не отправлена".into()));
+        env.emit(Event::Error(
+            "нет связи с сервером — команда не отправлена".into(),
+        ));
         return;
     }
     match cmd {
@@ -2421,9 +2664,11 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
         Cmd::Ban(gid, pk) => st.send_ctrl(env, ctrl::BAN, &payloads::enc_gid_target(gid, &pk)),
         Cmd::Unban(gid, pk) => st.send_ctrl(env, ctrl::UNBAN, &payloads::enc_gid_target(gid, &pk)),
         Cmd::GroupAdmin(gid) => st.send_ctrl(env, ctrl::GROUP_ADMIN, &payloads::enc_gid(gid)),
-        Cmd::Transfer(gid, pk) => {
-            st.send_ctrl(env, ctrl::TRANSFER_OWNER, &payloads::enc_gid_target(gid, &pk))
-        }
+        Cmd::Transfer(gid, pk) => st.send_ctrl(
+            env,
+            ctrl::TRANSFER_OWNER,
+            &payloads::enc_gid_target(gid, &pk),
+        ),
         Cmd::FriendGroups(pk) => {
             st.send_ctrl(env, ctrl::FRIEND_GROUPS, &payloads::enc_pubkey(&pk));
         }
@@ -2458,19 +2703,24 @@ pub fn check_cfg_cmd(cfg: &Config, current: SocketAddr, cmd: &Cmd) -> Option<Str
             let hex = proto::hex_of(pubkey);
             (!cfg.friends.iter().any(|f| f.pubkey == hex)).then(|| "такого друга нет".into())
         }
-        Cmd::AddServer { addr, .. } => {
-            addr.parse::<SocketAddr>().is_err().then(|| format!("неверный адрес сервера «{addr}» (нужен ip:port)"))
-        }
+        Cmd::AddServer { addr, .. } => addr
+            .parse::<SocketAddr>()
+            .is_err()
+            .then(|| format!("неверный адрес сервера «{addr}» (нужен ip:port)")),
         Cmd::DelServer { idx } => match cfg.servers.get(*idx) {
             None => Some(format!("нет сервера №{idx}")),
-            Some(s) if same(&s.addr) => Some("текущий сервер не удаляется — сначала переключитесь".into()),
+            Some(s) if same(&s.addr) => {
+                Some("текущий сервер не удаляется — сначала переключитесь".into())
+            }
             Some(_) => None,
         },
         Cmd::SetPrimaryServer { idx } => match cfg.servers.get(*idx) {
             None => Some(format!("нет сервера №{idx}")),
             Some(s) => {
                 let bad_addr = s.addr.parse::<SocketAddr>().is_err();
-                let bad_key = proto::hex_to_bytes(&s.pubkey).map(|v| v.len() != 32).unwrap_or(true);
+                let bad_key = proto::hex_to_bytes(&s.pubkey)
+                    .map(|v| v.len() != 32)
+                    .unwrap_or(true);
                 (bad_addr || bad_key).then(|| format!("сервер №{idx}: неверный адрес или ключ"))
             }
         },
@@ -2492,7 +2742,10 @@ fn cfg_cmd(env: &Env, st: &mut State, cmd: Cmd) {
             let a = alias.clone();
             env.update_cfg(|c| match c.friends.iter_mut().find(|f| f.pubkey == hex) {
                 Some(f) => f.alias = a,
-                None => c.friends.push(crate::store::StoredFriend { pubkey: hex, alias: a }),
+                None => c.friends.push(crate::store::StoredFriend {
+                    pubkey: hex,
+                    alias: a,
+                }),
             });
             env.emit(Event::Notice(format!("друг добавлен: {alias}")));
         }
@@ -2511,17 +2764,29 @@ fn cfg_cmd(env: &Env, st: &mut State, cmd: Cmd) {
             });
             env.emit(Event::Notice(format!("alias: {alias}")));
         }
-        Cmd::AddServer { addr, pubkey, label } => {
+        Cmd::AddServer {
+            addr,
+            pubkey,
+            label,
+        } => {
             let hex = proto::hex_of(&pubkey);
             let sa: SocketAddr = addr.parse().expect("проверено в check_cfg_cmd");
             let l = label.clone();
             env.update_cfg(|c| {
-                match c.servers.iter_mut().find(|s| s.addr.parse::<SocketAddr>().ok() == Some(sa)) {
+                match c
+                    .servers
+                    .iter_mut()
+                    .find(|s| s.addr.parse::<SocketAddr>().ok() == Some(sa))
+                {
                     Some(s) => {
                         s.pubkey = hex;
                         s.label = l;
                     }
-                    None => c.servers.push(crate::store::StoredServer { addr: sa.to_string(), pubkey: hex, label: l }),
+                    None => c.servers.push(crate::store::StoredServer {
+                        addr: sa.to_string(),
+                        pubkey: hex,
+                        label: l,
+                    }),
                 }
             });
             if sa == current {
@@ -2548,7 +2813,9 @@ fn cfg_cmd(env: &Env, st: &mut State, cmd: Cmd) {
             env.emit(Event::Notice(format!("сервер по умолчанию: {addr}")));
             if addr != current {
                 let mut pk = [0u8; 32];
-                pk.copy_from_slice(&proto::hex_to_bytes(&s.pubkey).expect("проверено в check_cfg_cmd"));
+                pk.copy_from_slice(
+                    &proto::hex_to_bytes(&s.pubkey).expect("проверено в check_cfg_cmd"),
+                );
                 switch_server(env, st, addr, pk, s.label);
             }
         }
@@ -2663,13 +2930,17 @@ fn on_ctrl(env: &Env, st: &mut State, typ: u8, payload: &[u8]) {
                 // потерялось): ответ принимается без сверки ревизии.
                 // Список не новее кика — запоздавший: группу не возвращает.
                 st.tombs.retain(|gid, (rev, _)| {
-                    !items.iter().any(|s| s.gid == *gid && s.mine && s.rev > *rev)
+                    !items
+                        .iter()
+                        .any(|s| s.gid == *gid && s.mine && s.rev > *rev)
                 });
                 let stale: Vec<u32> = {
                     let mut g = env.groups.lock().unwrap();
                     items
                         .iter()
-                        .filter(|s| s.mine && !st.leaving.contains_key(&s.gid) && st.tomb(s.gid).is_none())
+                        .filter(|s| {
+                            s.mine && !st.leaving.contains_key(&s.gid) && st.tomb(s.gid).is_none()
+                        })
                         .filter(|s| match g.get_mut(&s.gid) {
                             None => true,
                             Some(gs) if gs.rev > s.rev => {
@@ -2722,7 +2993,11 @@ fn on_ctrl(env: &Env, st: &mut State, typ: u8, payload: &[u8]) {
                         on_invite(env, st, inv);
                     }
                 }
-                env.emit(Event::InvitesSynced { gids, from, complete });
+                env.emit(Event::InvitesSynced {
+                    gids,
+                    from,
+                    complete,
+                });
             }
         }
         ctrl::INVITE_DECLINED => {
@@ -2737,7 +3012,12 @@ fn on_ctrl(env: &Env, st: &mut State, typ: u8, payload: &[u8]) {
         }
         ctrl::KICKED => {
             if let Ok(k) = payloads::dec_kicked(payload) {
-                let local = env.groups.lock().unwrap().remove(&k.gid).map(|g| (g.name.clone(), g.rev));
+                let local = env
+                    .groups
+                    .lock()
+                    .unwrap()
+                    .remove(&k.gid)
+                    .map(|g| (g.name.clone(), g.rev));
                 // Граница запоздания — ревизия сервера после кика из KICKED:
                 // своя могла отставать (пропущенная дельта — как раз повод
                 // для GET_GROUP, ответ на который придёт с ревизией новее
@@ -2748,8 +3028,16 @@ fn on_ctrl(env: &Env, st: &mut State, typ: u8, payload: &[u8]) {
                 let local = local.map(|(name, _)| name);
                 env.autojoin_remove(k.gid);
                 st.want_group.remove(&k.gid);
-                let name = if k.group_name.is_empty() { local.unwrap_or_default() } else { k.group_name };
-                env.emit(Event::Kicked { gid: k.gid, name, banned: k.banned });
+                let name = if k.group_name.is_empty() {
+                    local.unwrap_or_default()
+                } else {
+                    k.group_name
+                };
+                env.emit(Event::Kicked {
+                    gid: k.gid,
+                    name,
+                    banned: k.banned,
+                });
             }
         }
         ctrl::ADMIN_INFO => {
@@ -2781,7 +3069,10 @@ fn on_ctrl(env: &Env, st: &mut State, typ: u8, payload: &[u8]) {
         // О ком ответ — в самом ответе: запросы друг другу не мешают.
         ctrl::FRIEND_GROUPS_RESP => {
             if let Ok(f) = payloads::dec_friend_groups(payload) {
-                env.emit(Event::FriendGroups { pubkey: f.target, items: f.groups });
+                env.emit(Event::FriendGroups {
+                    pubkey: f.target,
+                    items: f.groups,
+                });
             }
         }
         _ => {}
@@ -2838,7 +3129,13 @@ fn reconcile(env: &Env, mine: &HashSet<u32>) {
 fn apply_group_state(env: &Env, es: &mut State, st: &payloads::GroupState) {
     let my_pub = env.identity.ed_pub();
     if st.deleted {
-        let removed = { env.groups.lock().unwrap().remove(&st.gid).map(|g| g.name.clone()) };
+        let removed = {
+            env.groups
+                .lock()
+                .unwrap()
+                .remove(&st.gid)
+                .map(|g| g.name.clone())
+        };
         match removed {
             Some(name) => {
                 env.autojoin_remove(st.gid);
@@ -2856,7 +3153,9 @@ fn apply_group_state(env: &Env, es: &mut State, st: &payloads::GroupState) {
     let mut events: Vec<Event> = Vec::new();
     let is_new = {
         let mut g = env.groups.lock().unwrap();
-        if g.get(&st.gid).is_some_and(|cur| cur.state_sess == es.sess_gen && st.rev < cur.rev) {
+        if g.get(&st.gid)
+            .is_some_and(|cur| cur.state_sess == es.sess_gen && st.rev < cur.rev)
+        {
             return;
         }
         let is_new = !g.contains_key(&st.gid);
@@ -2905,12 +3204,18 @@ fn apply_group_state(env: &Env, es: &mut State, st: &payloads::GroupState) {
         )));
     }
     if let Err(e) = env.tun.ensure_address6(st.my_ip) {
-        env.emit(Event::Notice(format!("IPv6 группы {} не назначен: {e}", st.name)));
+        env.emit(Event::Notice(format!(
+            "IPv6 группы {} не назначен: {e}",
+            st.name
+        )));
     }
     if env.cfg.lock().unwrap().dns
         && let Err(e) = env.tun.ensure_dns_route()
     {
-        env.emit(Event::Notice(format!("маршрут на DNS {}: {e}", crate::dns::DNS_ADDR)));
+        env.emit(Event::Notice(format!(
+            "маршрут на DNS {}: {e}",
+            crate::dns::DNS_ADDR
+        )));
     }
     for ev in events {
         env.emit(ev);
@@ -2960,7 +3265,11 @@ fn apply_group_update(env: &Env, st: &mut State, payload: &[u8]) {
                     gs.remove_member(pk);
                 }
             }
-            payloads::GroupDelta::Meta { name, owner, private } => {
+            payloads::GroupDelta::Meta {
+                name,
+                owner,
+                private,
+            } => {
                 gs.name = name.clone();
                 gs.owner = *owner;
                 gs.private = *private;
@@ -2979,7 +3288,9 @@ fn apply_group_update(env: &Env, st: &mut State, payload: &[u8]) {
 /// известной: нужен GET_GROUP (сигнал не чаще раза в секунду на группу).
 fn handle_group_frame(env: &Env, src: SocketAddr, datagram: &[u8]) -> Option<u32> {
     env.stats.rx_pkts.fetch_add(1, Ordering::Relaxed);
-    env.stats.rx_bytes.fetch_add(datagram.len() as u64, Ordering::Relaxed);
+    env.stats
+        .rx_bytes
+        .fetch_add(datagram.len() as u64, Ordering::Relaxed);
     let (_, h) = proto::parse_group_header(datagram).ok()?;
     let now = Instant::now();
     let is_relay = src == env.server();
@@ -3053,7 +3364,11 @@ fn handle_group_frame(env: &Env, src: SocketAddr, datagram: &[u8]) -> Option<u32
         }
     };
     if let Some(name) = became_direct {
-        env.emit(Event::Direct { gid: h.gid, ip: h.src, name });
+        env.emit(Event::Direct {
+            gid: h.gid,
+            ip: h.src,
+            name,
+        });
     }
     match (typ, reply) {
         (proto::grp::DATA, _) => {
@@ -3167,7 +3482,9 @@ fn rtt_round(env: &Env, connected: bool, now: Instant) {
         for (gid, gs) in g.iter_mut() {
             let ips: Vec<u32> = gs.members.keys().copied().collect();
             for ip in ips {
-                let Some(peer) = gs.members.get_mut(&ip) else { continue };
+                let Some(peer) = gs.members.get_mut(&ip) else {
+                    continue;
+                };
                 if !peer.online {
                     continue;
                 }
@@ -3179,7 +3496,11 @@ fn rtt_round(env: &Env, connected: bool, now: Instant) {
                     peer.direct_addr = None;
                     peer.last_direct = None;
                     peer.rtt_ms = None;
-                    events.push(Event::DirectLost { gid: *gid, ip, name: peer.name.clone() });
+                    events.push(Event::DirectLost {
+                        gid: *gid,
+                        ip,
+                        name: peer.name.clone(),
+                    });
                 }
                 let target = match peer.direct_addr {
                     Some(a) => a,
@@ -3187,7 +3508,10 @@ fn rtt_round(env: &Env, connected: bool, now: Instant) {
                     None => continue,
                 };
                 let (k, h, c) = gs.next_frame(*gid, ip);
-                frames.push((proto::seal_group(&k, proto::grp::PING, &h, c, &payload), target));
+                frames.push((
+                    proto::seal_group(&k, proto::grp::PING, &h, c, &payload),
+                    target,
+                ));
             }
         }
     }
@@ -3256,7 +3580,11 @@ where
         .spawn(move || {
             let mut buf = vec![0u8; 65535];
             while !env.quitting() {
-                let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+                let mut pfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
                 // SAFETY: pfd — валидный указатель на один pollfd.
                 let rc = unsafe { libc::poll(&mut pfd, 1, 250) };
                 if rc < 0 {
@@ -3319,7 +3647,15 @@ pub fn run(
     save: Arc<dyn Fn(&Config) + Send + Sync>,
 ) -> Result<()> {
     let shared = Arc::new(Mutex::new((*cfg).clone()));
-    let eng = start(shared, server, server_pub, identity, adapter_name, dll, save)?;
+    let eng = start(
+        shared,
+        server,
+        server_pub,
+        identity,
+        adapter_name,
+        dll,
+        save,
+    )?;
     while let Ok(ev) = eng.events.recv() {
         match ev {
             Event::Connected(s) => eprintln!("[engine] connected to {s}"),
@@ -3335,7 +3671,11 @@ pub fn run(
             }
             Event::Kicked { gid, name, banned } => eprintln!(
                 "[engine] вас {} из группы \"{name}\" (gid {gid})",
-                if banned { "забанили и исключили" } else { "исключили" }
+                if banned {
+                    "забанили и исключили"
+                } else {
+                    "исключили"
+                }
             ),
             Event::PeerOnline { ip, name, .. } => {
                 eprintln!("[engine] peer {} ({}) онлайн", proto::ip_str(ip), name)
@@ -3356,12 +3696,23 @@ pub fn run(
             // Ответить на месте нельзя: CLI join/decline и TUI — свой HELLO3
             // той же identity, он вытесняет этот сеанс (а реконнект run —
             // их), поэтому — только после остановки run.
-            Event::Invite { gid, group_name, from_name, expires_in, .. } => eprintln!(
+            Event::Invite {
+                gid,
+                group_name,
+                from_name,
+                expires_in,
+                ..
+            } => eprintln!(
                 "[engine] приглашение: {from_name} приглашает в группу {group_name} (gid {gid}, \
                  истекает через {}); ответить — остановив run: командой join {gid} / decline {gid} или в TUI",
                 fmt_secs(expires_in)
             ),
-            Event::InviteDeclined { gid, group_name, by_name, .. } => eprintln!(
+            Event::InviteDeclined {
+                gid,
+                group_name,
+                by_name,
+                ..
+            } => eprintln!(
                 "[engine] {by_name} отклонил приглашение в группу {group_name} (gid {gid})"
             ),
             Event::InviteRevoked { gid } => {
@@ -3413,15 +3764,36 @@ mod tests {
 
     impl Srv {
         fn new(id: proto::Identity) -> Self {
-            Self { id, eph: proto::EphemeralKey::generate() }
+            Self {
+                id,
+                eph: proto::EphemeralKey::generate(),
+            }
         }
 
-        fn welcome(&self, client: &proto::Identity, client_eph: &[u8; 32], links: &[proto::RotationLink]) -> Vec<u8> {
-            proto::Welcome::encode(&self.id, &self.eph.public(), links, &client.ed_pub(), client_eph)
+        fn welcome(
+            &self,
+            client: &proto::Identity,
+            client_eph: &[u8; 32],
+            links: &[proto::RotationLink],
+        ) -> Vec<u8> {
+            proto::Welcome::encode(
+                &self.id,
+                &self.eph.public(),
+                links,
+                &client.ed_pub(),
+                client_eph,
+            )
         }
 
         fn keys(&self, client: &proto::Identity, client_eph: &[u8; 32]) -> proto::DirKeys {
-            proto::session_keys(proto::Role::Server, &self.id, &self.eph, &client.x_pub(), client_eph).unwrap()
+            proto::session_keys(
+                proto::Role::Server,
+                &self.id,
+                &self.eph,
+                &client.x_pub(),
+                client_eph,
+            )
+            .unwrap()
         }
     }
 
@@ -3441,12 +3813,18 @@ mod tests {
         // закреплённого ключа — ошибка.
         let other = proto::EphemeralKey::generate();
         let foreign = srv.welcome(&client, &other.public(), &[]);
-        assert!(accept_welcome(&client, &hs.eph, &srv.id.ed_pub(), &foreign).unwrap().is_none());
+        assert!(
+            accept_welcome(&client, &hs.eph, &srv.id.ed_pub(), &foreign)
+                .unwrap()
+                .is_none()
+        );
         let body = srv.welcome(&client, &eph, &[]);
         let wrong_pin = proto::Identity::generate().ed_pub();
         assert!(accept_welcome(&client, &hs.eph, &wrong_pin, &body).is_err());
 
-        let acc = accept_welcome(&client, &hs.eph, &srv.id.ed_pub(), &body).unwrap().unwrap();
+        let acc = accept_welcome(&client, &hs.eph, &srv.id.ed_pub(), &body)
+            .unwrap()
+            .unwrap();
         assert_eq!(acc.pin, proto::PinResolution::Same);
         let sk = srv.keys(&client, &eph);
         let mut sess = CtrlSession::new(hs.eph, acc);
@@ -3458,10 +3836,19 @@ mod tests {
 
         // Сервер → клиент: s2c; повтор отсекается окном.
         let pong = proto::seal_ctrl(&sk.tx, 0, ctrl::CTRL_PONG, &[]);
-        assert_eq!(open_frame(&mut sess, &pong), Some(Some((ctrl::CTRL_PONG, vec![]))));
+        assert_eq!(
+            open_frame(&mut sess, &pong),
+            Some(Some((ctrl::CTRL_PONG, vec![])))
+        );
         assert_eq!(open_frame(&mut sess, &pong), None, "повтор");
         // Чужой ключ — не подлинный.
-        assert_eq!(open_frame(&mut sess, &proto::seal_ctrl(&[9; 32], 5, ctrl::CTRL_PONG, &[])), None);
+        assert_eq!(
+            open_frame(
+                &mut sess,
+                &proto::seal_ctrl(&[9; 32], 5, ctrl::CTRL_PONG, &[])
+            ),
+            None
+        );
 
         // FRAG: куски в обратном порядке собираются в одно сообщение.
         let big: Vec<u8> = (0..5000u32).map(|i| i as u8).collect();
@@ -3492,12 +3879,23 @@ mod tests {
         let s2 = Srv::new(id.clone());
         let hs = Handshake::new();
         let eph = hs.eph.public();
-        let acc1 = accept_welcome(&client, &hs.eph, &id.ed_pub(), &s1.welcome(&client, &eph, &[])).unwrap().unwrap();
+        let acc1 = accept_welcome(
+            &client,
+            &hs.eph,
+            &id.ed_pub(),
+            &s1.welcome(&client, &eph, &[]),
+        )
+        .unwrap()
+        .unwrap();
         let mut sess = CtrlSession::new(hs.eph, acc1);
         let w2 = s2.welcome(&client, &eph, &[]);
-        let acc2 = accept_welcome(&client, &sess.eph, &id.ed_pub(), &w2).unwrap().unwrap();
+        let acc2 = accept_welcome(&client, &sess.eph, &id.ed_pub(), &w2)
+            .unwrap()
+            .unwrap();
         assert!(sess.add(acc2), "новая серверная сессия — новые ключи");
-        let again = accept_welcome(&client, &sess.eph, &id.ed_pub(), &w2).unwrap().unwrap();
+        let again = accept_welcome(&client, &sess.eph, &id.ed_pub(), &w2)
+            .unwrap()
+            .unwrap();
         assert!(!sess.add(again), "повтор того же WELCOME ничего не меняет");
 
         // Отправка — новейшими ключами…
@@ -3523,14 +3921,28 @@ mod tests {
         let (s1, s2) = (Srv::new(id.clone()), Srv::new(id.clone()));
         let hs = Handshake::new();
         let eph = hs.eph.public();
-        let acc1 = accept_welcome(&client, &hs.eph, &id.ed_pub(), &s1.welcome(&client, &eph, &[])).unwrap().unwrap();
+        let acc1 = accept_welcome(
+            &client,
+            &hs.eph,
+            &id.ed_pub(),
+            &s1.welcome(&client, &eph, &[]),
+        )
+        .unwrap()
+        .unwrap();
         let mut sess = CtrlSession::new(hs.eph, acc1);
         let (k1, k2) = (s1.keys(&client, &eph), s2.keys(&client, &eph));
         // Первая сессия ответила…
         let m = proto::seal_ctrl(&k1.tx, 0, ctrl::CTRL_PONG, &[]);
         assert!(matches!(open_frame(&mut sess, &m), Some(Some(_))));
         // …затем WELCOME второй: набор добавлен, но отправка ещё первым.
-        let acc2 = accept_welcome(&client, &sess.eph, &id.ed_pub(), &s2.welcome(&client, &eph, &[])).unwrap().unwrap();
+        let acc2 = accept_welcome(
+            &client,
+            &sess.eph,
+            &id.ed_pub(),
+            &s2.welcome(&client, &eph, &[]),
+        )
+        .unwrap()
+        .unwrap();
         assert!(sess.add(acc2));
         let f = sess.seal(ctrl::CTRL_PING, &[]);
         let (t, b) = proto::split_frame(&f).unwrap();
@@ -3556,8 +3968,15 @@ mod tests {
         let srv = Srv::new(new.clone());
         let hs = Handshake::new();
         let body = srv.welcome(&client, &hs.eph.public(), &[link]);
-        let acc = accept_welcome(&client, &hs.eph, &old.ed_pub(), &body).unwrap().unwrap();
-        assert_eq!(acc.pin, proto::PinResolution::Rotated { new_ed: new.ed_pub() });
+        let acc = accept_welcome(&client, &hs.eph, &old.ed_pub(), &body)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            acc.pin,
+            proto::PinResolution::Rotated {
+                new_ed: new.ed_pub()
+            }
+        );
         // Цепочка не от закреплённого — ошибка.
         let stranger = proto::Identity::generate().ed_pub();
         assert!(accept_welcome(&client, &hs.eph, &stranger, &body).is_err());
@@ -3569,16 +3988,27 @@ mod tests {
         let mut hs = Handshake::new();
         let ch = handshake::enc_challenge(&[7; 16]);
         let t0 = Instant::now();
-        let f = hs.on_challenge(&client, "a", 0, &ch, t0).expect("HELLO3 с cookie");
+        let f = hs
+            .on_challenge(&client, "a", 0, &ch, t0)
+            .expect("HELLO3 с cookie");
         let (typ, body) = proto::split_frame(&f).unwrap();
         assert_eq!(typ, ctrl::HELLO3);
         let h = proto::Hello3::decode(body).unwrap();
         h.verify().unwrap();
         assert_eq!((h.cookie, h.eph_pub), (Some([7; 16]), hs.eph.public()));
         // Поток CHALLENGE не превращается в поток HELLO3.
-        assert!(hs.on_challenge(&client, "a", 0, &ch, t0 + Duration::from_millis(10)).is_none());
-        assert!(hs.on_challenge(&client, "a", 0, &ch, t0 + COOKIE_GAP).is_some());
-        assert!(hs.on_challenge(&client, "a", 0, b"junk", t0 + COOKIE_GAP * 3).is_none());
+        assert!(
+            hs.on_challenge(&client, "a", 0, &ch, t0 + Duration::from_millis(10))
+                .is_none()
+        );
+        assert!(
+            hs.on_challenge(&client, "a", 0, &ch, t0 + COOKIE_GAP)
+                .is_some()
+        );
+        assert!(
+            hs.on_challenge(&client, "a", 0, b"junk", t0 + COOKIE_GAP * 3)
+                .is_none()
+        );
         // Без CHALLENGE, но с RESET — похоже на v2-сервер.
         let mut v2 = Handshake::new();
         v2.saw_reset = true;
@@ -3616,7 +4046,11 @@ mod tests {
         let (k, h, c) = g.next_frame(1, 2);
         assert_eq!((k, h.epoch, c), ([2; 32], 6, 0));
         assert_eq!(g.rx_key(5, now), Some([1; 32]));
-        assert_eq!(g.rx_key(5, now + proto::PREV_KEY_GRACE), None, "grace истёк");
+        assert_eq!(
+            g.rx_key(5, now + proto::PREV_KEY_GRACE),
+            None,
+            "grace истёк"
+        );
         assert_eq!(g.rx_key(4, now), None);
         // Окно отправителя переехало вместе с прошлым ключом.
         assert!(g.prev.as_ref().is_some_and(|p| p.st.rx.contains_key(&9)));
@@ -3682,7 +4116,12 @@ mod tests {
                 rtt_ms: None,
             },
         );
-        let h = |src, epoch| proto::GroupHeader { gid: 1, src, dst: 0x6442_0102, epoch };
+        let h = |src, epoch| proto::GroupHeader {
+            gid: 1,
+            src,
+            dst: 0x6442_0102,
+            epoch,
+        };
         // Посторонний адрес, неизвестный src, сам клиент как src — не повод.
         for i in 0..100 {
             let t = t0 + Duration::from_secs(i);
@@ -3694,11 +4133,21 @@ mod tests {
         assert!(!g.epoch_hint(&h(0x6442_0103, 5), peer_addr, false, t0));
         // С кандидата участника — да; не чаще паузы.
         assert!(g.epoch_hint(&h(0x6442_0103, 9), peer_addr, false, t0));
-        assert!(!g.epoch_hint(&h(0x6442_0103, 9), peer_addr, false, t0 + Duration::from_millis(500)));
+        assert!(!g.epoch_hint(
+            &h(0x6442_0103, 9),
+            peer_addr,
+            false,
+            t0 + Duration::from_millis(500)
+        ));
         // Эпоха так и не пришла: паузы растут (1, 2, 4, … с), не каждую секунду.
         let mut fired = 1;
         for ms in (0..600_000).step_by(100) {
-            if g.epoch_hint(&h(0x6442_0103, 9), "10.9.9.9:1".parse().unwrap(), true, t0 + Duration::from_millis(ms)) {
+            if g.epoch_hint(
+                &h(0x6442_0103, 9),
+                "10.9.9.9:1".parse().unwrap(),
+                true,
+                t0 + Duration::from_millis(ms),
+            ) {
                 fired += 1;
             }
         }
@@ -3708,7 +4157,12 @@ mod tests {
         g.set_key(9, [9; 32], false, t1);
         assert!(g.epoch_hint(&h(0x6442_0103, 10), peer_addr, true, t1));
         g.set_key(10, [10; 32], false, t1);
-        assert!(g.epoch_hint(&h(0x6442_0103, 11), peer_addr, true, t1 + Duration::from_secs(1)));
+        assert!(g.epoch_hint(
+            &h(0x6442_0103, 11),
+            peer_addr,
+            true,
+            t1 + Duration::from_secs(1)
+        ));
     }
 
     #[test]
@@ -3722,7 +4176,17 @@ mod tests {
         for i in 0..60u32 {
             let t = t0 + Duration::from_secs(i as u64);
             let e = g.epoch + 1;
-            if g.epoch_hint(&proto::GroupHeader { gid: 1, src: 7, dst: 0x6442_0102, epoch: e }, relay, true, t) {
+            if g.epoch_hint(
+                &proto::GroupHeader {
+                    gid: 1,
+                    src: 7,
+                    dst: 0x6442_0102,
+                    epoch: e,
+                },
+                relay,
+                true,
+                t,
+            ) {
                 fired += 1;
             }
             g.set_key(e, [(e % 250) as u8 + 2; 32], false, t);
@@ -3731,7 +4195,17 @@ mod tests {
         // Окно сдвинулось — снова можно.
         let t = t0 + HINT_WINDOW + Duration::from_secs(1);
         let e = g.epoch + 1;
-        assert!(g.epoch_hint(&proto::GroupHeader { gid: 1, src: 7, dst: 0x6442_0102, epoch: e }, relay, true, t));
+        assert!(g.epoch_hint(
+            &proto::GroupHeader {
+                gid: 1,
+                src: 7,
+                dst: 0x6442_0102,
+                epoch: e
+            },
+            relay,
+            true,
+            t
+        ));
     }
 
     #[test]
@@ -3765,19 +4239,31 @@ mod tests {
         // ключа не наследуются — счётчики пира под новым ключом с нуля.
         g.set_key(5, [2; 32], false, now);
         assert_eq!(g.rx_key(5, now), Some([2; 32]));
-        assert!(g.rx_window(&[2; 32], 9).unwrap().commit(0), "новый ключ — свежее окно");
-        assert!(g.rx_window(&[1; 32], 9).is_none(), "прежний ключ той же эпохи не принимается");
+        assert!(
+            g.rx_window(&[2; 32], 9).unwrap().commit(0),
+            "новый ключ — свежее окно"
+        );
+        assert!(
+            g.rx_window(&[1; 32], 9).is_none(),
+            "прежний ключ той же эпохи не принимается"
+        );
 
         // Возврат к ранее использованному ключу — его окна возвращаются:
         // записанный фрейм под ним повторно не проходит.
         g.set_key(6, [1; 32], true, now);
-        assert!(!g.rx_window(&[1; 32], 9).unwrap().commit(100), "повтор под старым ключом");
+        assert!(
+            !g.rx_window(&[1; 32], 9).unwrap().commit(100),
+            "повтор под старым ключом"
+        );
         assert!(g.rx_window(&[1; 32], 9).unwrap().commit(101));
 
         // И после пересоздания группы (окна в KeyLog).
         drop(g);
         let mut g2 = GroupSess::new(&state(1, 5, 2), now, log);
-        assert!(!g2.rx_window(&[2; 32], 9).unwrap().commit(0), "окно ключа пережило пересоздание");
+        assert!(
+            !g2.rx_window(&[2; 32], 9).unwrap().commit(0),
+            "окно ключа пережило пересоздание"
+        );
     }
 
     #[test]

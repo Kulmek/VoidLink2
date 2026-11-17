@@ -3,9 +3,9 @@
 
 use std::time::{Duration, Instant};
 
-use rand::{rngs::StdRng, Rng, RngExt, SeedableRng};
+use rand::{Rng, RngExt, SeedableRng, rngs::StdRng};
 
-use crate::handshake::{self, make_link, EphemeralKey, Hello3, RotationLink, Welcome};
+use crate::handshake::{self, EphemeralKey, Hello3, RotationLink, Welcome, make_link};
 use crate::payloads::{self as p, *};
 use crate::*;
 
@@ -29,7 +29,9 @@ fn mutate(rng: &mut StdRng, src: &[u8]) -> Vec<u8> {
             4 if !v.is_empty() => {
                 // Счётчики и длины — крайние значения.
                 let i = rng.random_range(0..v.len());
-                v[i] = *[0u8, 1, 4, 5, 0x7f, 0x80, 0xff].get(rng.random_range(0..7)).unwrap();
+                v[i] = *[0u8, 1, 4, 5, 0x7f, 0x80, 0xff]
+                    .get(rng.random_range(0..7))
+                    .unwrap();
             }
             _ => {
                 let n = rng.random_range(0..8);
@@ -89,9 +91,20 @@ fn декодеры_не_паникуют_на_мусоре_и_мутациях(
     let c_eph = EphemeralKey::generate();
     let s_eph = EphemeralKey::generate();
     let links = vec![make_link(&old, &server)];
-    let welcome = Welcome::encode(&server, &s_eph.public(), &links, &client.ed_pub(), &c_eph.public());
+    let welcome = Welcome::encode(
+        &server,
+        &s_eph.public(),
+        &links,
+        &client.ed_pub(),
+        &c_eph.public(),
+    );
     let key = [1u8; 32];
-    let gh = GroupHeader { gid: 1, src: 2, dst: 3, epoch: 4 };
+    let gh = GroupHeader {
+        gid: 1,
+        src: 2,
+        dst: 3,
+        epoch: 4,
+    };
 
     let gs = p::tests::group_state();
     let seeds: Vec<Vec<u8>> = vec![
@@ -119,24 +132,65 @@ fn декодеры_не_паникуют_на_мусоре_и_мутациях(
             epoch: 3,
             revoke_prev: false,
             key: [0; 32],
-            delta: GroupDelta::Meta { name: "n".into(), owner: [1; 32], private: true },
+            delta: GroupDelta::Meta {
+                name: "n".into(),
+                owner: [1; 32],
+                private: true,
+            },
         }),
-        enc_group_list(&[GroupSummary { gid: 1, name: "a".into(), private: false, mine: true, online: 1, total: 2, rev: 3, epoch: 4 }]),
+        enc_group_list(&[GroupSummary {
+            gid: 1,
+            name: "a".into(),
+            private: false,
+            mine: true,
+            online: 1,
+            total: 2,
+            rev: 3,
+            epoch: 4,
+        }]),
         enc_invite_list(&InviteList {
             from: 0,
-            items: vec![InviteInfo { gid: 1, group_name: "g".into(), from_pubkey: [1; 32], from_name: "f".into(), expires_in: 9 }],
+            items: vec![InviteInfo {
+                gid: 1,
+                group_name: "g".into(),
+                from_pubkey: [1; 32],
+                from_name: "f".into(),
+                expires_in: 9,
+            }],
             complete: true,
         }),
-        enc_invite_declined(&InviteDeclined { gid: 1, group_name: "g".into(), by_pubkey: [1; 32], by_name: "b".into() }),
-        enc_kicked(&Kicked { gid: 1, group_name: "g".into(), banned: false, rev: 3 }),
+        enc_invite_declined(&InviteDeclined {
+            gid: 1,
+            group_name: "g".into(),
+            by_pubkey: [1; 32],
+            by_name: "b".into(),
+        }),
+        enc_kicked(&Kicked {
+            gid: 1,
+            group_name: "g".into(),
+            banned: false,
+            rev: 3,
+        }),
         enc_admin_info(&AdminInfo {
             gid: 1,
-            bans: vec![BanEntry { pubkey: [1; 32], name: "b".into() }],
-            invites: vec![PendingInvite { pubkey: [2; 32], name: "i".into(), expires_in: 5 }],
+            bans: vec![BanEntry {
+                pubkey: [1; 32],
+                name: "b".into(),
+            }],
+            invites: vec![PendingInvite {
+                pubkey: [2; 32],
+                name: "i".into(),
+                expires_in: 5,
+            }],
         }),
         enc_friend_groups(&FriendGroups {
             target: [3; 32],
-            groups: vec![FriendGroup { gid: 1, name: "f".into(), private: true, shared: false }],
+            groups: vec![FriendGroup {
+                gid: 1,
+                name: "f".into(),
+                private: true,
+                shared: false,
+            }],
         }),
         Hello3::encode(&client, &c_eph.public(), "alpha", 1, Some(&[5; 16])),
         Hello3::encode(&client, &c_eph.public(), "alpha", 0, None),
@@ -144,7 +198,10 @@ fn декодеры_не_паникуют_на_мусоре_и_мутациях(
         handshake::enc_unsupported("старый"),
         welcome.clone(),
         links[0].to_bytes().to_vec(),
-        frag::split_frag(1, ctrl::GROUP_STATE, &[7; 2500]).unwrap().unwrap()[1].clone(),
+        frag::split_frag(1, ctrl::GROUP_STATE, &[7; 2500])
+            .unwrap()
+            .unwrap()[1]
+            .clone(),
         seal_ctrl(&key, 3, ctrl::STATUS, b"hi"),
         seal_group(&key, grp::DATA, &gh, 9, &[0x45; 40]),
     ];
@@ -171,7 +228,9 @@ fn сборщик_frag_не_паникует_и_ограничен() {
     let mut rng = StdRng::seed_from_u64(0xF7A6);
     let mut r = Reassembler::new();
     let t0 = Instant::now();
-    let good = frag::split_frag(3, ctrl::GROUP_LIST, &[1; 9000]).unwrap().unwrap();
+    let good = frag::split_frag(3, ctrl::GROUP_LIST, &[1; 9000])
+        .unwrap()
+        .unwrap();
     for i in 0..20_000u64 {
         let now = t0 + Duration::from_millis(i);
         let input = if rng.random_range(0..2) == 0 {

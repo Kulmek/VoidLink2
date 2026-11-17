@@ -233,8 +233,16 @@ pub fn base64(data: &[u8]) -> String {
         let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
         out.push(ABC[(n >> 18) as usize & 63] as char);
         out.push(ABC[(n >> 12) as usize & 63] as char);
-        out.push(if c.len() > 1 { ABC[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if c.len() > 2 { ABC[n as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 1 {
+            ABC[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if c.len() > 2 {
+            ABC[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -269,20 +277,33 @@ mod tests {
 
     #[test]
     fn osc52_tmux() {
-        let env = Env { tmux: true, screen: true, ..Env::default() };
-        assert_eq!(osc52_wrapped("hi", &env), "\x1bPtmux;\x1b\x1b]52;c;aGk=\x07\x1b\\");
+        let env = Env {
+            tmux: true,
+            screen: true,
+            ..Env::default()
+        };
+        assert_eq!(
+            osc52_wrapped("hi", &env),
+            "\x1bPtmux;\x1b\x1b]52;c;aGk=\x07\x1b\\"
+        );
     }
 
     #[test]
     fn osc52_screen_chunks() {
-        let env = Env { screen: true, ..Env::default() };
+        let env = Env {
+            screen: true,
+            ..Env::default()
+        };
         assert_eq!(osc52_wrapped("hi", &env), "\x1bP\x1b]52;c;aGk=\x07\x1b\\");
         let long = "x".repeat(1000);
         let seq = osc52(&long);
         let wrapped = wrap_screen(&seq);
         let parts: Vec<&str> = wrapped.split("\x1b\\").filter(|p| !p.is_empty()).collect();
         assert_eq!(parts.len(), seq.len().div_ceil(768));
-        let joined: String = parts.iter().map(|p| p.strip_prefix("\x1bP").unwrap()).collect();
+        let joined: String = parts
+            .iter()
+            .map(|p| p.strip_prefix("\x1bP").unwrap())
+            .collect();
         assert_eq!(joined, seq);
     }
 
@@ -292,7 +313,11 @@ mod tests {
         assert_eq!(plan(Os::Windows, &e), [Method::WinClip, Method::Osc52]);
         assert_eq!(plan(Os::Mac, &e), [Method::PbCopy, Method::Osc52]);
         assert_eq!(plan(Os::Other, &e), [Method::Osc52]);
-        let e = Env { wayland: true, x11: true, ..Env::default() };
+        let e = Env {
+            wayland: true,
+            x11: true,
+            ..Env::default()
+        };
         assert_eq!(
             plan(Os::Other, &e),
             [Method::WlCopy, Method::Xclip, Method::Xsel, Method::Osc52]
@@ -301,9 +326,19 @@ mod tests {
 
     #[test]
     fn plan_ssh_osc_first() {
-        let e = Env { ssh: true, x11: true, ..Env::default() };
-        assert_eq!(plan(Os::Other, &e), [Method::Osc52, Method::Xclip, Method::Xsel]);
-        let e = Env { ssh: true, ..Env::default() };
+        let e = Env {
+            ssh: true,
+            x11: true,
+            ..Env::default()
+        };
+        assert_eq!(
+            plan(Os::Other, &e),
+            [Method::Osc52, Method::Xclip, Method::Xsel]
+        );
+        let e = Env {
+            ssh: true,
+            ..Env::default()
+        };
         assert_eq!(plan(Os::Windows, &e), [Method::Osc52, Method::WinClip]);
         assert_eq!(plan(Os::Mac, &e)[0], Method::Osc52);
     }

@@ -52,7 +52,12 @@ impl FakeBackend {
     /// `Connected`.
     pub fn new() -> Self {
         let groups = (1..=3)
-            .map(|gid| Group { gid, name: format!("группа-{gid}"), private: false, joined: false })
+            .map(|gid| Group {
+                gid,
+                name: format!("группа-{gid}"),
+                private: false,
+                joined: false,
+            })
             .collect();
         let st = State {
             groups,
@@ -61,7 +66,10 @@ impl FakeBackend {
             name: "fake".into(),
             sent: Vec::new(),
         };
-        FakeBackend(Arc::new(Shared { st: Mutex::new(st), changed: AtomicBool::new(true) }))
+        FakeBackend(Arc::new(Shared {
+            st: Mutex::new(st),
+            changed: AtomicBool::new(true),
+        }))
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -85,7 +93,12 @@ impl FakeBackend {
 
     /// gid групп, в которых состоим.
     pub fn joined(&self) -> Vec<u32> {
-        self.lock().groups.iter().filter(|g| g.joined).map(|g| g.gid).collect()
+        self.lock()
+            .groups
+            .iter()
+            .filter(|g| g.joined)
+            .map(|g| g.gid)
+            .collect()
     }
 
     fn my_ip(gid: u32) -> u32 {
@@ -94,7 +107,11 @@ impl FakeBackend {
     }
 
     fn apply(st: &mut State, cmd: &Value) -> Result<Vec<Value>, String> {
-        let gid_of = |v: &Value| v.as_u64().and_then(|g| u32::try_from(g).ok()).ok_or("ожидался gid (u32)".to_string());
+        let gid_of = |v: &Value| {
+            v.as_u64()
+                .and_then(|g| u32::try_from(g).ok())
+                .ok_or("ожидался gid (u32)".to_string())
+        };
         let (name, arg) = match cmd {
             Value::String(s) => (s.as_str(), &Value::Null),
             Value::Object(m) if m.len() == 1 => {
@@ -107,16 +124,26 @@ impl FakeBackend {
             "RefreshList" => Ok(vec![json!({ "Notice": "список групп обновлён" })]),
             "Join" => {
                 let gid = gid_of(arg)?;
-                let g = st.groups.iter_mut().find(|g| g.gid == gid).ok_or(format!("нет группы {gid}"))?;
+                let g = st
+                    .groups
+                    .iter_mut()
+                    .find(|g| g.gid == gid)
+                    .ok_or(format!("нет группы {gid}"))?;
                 if g.joined {
                     return Ok(vec![json!({ "Error": format!("уже в группе {gid}") })]);
                 }
                 g.joined = true;
-                Ok(vec![json!({ "GroupJoined": { "gid": gid, "name": g.name, "my_ip": Self::my_ip(gid) } })])
+                Ok(vec![
+                    json!({ "GroupJoined": { "gid": gid, "name": g.name, "my_ip": Self::my_ip(gid) } }),
+                ])
             }
             "Leave" => {
                 let gid = gid_of(arg)?;
-                let g = st.groups.iter_mut().find(|g| g.gid == gid).ok_or(format!("нет группы {gid}"))?;
+                let g = st
+                    .groups
+                    .iter_mut()
+                    .find(|g| g.gid == gid)
+                    .ok_or(format!("нет группы {gid}"))?;
                 if !g.joined {
                     return Err(format!("не в группе {gid}"));
                 }
@@ -124,12 +151,22 @@ impl FakeBackend {
                 Ok(vec![json!({ "GroupLeft": { "gid": gid, "name": g.name } })])
             }
             "Create" => {
-                let name = arg.get("name").and_then(Value::as_str).ok_or("Create: нужно name")?;
+                let name = arg
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or("Create: нужно name")?;
                 let private = arg.get("private").and_then(Value::as_bool).unwrap_or(false);
                 let gid = st.next_gid;
                 st.next_gid += 1;
-                st.groups.push(Group { gid, name: name.to_string(), private, joined: true });
-                Ok(vec![json!({ "GroupJoined": { "gid": gid, "name": name, "my_ip": Self::my_ip(gid) } })])
+                st.groups.push(Group {
+                    gid,
+                    name: name.to_string(),
+                    private,
+                    joined: true,
+                });
+                Ok(vec![
+                    json!({ "GroupJoined": { "gid": gid, "name": name, "my_ip": Self::my_ip(gid) } }),
+                ])
             }
             "SetName" => {
                 let n = arg.as_str().ok_or("SetName: нужна строка")?;
@@ -218,7 +255,10 @@ mod tests {
         assert_eq!(ev[0]["GroupJoined"]["gid"], 2);
         assert!(b.send(json!({ "Join": 99 })).is_err());
         assert!(b.send(json!({ "Leave": 1 })).is_err());
-        assert!(b.send(json!({ "Create": { "name": "x", "private": true } })).is_ok());
+        assert!(
+            b.send(json!({ "Create": { "name": "x", "private": true } }))
+                .is_ok()
+        );
         assert_eq!(b.joined(), vec![2, 4]);
         assert!(b.send(json!("RefreshList")).is_ok());
         assert!(b.send(json!(42)).is_err());

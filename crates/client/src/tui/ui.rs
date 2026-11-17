@@ -9,6 +9,7 @@
 
 use std::cell::RefCell;
 
+use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -17,13 +18,12 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Clear, LineGauge, List, ListItem, ListState, Paragraph, Row,
     Scrollbar, ScrollbarOrientation, ScrollbarState, Sparkline, Table, TableState, Tabs, Wrap,
 };
-use ratatui::Frame;
 
 use tunnel_protocol as proto;
 
 use crate::tui::app::{
     App, ConfirmPopup, Focus, FriendCardPopup, InputPopup, InvitePopup, ListPickPopup, MsgKind,
-    PeerPickPopup, Popup, SettingsPopup, SETTING_ROWS, TOOLBAR,
+    PeerPickPopup, Popup, SETTING_ROWS, SettingsPopup, TOOLBAR,
 };
 use crate::tui::badges::{self, BadgeState, ConnState};
 use crate::tui::clock;
@@ -69,8 +69,8 @@ pub fn draw(f: &mut Frame, app: &App) {
     draw_body(f, app, &th, chunks[2]);
     let traffic_panel = chunks[3].width >= TRAFFIC_MIN_TOTAL;
     if traffic_panel {
-        let cols =
-            Layout::horizontal([Constraint::Min(30), Constraint::Length(TRAFFIC_W)]).split(chunks[3]);
+        let cols = Layout::horizontal([Constraint::Min(30), Constraint::Length(TRAFFIC_W)])
+            .split(chunks[3]);
         draw_log(f, app, &th, cols[0], false);
         draw_traffic(f, app, &th, cols[1]);
     } else {
@@ -108,7 +108,11 @@ fn panel_block(
     if let Some(badge) = badge {
         spans.push(Span::styled(
             format!(" {badge} "),
-            if focused { th.pill(th.c.accent) } else { th.chip() },
+            if focused {
+                th.pill(th.c.accent)
+            } else {
+                th.chip()
+            },
         ));
         spans.push(Span::raw(" "));
     }
@@ -176,7 +180,11 @@ fn scrollbar(
         } else {
             th.scroll_track()
         })
-        .thumb_style(if focused { th.accent } else { th.scroll_thumb() });
+        .thumb_style(if focused {
+            th.accent
+        } else {
+            th.scroll_thumb()
+        });
     f.render_stateful_widget(sb, track, &mut state);
 }
 
@@ -199,7 +207,10 @@ fn draw_header(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
         .border_style(th.focused_border)
         .style(th.header())
         .title(Line::from({
-            let mut t = vec![Span::styled(" ◆ ", th.accent), Span::styled("Tunnel ", th.title)];
+            let mut t = vec![
+                Span::styled(" ◆ ", th.accent),
+                Span::styled("Tunnel ", th.title),
+            ];
             // Где движок: embedded (в этом процессе) или демон (PLAN.md 7.4).
             if let Some(m) = app.mode {
                 t.push(Span::styled(format!("· {} ", m.label()), th.dim));
@@ -441,7 +452,10 @@ fn draw_friends(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
                 if fr.online { th.base } else { th.dim },
             ));
             if fr.shared_groups > 0 {
-                spans.push(Span::styled(format!("  {} общих", fr.shared_groups), th.dim));
+                spans.push(Span::styled(
+                    format!("  {} общих", fr.shared_groups),
+                    th.dim,
+                ));
             }
             ListItem::new(Line::from(spans))
         })
@@ -469,7 +483,11 @@ fn draw_peers(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
     let focused = app.focus == Focus::Peers;
     let title = match g {
         Some(g) => {
-            let kind = if g.private { "приватная" } else { "публичная" };
+            let kind = if g.private {
+                "приватная"
+            } else {
+                "публичная"
+            };
             let mine = g
                 .my_ip
                 .map(|ip| format!(" · мой IP {}", proto::ip_str(ip)))
@@ -608,7 +626,10 @@ fn draw_peers(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
         let ratio = (g.total as f64 / GROUP_CAP as f64).clamp(0.0, 1.0);
         let label = Line::from(vec![
             Span::styled("занято ", th.dim),
-            Span::styled(format!("{}/{GROUP_CAP}", g.total), th.base.add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{}/{GROUP_CAP}", g.total),
+                th.base.add_modifier(Modifier::BOLD),
+            ),
             Span::styled(format!(" · онлайн {}", g.online), th.dim),
         ]);
         let lg = LineGauge::default()
@@ -664,7 +685,11 @@ fn draw_log(f: &mut Frame, app: &App, th: &Theme, area: Rect, rates: bool) {
                 Span::styled(format!("{mark} "), style.add_modifier(Modifier::BOLD)),
                 Span::styled(
                     l.text.clone(),
-                    if l.kind == MsgKind::Info { th.base } else { style },
+                    if l.kind == MsgKind::Info {
+                        th.base
+                    } else {
+                        style
+                    },
                 ),
             ])
         })
@@ -711,7 +736,10 @@ fn draw_traffic(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
         Line::from(vec![
             Span::styled(format!("{arrow} "), style.add_modifier(Modifier::BOLD)),
             Span::styled(format!("{name} "), th.dim),
-            Span::styled(format!("{}/с", kb(rate)), style.add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{}/с", kb(rate)),
+                style.add_modifier(Modifier::BOLD),
+            ),
         ])
     };
     let rx_label = label("↓", "приём", rx_rate, th.chart_rx());
@@ -767,8 +795,12 @@ fn draw_status(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
         .iter()
         .map(|f| format!(" {} ", capitalize(f.label())))
         .collect();
-    let tabs_w: u16 =
-        titles.iter().map(|t| Span::raw(t.as_str()).width() as u16).sum::<u16>() + TABS.len() as u16 - 1;
+    let tabs_w: u16 = titles
+        .iter()
+        .map(|t| Span::raw(t.as_str()).width() as u16)
+        .sum::<u16>()
+        + TABS.len() as u16
+        - 1;
     let tabs_area = Rect {
         width: tabs_w.min(area.width),
         ..area
@@ -821,7 +853,10 @@ fn draw_status(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
     ];
     if app.filtering || !app.filter.is_empty() {
         spans.push(Span::raw("  "));
-        spans.push(Span::styled(format!(" /{} ", app.filter), th.pill(th.c.warn)));
+        spans.push(Span::styled(
+            format!(" /{} ", app.filter),
+            th.pill(th.c.warn),
+        ));
     }
     let rest = Rect {
         x: tabs_area.right(),
@@ -836,7 +871,11 @@ fn draw_status(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
     // транспорт, прямые/релейные пиры.
     let state = BadgeState {
         pending_invites: app.pending_invites(),
-        conn: if app.connected { ConnState::Online } else { ConnState::Reconnecting },
+        conn: if app.connected {
+            ConnState::Online
+        } else {
+            ConnState::Reconnecting
+        },
         invisible: app.invisible,
         transport: app.transport,
         direct,
@@ -855,7 +894,9 @@ fn draw_status(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
 
 /// Сколько осталось до истечения: «6 д», «5 ч», «12 мин».
 fn left_until(t: std::time::Instant) -> String {
-    let s = t.saturating_duration_since(std::time::Instant::now()).as_secs();
+    let s = t
+        .saturating_duration_since(std::time::Instant::now())
+        .as_secs();
     if s == 0 {
         "истекло".into()
     } else if s >= 86_400 {
@@ -885,7 +926,12 @@ fn draw_toasts(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
     let heights: Vec<u16> = app
         .toasts
         .iter()
-        .map(|t| wrapped_lines(&format!("{} {}", toast_mark(t.kind), t.text), (w - 2) as usize) as u16)
+        .map(|t| {
+            wrapped_lines(
+                &format!("{} {}", toast_mark(t.kind), t.text),
+                (w - 2) as usize,
+            ) as u16
+        })
         .collect();
     let mut skip = 0;
     let mut total: u16 = heights.iter().sum();
@@ -904,7 +950,12 @@ fn draw_toasts(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
     };
     app.hits.toasts.set(rect);
     f.render_widget(Clear, rect);
-    let border = match app.toasts.iter().map(|t| t.kind).max_by_key(|k| severity(*k)) {
+    let border = match app
+        .toasts
+        .iter()
+        .map(|t| t.kind)
+        .max_by_key(|k| severity(*k))
+    {
         Some(MsgKind::Error) => th.error,
         Some(MsgKind::Warn) => th.warn,
         Some(MsgKind::Ok) => th.ok,
@@ -927,7 +978,11 @@ fn draw_toasts(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
                 Span::styled(format!("{mark} "), style.add_modifier(Modifier::BOLD)),
                 Span::styled(
                     t.text.clone(),
-                    if t.kind == MsgKind::Info { th.base } else { style },
+                    if t.kind == MsgKind::Info {
+                        th.base
+                    } else {
+                        style
+                    },
                 ),
             ])
         })
@@ -1071,7 +1126,10 @@ fn draw_input(f: &mut Frame, app: &App, th: &Theme, inp: &InputPopup, area: Rect
         let line = Line::from(vec![
             Span::styled(format!(" {mark} "), style.add_modifier(Modifier::BOLD)),
             Span::styled(
-                format!("приватная группа: {}", if inp.private { "да" } else { "нет" }),
+                format!(
+                    "приватная группа: {}",
+                    if inp.private { "да" } else { "нет" }
+                ),
                 th.base,
             ),
             Span::styled("  (Tab или клик — переключить)", th.dim),
@@ -1250,7 +1308,11 @@ fn draw_friend_card(f: &mut Frame, app: &App, th: &Theme, c: &FriendCardPopup, a
                 Span::styled(
                     format!(
                         " {}",
-                        if g.private { "[приватная]" } else { "[публичная]" }
+                        if g.private {
+                            "[приватная]"
+                        } else {
+                            "[публичная]"
+                        }
                     ),
                     th.dim,
                 ),
@@ -1365,11 +1427,12 @@ fn draw_settings(f: &mut Frame, app: &App, th: &Theme, s: &SettingsPopup, area: 
         })
         .collect();
 
-    let block = popup_block(th, popup_title(th, "◎", "Настройки"), th.focused_border)
-        .title_bottom(Line::from(Span::styled(
+    let block = popup_block(th, popup_title(th, "◎", "Настройки"), th.focused_border).title_bottom(
+        Line::from(Span::styled(
             " Enter или клик — изменить · Esc — закрыть ",
             th.dim,
-        )));
+        )),
+    );
     draw_popup_list(f, th, block, items, s.sel, area)
 }
 
@@ -1422,7 +1485,11 @@ fn draw_profile(f: &mut Frame, app: &App, th: &Theme, area: Rect) {
         &app.hits.popup_buttons,
         inner_row(area, buttons_at),
         &[
-            ("Копировать friend code (c)", Btn::Primary, key(KeyCode::Char('c'))),
+            (
+                "Копировать friend code (c)",
+                Btn::Primary,
+                key(KeyCode::Char('c')),
+            ),
             ("Закрыть (Esc)", Btn::Normal, key(KeyCode::Esc)),
         ],
         2,
@@ -1441,18 +1508,26 @@ fn draw_invite(f: &mut Frame, app: &App, th: &Theme, inv: &InvitePopup, area: Re
     let lines = vec![
         Line::from(vec![
             Span::styled("от:      ", th.dim),
-            Span::styled(app.invite_from_label(inv), th.base.add_modifier(Modifier::BOLD)),
+            Span::styled(
+                app.invite_from_label(inv),
+                th.base.add_modifier(Modifier::BOLD),
+            ),
         ]),
         Line::from(vec![
             Span::styled("группа:  ", th.dim),
-            Span::styled(format!("«{}»", inv.group_name), th.accent.add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("«{}»", inv.group_name),
+                th.accent.add_modifier(Modifier::BOLD),
+            ),
             Span::styled(format!("  gid {}", inv.gid), th.dim),
         ]),
         Line::from(vec![
             Span::styled("пришло:  ", th.dim),
             Span::styled(ago(inv.received_at), th.dim),
             Span::styled(
-                inv.expires_at.map(|t| format!(" · {}", left_until(t))).unwrap_or_default(),
+                inv.expires_at
+                    .map(|t| format!(" · {}", left_until(t)))
+                    .unwrap_or_default(),
                 th.warn,
             ),
         ]),
@@ -1462,7 +1537,9 @@ fn draw_invite(f: &mut Frame, app: &App, th: &Theme, inv: &InvitePopup, area: Re
     let block = popup_block(
         th,
         Line::from(title),
-        Style::default().fg(th.c.accent_alt).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(th.c.accent_alt)
+            .add_modifier(Modifier::BOLD),
     )
     .title_bottom(Line::from(Span::styled(
         " Enter/y — принять · n — отклонить · Esc — позже (o — вернуться) ",
@@ -1497,7 +1574,10 @@ fn help_lines(th: &Theme) -> Vec<Line<'static>> {
     let head = |t: &str| Line::from(Span::styled(format!("▸ {t}"), th.title));
     vec![
         head("Навигация"),
-        kv("Tab / Shift-Tab", "смена фокуса (группы → друзья → участники → лог)"),
+        kv(
+            "Tab / Shift-Tab",
+            "смена фокуса (группы → друзья → участники → лог)",
+        ),
         kv("↑ ↓", "перемещение по списку"),
         kv("Enter", "войти в группу / карточка друга"),
         kv("/", "поиск по спискам (Esc — сбросить, Enter — принять)"),
@@ -1512,9 +1592,15 @@ fn help_lines(th: &Theme) -> Vec<Line<'static>> {
         kv("x", "покинуть группу"),
         kv("i", "пригласить друга в группу"),
         kv("k / b", "исключить / забанить участника"),
-        kv("m · :admin", "управление своей группой: баны, приглашения, владелец"),
+        kv(
+            "m · :admin",
+            "управление своей группой: баны, приглашения, владелец",
+        ),
         kv("o", "неотвеченные приглашения (отложенные «Позже»)"),
-        kv("  в окне", "Enter/y — принять · n — отклонить · Esc — позже"),
+        kv(
+            "  в окне",
+            "Enter/y — принять · n — отклонить · Esc — позже",
+        ),
         Line::from(""),
         head("Друзья и профиль"),
         kv("a", "добавить друга по friend code"),
@@ -1523,7 +1609,10 @@ fn help_lines(th: &Theme) -> Vec<Line<'static>> {
         kv("c", "скопировать IP / pubkey / friend code"),
         kv("p", "карточка профиля"),
         kv("F3", "настройки (имя, сервер, автовход, тема, невидимка)"),
-        kv("F4 · :servers", "серверы: переключить, добавить, удалить, адаптер"),
+        kv(
+            "F4 · :servers",
+            "серверы: переключить, добавить, удалить, адаптер",
+        ),
         Line::from(""),
         head("Прочее"),
         kv(":", "командная строка (:help — список)"),
@@ -1557,7 +1646,12 @@ fn kb(v: u64) -> String {
 /// Время в формате ч:м:с (аптайм).
 fn uptime(t: std::time::Instant) -> String {
     let secs = t.elapsed().as_secs();
-    format!("{:02}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60)
+    format!(
+        "{:02}:{:02}:{:02}",
+        secs / 3600,
+        (secs / 60) % 60,
+        secs % 60
+    )
 }
 
 /// «только что» / «N с назад» / «N мин назад».
@@ -1576,8 +1670,8 @@ mod tests {
     use super::*;
     use crate::store::Config;
     use crate::tui::app::{App, FriendView, GroupView, PeerView};
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn demo_app() -> App {
         let mut app = App::new([9; 32], "TUN-TEST-CODE-TEST-CODE", &Config::default());
@@ -1678,7 +1772,8 @@ mod tests {
         assert!(text.contains("TUN-TEST-CODE"));
 
         let mut app = demo_app();
-        app.stack.push(Popup::Settings(crate::tui::app::SettingsPopup { sel: 0 }));
+        app.stack
+            .push(Popup::Settings(crate::tui::app::SettingsPopup { sel: 0 }));
         let text = render(&app, 140, 40);
         assert!(text.contains("Настройки"));
     }
@@ -1691,7 +1786,11 @@ mod tests {
         let message = format!("группа 12 «{name}» будет удалена у всех участников");
         assert_eq!(confirm_lines(&message, 60), 3);
         assert_eq!(confirm_lines("Точно?", 60), 1);
-        assert_eq!(confirm_lines(&"y".repeat(112), 60), 2, "слово ровно в две строки");
+        assert_eq!(
+            confirm_lines(&"y".repeat(112), 60),
+            2,
+            "слово ровно в две строки"
+        );
         for w in [140u16, 30] {
             let mut app = demo_app();
             app.stack.push(Popup::Confirm(ConfirmPopup {
@@ -1700,9 +1799,16 @@ mod tests {
                 action: ConfirmAction::DeleteGroup(12),
             }));
             let text = render(&app, w, 40);
-            assert!(text.contains("участников"), "конец сообщения обрезан (ширина {w}):\n{text}");
+            assert!(
+                text.contains("участников"),
+                "конец сообщения обрезан (ширина {w}):\n{text}"
+            );
             assert!(text.contains("Да (y)"), "нет кнопок (ширина {w}):\n{text}");
-            assert_eq!(app.hits.popup_buttons.borrow().len(), 2, "кнопки не кликабельны ({w})");
+            assert_eq!(
+                app.hits.popup_buttons.borrow().len(),
+                2,
+                "кнопки не кликабельны ({w})"
+            );
         }
     }
 
@@ -1868,7 +1974,10 @@ mod tests {
             shown_at: None,
         }));
         let s = frame(&app, 140, 40);
-        let text: String = s.iter().map(|r| r.iter().collect::<String>() + "\n").collect();
+        let text: String = s
+            .iter()
+            .map(|r| r.iter().collect::<String>() + "\n")
+            .collect();
         assert!(text.contains("Приглашение в группу"), "{text}");
         assert!(text.contains("bravo (bravo-srv)"), "алиас друга: {text}");
         assert!(text.contains("«secret»") && text.contains("gid 2"));
@@ -1898,9 +2007,21 @@ mod tests {
         );
         app.toast(MsgKind::Info, "последний тост".into());
         let text = render(&app, 80, 24);
-        assert!(text.contains("приглашение отложено"), "конец тоста обрезан: {text}");
-        assert!(text.contains("последний тост"), "новый тост вытеснен: {text}");
-        assert_eq!(wrapped_lines("✗ нет связи с сервером — ответ не отправлен, приглашение отложено", 50), 2);
+        assert!(
+            text.contains("приглашение отложено"),
+            "конец тоста обрезан: {text}"
+        );
+        assert!(
+            text.contains("последний тост"),
+            "новый тост вытеснен: {text}"
+        );
+        assert_eq!(
+            wrapped_lines(
+                "✗ нет связи с сервером — ответ не отправлен, приглашение отложено",
+                50
+            ),
+            2
+        );
     }
 
     #[test]
@@ -2023,7 +2144,11 @@ mod tests {
                 }),
                 false,
             ),
-            ("настройки", Popup::Settings(SettingsPopup { sel: 4 }), false),
+            (
+                "настройки",
+                Popup::Settings(SettingsPopup { sel: 4 }),
+                false,
+            ),
             ("профиль", Popup::Profile, true),
             (
                 "приглашение",
@@ -2033,7 +2158,9 @@ mod tests {
                     from_name: "bravo-srv".into(),
                     from_pubkey: [2; 32],
                     received_at: std::time::Instant::now(),
-                    expires_at: Some(std::time::Instant::now() + std::time::Duration::from_secs(6 * 86_400 + 60)),
+                    expires_at: Some(
+                        std::time::Instant::now() + std::time::Duration::from_secs(6 * 86_400 + 60),
+                    ),
                     shown_at: None,
                 }),
                 true,
@@ -2064,7 +2191,11 @@ mod tests {
                 ip: 0x6442_0110 + i as u32,
                 online: !i.is_multiple_of(4),
                 direct: i.is_multiple_of(2),
-                rtt_ms: if i.is_multiple_of(5) { None } else { Some(i as u64 * 7) },
+                rtt_ms: if i.is_multiple_of(5) {
+                    None
+                } else {
+                    Some(i as u64 * 7)
+                },
                 status: "ok".into(),
             })
             .collect();
@@ -2100,7 +2231,10 @@ mod tests {
                 if w >= 80 {
                     let (r, _) = app.hits.groups.get();
                     assert!(r.width > 0 && r.height > 0, "{kind:?} {w}x{h}: нет групп");
-                    assert!(app.hits.peers.get().0.height > 0, "{kind:?}: нет участников");
+                    assert!(
+                        app.hits.peers.get().0.height > 0,
+                        "{kind:?}: нет участников"
+                    );
                     assert!(app.hits.log.get().height > 0, "{kind:?}: нет лога");
                     assert_eq!(app.hits.tabs.borrow().len(), 4, "{kind:?}: вкладки");
                     assert!(!app.hits.toolbar.borrow().is_empty());
@@ -2142,7 +2276,11 @@ mod tests {
             assert_eq!(buf[(139u16, 3u16)].bg, c.bg, "{kind:?}: фон кадра");
             // Внутри панели групп — фон панели.
             let (r, _) = app.hits.groups.get();
-            assert_eq!(buf[(r.right() - 3, r.bottom() - 2)].bg, c.surface, "{kind:?}");
+            assert_eq!(
+                buf[(r.right() - 3, r.bottom() - 2)].bg,
+                c.surface,
+                "{kind:?}"
+            );
             // Ни одной клетки с цветом терминала по умолчанию.
             for y in 0..40u16 {
                 for x in 0..140u16 {
@@ -2168,7 +2306,11 @@ mod tests {
         let buf = term.backend().buffer();
         let c = Palette::of(app.theme_kind);
         let (fx, fy) = find(&s, "Друзья", 0);
-        let (fx, fy) = if fy == 39 { (fx, fy) } else { find_row(&s, "Друзья", 39) };
+        let (fx, fy) = if fy == 39 {
+            (fx, fy)
+        } else {
+            find_row(&s, "Друзья", 39)
+        };
         assert_eq!(buf[(fx, fy)].bg, c.tab_active_bg, "активная вкладка");
         let (gx, gy) = find_row(&s, "Группы", 39);
         assert_ne!(buf[(gx, gy)].bg, c.tab_active_bg, "неактивная вкладка");
@@ -2221,7 +2363,10 @@ mod tests {
         app.toasts.clear();
         app.log_scroll = 50;
         let s = frame(&app, 120, 40);
-        let text: String = s.iter().map(|r| r.iter().collect::<String>() + "\n").collect();
+        let text: String = s
+            .iter()
+            .map(|r| r.iter().collect::<String>() + "\n")
+            .collect();
         assert!(text.contains("событие 49"), "{text}");
         assert!(!text.contains("событие 99"));
         let r = app.hits.log.get();
@@ -2242,7 +2387,10 @@ mod tests {
         let text = render(&app, 70, 24);
         assert!(!text.contains("Трафик"));
         let log_top = text.lines().find(|l| l.contains("Лог")).unwrap();
-        assert!(log_top.contains("↓28.8 КБ/с") && log_top.contains('↑'), "{text}");
+        assert!(
+            log_top.contains("↓28.8 КБ/с") && log_top.contains('↑'),
+            "{text}"
+        );
     }
 
     #[test]
@@ -2269,9 +2417,9 @@ mod tests {
         use crate::store::{Config, StoredServer};
         use crate::tui::app::{App, Popup};
         use crate::tui::{admin, ui::draw};
+        use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-        use ratatui::Terminal;
         use tunnel_protocol as proto;
 
         fn frame(app: &App, w: u16, h: u16) -> Vec<Vec<char>> {
@@ -2300,7 +2448,10 @@ mod tests {
         }
 
         fn text(screen: &[Vec<char>]) -> String {
-            screen.iter().map(|r| r.iter().collect::<String>() + "\n").collect()
+            screen
+                .iter()
+                .map(|r| r.iter().collect::<String>() + "\n")
+                .collect()
         }
 
         fn click(x: u16, y: u16) -> MouseEvent {
@@ -2325,15 +2476,25 @@ mod tests {
         fn управление_группой_рисуется_и_кликается() {
             let mut app = demo_app();
             assert!(matches!(app.open_admin(), Some(Cmd::GroupAdmin(1))));
-            app.on_admin_info(1, vec![([3; 32], "charlie".into())], vec![([4; 32], "delta".into(), 7200)]);
+            app.on_admin_info(
+                1,
+                vec![([3; 32], "charlie".into())],
+                vec![([4; 32], "delta".into(), 7200)],
+            );
             let s = frame(&app, 140, 40);
             let t = text(&s);
-            assert!(t.contains("Управление группой «gamers»") && t.contains("charlie"), "{t}");
+            assert!(
+                t.contains("Управление группой «gamers»") && t.contains("charlie"),
+                "{t}"
+            );
 
             // Клик по кнопке «Разбанить» = Enter на выбранной строке.
             let (x, y) = find(&s, "Разбанить (Enter)");
             let cmds = admin_click(&mut app, x + 1, y);
-            assert!(matches!(cmds[..], [Cmd::Unban(1, pk), Cmd::GroupAdmin(1)] if pk == [3; 32]), "{cmds:?}");
+            assert!(
+                matches!(cmds[..], [Cmd::Unban(1, pk), Cmd::GroupAdmin(1)] if pk == [3; 32]),
+                "{cmds:?}"
+            );
 
             // Вкладка «Приглашения» кликом, затем «Отозвать».
             let (x, y) = find(&s, "Приглашения");
@@ -2342,7 +2503,10 @@ mod tests {
             assert!(text(&s).contains("delta"));
             let (x, y) = find(&s, "Отозвать приглашение (Enter)");
             let cmds = admin_click(&mut app, x + 1, y);
-            assert!(matches!(cmds[..], [Cmd::Kick(1, pk), Cmd::GroupAdmin(1)] if pk == [4; 32]), "{cmds:?}");
+            assert!(
+                matches!(cmds[..], [Cmd::Kick(1, pk), Cmd::GroupAdmin(1)] if pk == [4; 32]),
+                "{cmds:?}"
+            );
 
             // Клик мимо окна — закрыть.
             assert!(admin_click(&mut app, 0, 0).is_empty());
@@ -2354,28 +2518,43 @@ mod tests {
             let mut app = demo_app();
             let mut cfg = Config {
                 servers: vec![
-                    StoredServer { addr: "127.0.0.1:5599".into(), pubkey: proto::hex_of(&[1; 32]), label: "дом".into() },
-                    StoredServer { addr: "127.0.0.9:5601".into(), pubkey: proto::hex_of(&[2; 32]), label: "офис".into() },
+                    StoredServer {
+                        addr: "127.0.0.1:5599".into(),
+                        pubkey: proto::hex_of(&[1; 32]),
+                        label: "дом".into(),
+                    },
+                    StoredServer {
+                        addr: "127.0.0.9:5601".into(),
+                        pubkey: proto::hex_of(&[2; 32]),
+                        label: "офис".into(),
+                    },
                 ],
                 ..Config::default()
             };
             app.open_servers_with(&cfg);
             let s = frame(&app, 140, 40);
             let t = text(&s);
-            assert!(t.contains("127.0.0.1:5599") && t.contains("127.0.0.9:5601"), "{t}");
+            assert!(
+                t.contains("127.0.0.1:5599") && t.contains("127.0.0.9:5601"),
+                "{t}"
+            );
 
             // Первый клик по строке выбирает, второй — переключает.
             let (x, y) = find(&s, "127.0.0.9:5601");
             let mut act = None;
             for _ in 0..2 {
                 act = match app.stack.last_mut() {
-                    Some(Popup::Servers(v)) => v.handle_mouse(MouseEventKind::Down(MouseButton::Left), x, y),
+                    Some(Popup::Servers(v)) => {
+                        v.handle_mouse(MouseEventKind::Down(MouseButton::Left), x, y)
+                    }
                     _ => panic!("экран серверов не открыт"),
                 };
             }
             let (cmd, save) = app.servers_apply(act.expect("переключение"), &mut cfg);
             assert!(!save);
-            assert!(matches!(cmd, Some(Cmd::SwitchServer { addr, .. }) if addr.to_string() == "127.0.0.9:5601"));
+            assert!(
+                matches!(cmd, Some(Cmd::SwitchServer { addr, .. }) if addr.to_string() == "127.0.0.9:5601")
+            );
         }
 
         #[test]
@@ -2408,7 +2587,10 @@ mod tests {
         assert!(last.contains("✦ 1"), "{last}");
         assert!(last.contains("невидимка"), "{last}");
         assert!(last.contains("UDP"), "{last}");
-        assert!(last.contains("◆ 1 прямых") && last.contains("◇ 0 через релей"), "{last}");
+        assert!(
+            last.contains("◆ 1 прямых") && last.contains("◇ 0 через релей"),
+            "{last}"
+        );
         // Клик по бейджу приглашений — клавиша «o».
         let (x, y) = find(&s, "✦ 1", 0);
         assert_eq!(app.hit(x, y), Hit::Key(k(KeyCode::Char('o'))));
@@ -2417,7 +2599,10 @@ mod tests {
         app.later_invites.clear();
         let s = frame(&app, 200, 40);
         let last: String = s[39].iter().collect();
-        assert!(last.contains("Переподключение") && !last.contains('✦'), "{last}");
+        assert!(
+            last.contains("Переподключение") && !last.contains('✦'),
+            "{last}"
+        );
         // Узко — не паникует.
         let _ = frame(&app, 40, 20);
     }

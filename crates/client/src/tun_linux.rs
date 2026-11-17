@@ -60,7 +60,10 @@ fn build_ifreq(name: &str) -> Result<IfReqFlags> {
 /// Проверка имени интерфейса по правилам ядра (dev_valid_name).
 fn validate_ifname(name: &str) -> Result<()> {
     if name.is_empty() || name.len() >= IFNAMSIZ {
-        bail!("имя интерфейса должно быть 1..{} байт: {name:?}", IFNAMSIZ - 1);
+        bail!(
+            "имя интерфейса должно быть 1..{} байт: {name:?}",
+            IFNAMSIZ - 1
+        );
     }
     if name == "." || name == ".." {
         bail!("недопустимое имя интерфейса: {name:?}");
@@ -129,7 +132,11 @@ fn run_ip(args: &[String]) -> Result<()> {
         .with_context(|| format!("запуск ip {}", args.join(" ")))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
-        return Err(anyhow!("ip {} завершился с ошибкой: {}", args.join(" "), err.trim()));
+        return Err(anyhow!(
+            "ip {} завершился с ошибкой: {}",
+            args.join(" "),
+            err.trim()
+        ));
     }
     Ok(())
 }
@@ -156,7 +163,13 @@ impl LinuxTun {
             .open(TUN_CLONE_PATH)
             .with_context(|| format!("открытие {TUN_CLONE_PATH} (нужны root/CAP_NET_ADMIN)"))?;
         // SAFETY: fd валиден, req — корректно выровненная структура размера ifreq.
-        let rc = unsafe { libc::ioctl(file.as_raw_fd(), TUNSETIFF as _, &mut req as *mut IfReqFlags) };
+        let rc = unsafe {
+            libc::ioctl(
+                file.as_raw_fd(),
+                TUNSETIFF as _,
+                &mut req as *mut IfReqFlags,
+            )
+        };
         if rc < 0 {
             return Err(std::io::Error::last_os_error()).context("ioctl TUNSETIFF");
         }
@@ -240,7 +253,11 @@ const READER_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Ждёт готовности fd на чтение не дольше `timeout`. true — данные есть.
 fn wait_readable(fd: libc::c_int, timeout: Duration) -> Result<bool> {
-    let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
     let ms = timeout.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
     loop {
         // SAFETY: pfd — валидный указатель на один pollfd.
@@ -325,7 +342,10 @@ where
             Ok(())
         })
         .context("запуск потока чтения TUN")?;
-    Ok(TunReader { stop, thread: Some(thread) })
+    Ok(TunReader {
+        stop,
+        thread: Some(thread),
+    })
 }
 
 #[cfg(test)]
@@ -334,7 +354,10 @@ mod tests {
 
     #[test]
     fn ifreq_size_matches_kernel() {
-        assert_eq!(std::mem::size_of::<IfReqFlags>(), std::mem::size_of::<libc::ifreq>());
+        assert_eq!(
+            std::mem::size_of::<IfReqFlags>(),
+            std::mem::size_of::<libc::ifreq>()
+        );
     }
 
     #[test]
@@ -350,7 +373,16 @@ mod tests {
 
     #[test]
     fn ifname_validation() {
-        for bad in ["", "abcdefghijklmnop", "a/b", "a b", "a:b", ".", "..", "имя"] {
+        for bad in [
+            "",
+            "abcdefghijklmnop",
+            "a/b",
+            "a b",
+            "a:b",
+            ".",
+            "..",
+            "имя",
+        ] {
             assert!(build_ifreq(bad).is_err(), "{bad:?} должно отклоняться");
         }
     }
@@ -398,7 +430,8 @@ mod tests {
         let ip = u32::from(Ipv4Addr::new(10, 250, 1, 2));
         tun.ensure_address(ip).unwrap();
         tun.ensure_address(ip).unwrap(); // повтор — без ошибки
-        tun.ensure_address6("fd00:766c::2".parse().unwrap(), 64).unwrap();
+        tun.ensure_address6("fd00:766c::2".parse().unwrap(), 64)
+            .unwrap();
         // Минимальный IPv4/UDP-пакет на соседний адрес подсети должен приниматься ядром.
         let mut pkt = [0u8; 28];
         pkt[0] = 0x45;

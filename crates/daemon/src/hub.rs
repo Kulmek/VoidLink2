@@ -174,7 +174,12 @@ impl<B: Backend> Hub<B> {
         };
         let id = g.next_id;
         g.next_id += 1;
-        g.subs.push(Sub { id, tx, need_snapshot: false, dropped: 0 });
+        g.subs.push(Sub {
+            id,
+            tx,
+            need_snapshot: false,
+            dropped: 0,
+        });
         Subscription {
             id,
             history: g.ring.iter().cloned().collect(),
@@ -185,7 +190,11 @@ impl<B: Backend> Hub<B> {
 
     /// Потерянные сообщения подписчика (`None` — нет такого).
     pub fn dropped(&self, id: u64) -> Option<u64> {
-        self.lock().subs.iter().find(|s| s.id == id).map(|s| s.dropped)
+        self.lock()
+            .subs
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.dropped)
     }
 
     /// Один такт: забрать события, разослать, при необходимости — снимок.
@@ -210,17 +219,32 @@ impl<B: Backend> Hub<B> {
                 }
                 g.ring.push_back((g.seq, ev.clone()));
                 let seq = g.seq;
-                g.subs.retain_mut(|s| deliver(s, HubMsg::Event { seq, ev: ev.clone() }, &mut overflowed));
+                g.subs.retain_mut(|s| {
+                    deliver(
+                        s,
+                        HubMsg::Event {
+                            seq,
+                            ev: ev.clone(),
+                        },
+                        &mut overflowed,
+                    )
+                });
             }
-            let due = g.last_snap.is_none_or(|t| now.saturating_duration_since(t) >= SNAPSHOT_EVERY);
+            let due = g
+                .last_snap
+                .is_none_or(|t| now.saturating_duration_since(t) >= SNAPSHOT_EVERY);
             // Подписчику с пропуском нужен снимок, покрывающий дырку: кэш,
             // не учитывающий последние события, не годится.
-            let stale = g.snap.as_ref().is_some_and(|(q, _)| *q < g.seq) && g.subs.iter().any(|s| s.need_snapshot);
+            let stale = g.snap.as_ref().is_some_and(|(q, _)| *q < g.seq)
+                && g.subs.iter().any(|s| s.need_snapshot);
             (changed || due || stale || g.snap.is_none(), g.seq)
         };
         if let Some(log) = &self.log {
             for id in overflowed {
-                log(Level::Warn, &format!("подписчик {id}: очередь переполнена, события теряются до снимка"));
+                log(
+                    Level::Warn,
+                    &format!("подписчик {id}: очередь переполнена, события теряются до снимка"),
+                );
             }
         }
         // Снимок строится без мьютекса хаба; он не старше событий этого такта
@@ -235,12 +259,17 @@ impl<B: Backend> Hub<B> {
                 s.need_snapshot = true;
             }
         }
-        let Some((seq, snap)) = g.snap.clone() else { return };
+        let Some((seq, snap)) = g.snap.clone() else {
+            return;
+        };
         g.subs.retain_mut(|s| {
             if !s.need_snapshot {
                 return true;
             }
-            match s.tx.try_send(HubMsg::Snapshot { seq, snap: snap.clone() }) {
+            match s.tx.try_send(HubMsg::Snapshot {
+                seq,
+                snap: snap.clone(),
+            }) {
                 Ok(()) => {
                     s.need_snapshot = false;
                     true
@@ -422,7 +451,11 @@ mod tests {
         let (tick, seq) = got_snap.expect("снимок не дошёл за 3 такта");
         assert!(tick <= 2, "снимок пришёл только на такте {tick}");
         assert_eq!(seq, hub.seq());
-        assert_eq!(logged.lock().unwrap().len(), 1, "переполнение логируется один раз");
+        assert_eq!(
+            logged.lock().unwrap().len(),
+            1,
+            "переполнение логируется один раз"
+        );
     }
 
     #[test]
@@ -449,7 +482,11 @@ mod tests {
         let now = Instant::now();
         hub.pump_at(now);
         let sub = hub.subscribe(16);
-        let snaps = |msgs: Vec<HubMsg>| msgs.iter().filter(|m| matches!(m, HubMsg::Snapshot { .. })).count();
+        let snaps = |msgs: Vec<HubMsg>| {
+            msgs.iter()
+                .filter(|m| matches!(m, HubMsg::Snapshot { .. }))
+                .count()
+        };
         hub.pump_at(now + Duration::from_millis(100));
         assert_eq!(snaps(drain(&sub.rx)), 0);
         hub.backend().changed.store(true, Ordering::Relaxed);

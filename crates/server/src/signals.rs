@@ -35,7 +35,9 @@ pub struct Shutdown {
 impl Shutdown {
     /// Хэндл без обработчиков сигналов (для тестов и ручного `trigger()`).
     pub fn new() -> Self {
-        Self { flag: Arc::new(AtomicBool::new(false)) }
+        Self {
+            flag: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     /// Поставить обработчики сигналов завершения.
@@ -120,10 +122,10 @@ mod console {
 
     use anyhow::{Result, bail};
     use windows_sys::Win32::Foundation::{FALSE, TRUE};
-    use windows_sys::core::BOOL;
     use windows_sys::Win32::System::Console::{
         CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT, SetConsoleCtrlHandler,
     };
+    use windows_sys::core::BOOL;
 
     /// Сколько ждать после выставления флага. Windows даёт ~5 с на
     /// CTRL_CLOSE_EVENT, после возврата из обработчика процесс убивается.

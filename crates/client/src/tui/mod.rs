@@ -8,11 +8,11 @@
 pub mod admin;
 pub mod app;
 pub mod badges;
-pub mod identicon;
-pub mod servers;
 pub mod clipboard;
 pub mod clock;
+pub mod identicon;
 pub mod keymap;
+pub mod servers;
 pub mod setup;
 pub mod theme;
 pub mod ui;
@@ -27,7 +27,7 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::prelude::*;
 
@@ -127,7 +127,11 @@ fn install_panic_hook() {
 
 pub(crate) fn restore_terminal(term: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     disable_raw_mode()?;
-    execute!(term.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
+    execute!(
+        term.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     term.show_cursor()?;
     Ok(())
 }
@@ -156,10 +160,8 @@ fn event_loop(
                         app.handle_key(key, eng);
                     }
                     Event::Mouse(m) => {
-                        significant = !matches!(
-                            m.kind,
-                            MouseEventKind::Moved | MouseEventKind::Drag(_)
-                        );
+                        significant =
+                            !matches!(m.kind, MouseEventKind::Moved | MouseEventKind::Drag(_));
                         app.handle_mouse(m, eng);
                     }
                     _ => {}

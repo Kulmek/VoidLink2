@@ -76,7 +76,10 @@ impl Logger {
             max_files: max_files.max(1),
             min_level,
             console,
-            state: Mutex::new(State { file: Some(file), size }),
+            state: Mutex::new(State {
+                file: Some(file),
+                size,
+            }),
         }))
     }
 
@@ -89,7 +92,12 @@ impl Logger {
         if level < self.min_level {
             return;
         }
-        let line = format!("{} {:<5} {}\n", timestamp(SystemTime::now()), level.tag(), msg.trim_end());
+        let line = format!(
+            "{} {:<5} {}\n",
+            timestamp(SystemTime::now()),
+            level.tag(),
+            msg.trim_end()
+        );
         if self.console {
             eprint!("{line}");
         }
@@ -97,14 +105,33 @@ impl Logger {
         if st.size > 0 && st.size + line.len() as u64 > self.max_bytes {
             st.file = None; // закрыть перед переименованием (Windows)
             let rotated = self.rotate();
-            st.file = OpenOptions::new().create(true).append(true).open(&self.path).ok();
+            st.file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)
+                .ok();
             // Не вышло (файл держит другой процесс без FILE_SHARE_DELETE) —
             // пишем дальше в тот же файл, следующая попытка через max_bytes.
-            st.size = if rotated { st.file.as_ref().and_then(|f| f.metadata().ok()).map_or(0, |m| m.len()) } else { 0 };
+            st.size = if rotated {
+                st.file
+                    .as_ref()
+                    .and_then(|f| f.metadata().ok())
+                    .map_or(0, |m| m.len())
+            } else {
+                0
+            };
         }
         if st.file.is_none() {
-            st.file = OpenOptions::new().create(true).append(true).open(&self.path).ok();
-            st.size = st.file.as_ref().and_then(|f| f.metadata().ok()).map_or(0, |m| m.len());
+            st.file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)
+                .ok();
+            st.size = st
+                .file
+                .as_ref()
+                .and_then(|f| f.metadata().ok())
+                .map_or(0, |m| m.len());
         }
         if let Some(f) = st.file.as_mut()
             && f.write_all(line.as_bytes()).is_ok()
@@ -201,8 +228,10 @@ mod tests {
             log.log(Level::Info, &format!("строка {i:03} xxxxxxxxxxxxxxxxxxxx"));
         }
         log.log(Level::Debug, "не должно попасть");
-        let mut names: Vec<String> =
-            std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
         names.sort();
         assert_eq!(names, vec!["daemon.log", "daemon.log.1", "daemon.log.2"]);
         for n in &names {
@@ -218,7 +247,11 @@ mod tests {
         drop(log);
         let log = Logger::open_with(&dir, "daemon.log", 200, 3, Level::Debug, false).unwrap();
         (log.callback())(Level::Debug, "через колбэк");
-        assert!(std::fs::read_to_string(log.path()).unwrap().contains("через колбэк"));
+        assert!(
+            std::fs::read_to_string(log.path())
+                .unwrap()
+                .contains("через колбэк")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -235,16 +268,29 @@ mod tests {
         for i in 0..30 {
             log.log(Level::Info, &format!("строка {i:03} xxxxxxxxxxxxxxxxxxxx"));
         }
-        assert_eq!(std::fs::read_to_string(dir.join("daemon.log.1")).unwrap(), "архив 1\n");
-        assert_eq!(std::fs::read_to_string(dir.join("daemon.log.2")).unwrap(), "архив 2\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("daemon.log.1")).unwrap(),
+            "архив 1\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("daemon.log.2")).unwrap(),
+            "архив 2\n"
+        );
         let cur = std::fs::read_to_string(dir.join("daemon.log")).unwrap();
         assert!(cur.contains("строка 000") && cur.contains("строка 029"));
         // Препятствие ушло — ротация снова работает.
         std::fs::remove_dir(dir.join("daemon.log.rotating")).unwrap();
         for i in 0..10 {
-            log.log(Level::Info, &format!("после {i:03} xxxxxxxxxxxxxxxxxxxxxxxxxxx"));
+            log.log(
+                Level::Info,
+                &format!("после {i:03} xxxxxxxxxxxxxxxxxxxxxxxxxxx"),
+            );
         }
-        assert!(!std::fs::read_to_string(dir.join("daemon.log")).unwrap().contains("строка 000"));
+        assert!(
+            !std::fs::read_to_string(dir.join("daemon.log"))
+                .unwrap()
+                .contains("строка 000")
+        );
         assert!(!dir.join("daemon.log.rotating").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }

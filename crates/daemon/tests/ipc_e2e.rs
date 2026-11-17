@@ -14,8 +14,8 @@ use serde_json::json;
 use tunnel_daemon::server::socket_path;
 use tunnel_daemon::{FakeBackend, IpcMode, RunOpts, run_daemon};
 use tunnel_ipc::{
-    AckResult, ClientError, ClientKind, ClientMsg, CodecError, Conn, DaemonMsg, IpcClient, PROTO_VERSION, read_msg,
-    write_msg,
+    AckResult, ClientError, ClientKind, ClientMsg, CodecError, Conn, DaemonMsg, IpcClient,
+    PROTO_VERSION, read_msg, write_msg,
 };
 
 const T: Duration = Duration::from_secs(5);
@@ -52,7 +52,12 @@ impl Daemon {
         let stop = Arc::new(AtomicBool::new(false));
         let (b, s, o) = (backend.clone(), stop.clone(), opts(&dir));
         let th = std::thread::spawn(move || run_daemon(&o, move |_| b, s));
-        let d = Daemon { dir, backend, stop, th: Some(th) };
+        let d = Daemon {
+            dir,
+            backend,
+            stop,
+            th: Some(th),
+        };
         // Ждём, пока сокет начнёт принимать.
         let t0 = Instant::now();
         loop {
@@ -134,7 +139,10 @@ fn snapshot_with_groups(n: usize) -> impl FnMut(&DaemonMsg) -> bool {
 
 fn hello(c: &mut Conn) {
     write_msg(c, &ClientMsg::hello(ClientKind::Cli, "raw")).unwrap();
-    assert!(matches!(read_msg::<_, DaemonMsg>(c).unwrap(), DaemonMsg::Welcome { .. }));
+    assert!(matches!(
+        read_msg::<_, DaemonMsg>(c).unwrap(),
+        DaemonMsg::Welcome { .. }
+    ));
 }
 
 /// Пир закрыл соединение (EOF или сброс), а не прислал что-то.
@@ -144,7 +152,10 @@ fn expect_closed(c: &mut Conn) {
     loop {
         match read_msg::<_, DaemonMsg>(c) {
             Err(CodecError::Closed | CodecError::Truncated) => return,
-            Err(CodecError::Io(e)) if e.kind() != std::io::ErrorKind::WouldBlock && e.kind() != std::io::ErrorKind::TimedOut => {
+            Err(CodecError::Io(e))
+                if e.kind() != std::io::ErrorKind::WouldBlock
+                    && e.kind() != std::io::ErrorKind::TimedOut =>
+            {
                 return;
             }
             Err(e) => panic!("ждали закрытия, получили {e}"),
@@ -188,12 +199,26 @@ fn two_clients_see_same_events_and_join() {
     wait_for(&mut a, "снимок с группой у A", snapshot_with_groups(1));
     wait_for(&mut b, "снимок с группой у B", snapshot_with_groups(1));
     // Неверный gid — Err в Ack, а не разрыв.
-    assert!(matches!(b.request(json!({ "Join": 99 }), T).unwrap(), AckResult::Err(_)));
-    assert!(matches!(b.request(json!("Quit"), T).unwrap(), AckResult::Err(_)));
+    assert!(matches!(
+        b.request(json!({ "Join": 99 }), T).unwrap(),
+        AckResult::Err(_)
+    ));
+    assert!(matches!(
+        b.request(json!("Quit"), T).unwrap(),
+        AckResult::Err(_)
+    ));
     // Событие из бэкенда — обоим.
     d.backend.push_event(json!({ "Notice": "привет" }));
-    let na = wait_for(&mut a, "Notice у A", |m| matches!(m, DaemonMsg::Event { ev, .. } if ev["Notice"] == "привет"));
-    let nb = wait_for(&mut b, "Notice у B", |m| matches!(m, DaemonMsg::Event { ev, .. } if ev["Notice"] == "привет"));
+    let na = wait_for(
+        &mut a,
+        "Notice у A",
+        |m| matches!(m, DaemonMsg::Event { ev, .. } if ev["Notice"] == "привет"),
+    );
+    let nb = wait_for(
+        &mut b,
+        "Notice у B",
+        |m| matches!(m, DaemonMsg::Event { ev, .. } if ev["Notice"] == "привет"),
+    );
     assert_eq!(na, nb);
     assert_eq!(d.backend.joined(), vec![2]);
     drop((a, b));
@@ -211,7 +236,11 @@ fn client_disconnect_does_not_affect_other() {
     assert_eq!(b.request(json!({ "Join": 1 }), T).unwrap(), AckResult::Ok);
     wait_for(&mut b, "GroupJoined после ухода других", joined_event(1));
     d.backend.push_event(json!({ "Notice": "после" }));
-    wait_for(&mut b, "Notice", |m| matches!(m, DaemonMsg::Event { ev, .. } if ev["Notice"] == "после"));
+    wait_for(
+        &mut b,
+        "Notice",
+        |m| matches!(m, DaemonMsg::Event { ev, .. } if ev["Notice"] == "после"),
+    );
     // Движок ничего не заметил: группа на месте, новый клиент её видит.
     assert_eq!(d.backend.joined(), vec![1]);
     let mut n = d.subscribed();
@@ -242,22 +271,33 @@ fn slow_subscriber_does_not_block() {
         }
         // seq 1 — Connected, дальше наши N событий.
         match fast.recv(Some(Duration::from_millis(20))) {
-            Ok(DaemonMsg::Event { seq, .. } | DaemonMsg::Snapshot { seq, .. }) => last = last.max(seq),
+            Ok(DaemonMsg::Event { seq, .. } | DaemonMsg::Snapshot { seq, .. }) => {
+                last = last.max(seq)
+            }
             Ok(_) | Err(ClientError::Timeout) => {}
             Err(e) => panic!("быстрый клиент: {e}"),
         }
-        assert!(t0.elapsed() < Duration::from_secs(20), "быстрый застрял на seq {last}");
+        assert!(
+            t0.elapsed() < Duration::from_secs(20),
+            "быстрый застрял на seq {last}"
+        );
     }
     // Демон отвечает, хотя медленный висит с полным буфером.
     let t1 = Instant::now();
-    assert_eq!(fast.request(json!({ "Join": 3 }), T).unwrap(), AckResult::Ok);
+    assert_eq!(
+        fast.request(json!({ "Join": 3 }), T).unwrap(),
+        AckResult::Ok
+    );
     assert!(t1.elapsed() < Duration::from_secs(1));
     assert!(d.alive());
     drop((fast, slow));
     // Остановка не виснет на медленном (Shutdown ему не влезает).
     let t2 = Instant::now();
     d.stop().unwrap();
-    assert!(t2.elapsed() < Duration::from_secs(5), "остановка ждала медленного");
+    assert!(
+        t2.elapsed() < Duration::from_secs(5),
+        "остановка ждала медленного"
+    );
 }
 
 #[test]
@@ -273,7 +313,10 @@ fn slow_subscriber_still_connected_does_not_block_stop() {
     std::thread::sleep(Duration::from_millis(300));
     let t0 = Instant::now();
     d.stop().unwrap();
-    assert!(t0.elapsed() < Duration::from_secs(5), "остановка ждала медленного");
+    assert!(
+        t0.elapsed() < Duration::from_secs(5),
+        "остановка ждала медленного"
+    );
     drop(slow);
 }
 
@@ -281,7 +324,15 @@ fn slow_subscriber_still_connected_does_not_block_stop() {
 fn wrong_version_rejected_and_closed() {
     let d = Daemon::start();
     let mut c = d.raw();
-    write_msg(&mut c, &ClientMsg::Hello { proto: PROTO_VERSION + 1, kind: ClientKind::Tray, ver: "9".into() }).unwrap();
+    write_msg(
+        &mut c,
+        &ClientMsg::Hello {
+            proto: PROTO_VERSION + 1,
+            kind: ClientKind::Tray,
+            ver: "9".into(),
+        },
+    )
+    .unwrap();
     match read_msg::<_, DaemonMsg>(&mut c).unwrap() {
         DaemonMsg::Reject { reason } => assert!(reason.contains("версия"), "{reason}"),
         m => panic!("ждали Reject, пришло {m:?}"),
@@ -290,7 +341,13 @@ fn wrong_version_rejected_and_closed() {
     // Через IpcClient — понятная ошибка.
     let mut raw = d.raw();
     write_msg(&mut raw, &ClientMsg::Subscribe { snapshots_ms: 0 }).unwrap();
-    assert!(matches!(read_msg::<_, DaemonMsg>(&mut raw).unwrap(), DaemonMsg::Reject { .. }), "не Hello первым");
+    assert!(
+        matches!(
+            read_msg::<_, DaemonMsg>(&mut raw).unwrap(),
+            DaemonMsg::Reject { .. }
+        ),
+        "не Hello первым"
+    );
     expect_closed(&mut raw);
     assert!(d.alive());
     d.stop().unwrap();
@@ -318,7 +375,8 @@ fn garbage_and_huge_length_disconnect_daemon_alive() {
     // Длина чуть больше лимита.
     let mut h2 = d.raw();
     hello(&mut h2);
-    h2.write_all(&((tunnel_ipc::MAX_FRAME + 1) as u32).to_le_bytes()).unwrap();
+    h2.write_all(&((tunnel_ipc::MAX_FRAME + 1) as u32).to_le_bytes())
+        .unwrap();
     expect_closed(&mut h2);
 
     // Нулевая длина и обрыв посреди фрейма.
@@ -340,7 +398,10 @@ fn garbage_and_huge_length_disconnect_daemon_alive() {
 
     // Демон жив, старый клиент работает, новый подключается.
     assert!(d.alive());
-    assert_eq!(keep.request(json!({ "Join": 1 }), T).unwrap(), AckResult::Ok);
+    assert_eq!(
+        keep.request(json!({ "Join": 1 }), T).unwrap(),
+        AckResult::Ok
+    );
     wait_for(&mut keep, "GroupJoined", joined_event(1));
     let mut n = d.client();
     assert_eq!(n.request(json!("RefreshList"), T).unwrap(), AckResult::Ok);
@@ -421,7 +482,9 @@ fn snapshots_ms_throttles_periodic_snapshots() {
     let mut c = d.client();
     c.subscribe(60_000).unwrap();
     // Начальный снимок приходит всегда.
-    wait_for(&mut c, "начальный снимок", |m| matches!(m, DaemonMsg::Snapshot { .. }));
+    wait_for(&mut c, "начальный снимок", |m| {
+        matches!(m, DaemonMsg::Snapshot { .. })
+    });
     // Изменения без событий (touch) — снимки хаба не чаще 60 с: их нет.
     d.backend.touch();
     let t0 = Instant::now();
@@ -443,7 +506,9 @@ fn throttled_subscriber_gets_snapshot_right_after_change() {
     let d = Daemon::start();
     let mut c = d.client();
     c.subscribe(1000).unwrap();
-    wait_for(&mut c, "начальный снимок", |m| matches!(m, DaemonMsg::Snapshot { .. }));
+    wait_for(&mut c, "начальный снимок", |m| {
+        matches!(m, DaemonMsg::Snapshot { .. })
+    });
     assert_eq!(c.request(json!({ "Join": 1 }), T).unwrap(), AckResult::Ok);
     let t0 = Instant::now();
     loop {

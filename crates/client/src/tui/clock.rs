@@ -134,7 +134,10 @@ fn parse_posix_tz(s: &str) -> Option<i64> {
         b'+' => (-1, &rest[1..]),
         _ => (-1, rest),
     };
-    let num: String = num.chars().take_while(|c| c.is_ascii_digit() || *c == ':').collect();
+    let num: String = num
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == ':')
+        .collect();
     let mut parts = num.split(':');
     let h: i64 = parts.next()?.parse().ok()?;
     let m: i64 = parts.next().map_or(Ok(0), str::parse).ok()?;
@@ -166,7 +169,10 @@ mod tests {
         assert_eq!(format_with_offset(at(T), at(T), 0), "12:34:56");
         assert_eq!(format_with_offset(at(T), at(T), 3 * 3600), "15:34:56");
         assert_eq!(format_with_offset(at(T), at(T), -5 * 3600), "07:34:56");
-        assert_eq!(format_with_offset(at(T), at(T), 5 * 3600 + 1800), "18:04:56");
+        assert_eq!(
+            format_with_offset(at(T), at(T), 5 * 3600 + 1800),
+            "18:04:56"
+        );
     }
 
     #[test]

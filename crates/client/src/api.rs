@@ -122,7 +122,10 @@ impl LocalEngine {
             meta: eng.meta.clone(),
             stats: eng.stats.clone(),
             cfg: eng.cfg.clone(),
-            me: Me { my_pub: eng.my_pub, my_code: eng.my_code.clone() },
+            me: Me {
+                my_pub: eng.my_pub,
+                my_code: eng.my_code.clone(),
+            },
             cmds: Mutex::new(eng.cmds.clone()),
             events: Mutex::new(events),
             invites: Mutex::new(PendingInvites::new()),
@@ -161,7 +164,13 @@ impl LocalEngine {
     /// приглашение, которое мы только что отклонили).
     fn track(inv: &mut PendingInvites, ev: &Event, now: Instant) -> bool {
         match ev {
-            Event::Invite { gid, group_name, from_pubkey, from_name, expires_in } => {
+            Event::Invite {
+                gid,
+                group_name,
+                from_pubkey,
+                from_name,
+                expires_in,
+            } => {
                 let i = IncomingInvite {
                     gid: *gid,
                     group_name: group_name.clone(),
@@ -171,7 +180,11 @@ impl LocalEngine {
                 };
                 return inv.on_invite(i, now) != InviteOutcome::Declined;
             }
-            Event::InvitesSynced { gids, from, complete } => {
+            Event::InvitesSynced {
+                gids,
+                from,
+                complete,
+            } => {
                 inv.on_synced(gids, *from, *complete, now);
             }
             Event::GroupJoined { gid, .. } => {
@@ -230,7 +243,9 @@ impl EngineApi for LocalEngine {
         if let Cmd::DeclineInvite(gid) = cmd {
             lock(&self.invites).on_decline(gid, Instant::now());
         }
-        lock(&self.cmds).send(cmd).map_err(|_| anyhow!("движок остановлен"))?;
+        lock(&self.cmds)
+            .send(cmd)
+            .map_err(|_| anyhow!("движок остановлен"))?;
         self.changed.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -261,9 +276,15 @@ mod tests {
 
     #[test]
     fn me_json_туда_и_обратно() {
-        let me = Me { my_pub: [5; 32], my_code: "TUN-X".into() };
+        let me = Me {
+            my_pub: [5; 32],
+            my_code: "TUN-X".into(),
+        };
         assert_eq!(Me::from_json(&me.to_json()), Some(me));
         assert_eq!(Me::from_json(&Value::Null), None);
-        assert_eq!(Me::from_json(&json!({"my_pub": "zz", "my_code": "x"})), None);
+        assert_eq!(
+            Me::from_json(&json!({"my_pub": "zz", "my_code": "x"})),
+            None
+        );
     }
 }

@@ -100,7 +100,12 @@ impl IpcClient {
     }
 
     /// `Hello` → `Welcome` поверх уже открытого соединения.
-    pub fn handshake(conn: Conn, kind: ClientKind, ver: &str, timeout: Duration) -> Result<IpcClient, ClientError> {
+    pub fn handshake(
+        conn: Conn,
+        kind: ClientKind,
+        ver: &str,
+        timeout: Duration,
+    ) -> Result<IpcClient, ClientError> {
         let mut rd = conn.try_clone().map_err(ClientError::Connect)?;
         let (tx, rx) = mpsc::sync_channel(CLIENT_QUEUE);
         let reader = std::thread::Builder::new()
@@ -134,7 +139,9 @@ impl IpcClient {
             }
             DaemonMsg::Reject { reason } => Err(ClientError::Rejected(reason)),
             DaemonMsg::Shutdown { reason } => Err(ClientError::Shutdown(reason)),
-            m => Err(ClientError::Protocol(format!("ждали Welcome, пришло {m:?}"))),
+            m => Err(ClientError::Protocol(format!(
+                "ждали Welcome, пришло {m:?}"
+            ))),
         }
     }
 

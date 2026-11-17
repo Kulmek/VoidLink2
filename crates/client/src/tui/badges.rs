@@ -10,12 +10,12 @@
 // подключается при интеграции
 #![allow(dead_code)]
 
+use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use super::theme::Theme;
 
@@ -256,8 +256,8 @@ pub fn render_badges(
 mod tests {
     use super::*;
     use crate::tui::theme::ThemeKind;
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn full() -> BadgeState {
         BadgeState {
@@ -334,7 +334,10 @@ mod tests {
 
     #[test]
     fn приглашения_скрыты_при_нуле() {
-        let st = BadgeState { pending_invites: 0, ..full() };
+        let st = BadgeState {
+            pending_invites: 0,
+            ..full()
+        };
         let (text, hits) = render(&st, ThemeKind::Dark, 120);
         assert!(!text.contains('✦'), "{text}");
         assert!(hits.is_empty());
@@ -357,7 +360,10 @@ mod tests {
             (ConnState::Reconnecting, "Переподключение"),
             (ConnState::Offline, "Офлайн"),
         ] {
-            let st = BadgeState { conn, ..Default::default() };
+            let st = BadgeState {
+                conn,
+                ..Default::default()
+            };
             let text: String = status_badges(&st, &th)
                 .iter()
                 .map(|s| s.content.to_string())

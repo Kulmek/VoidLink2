@@ -194,7 +194,10 @@ pub fn cmd_add_windows(if_index: u32, v4: u32) -> Option<Cmd> {
     args.push(if_index.to_string());
     args.push(format!("{a}/{GROUP_PREFIX_LEN}"));
     args.push("store=active".into());
-    Some(Cmd { program: "netsh", args })
+    Some(Cmd {
+        program: "netsh",
+        args,
+    })
 }
 
 /// Windows: удалить адрес при выходе из группы
@@ -204,7 +207,10 @@ pub fn cmd_del_windows(if_index: u32, v4: u32) -> Option<Cmd> {
     let mut args = strs(&["interface", "ipv6", "delete", "address"]);
     args.push(if_index.to_string());
     args.push(a.to_string());
-    Some(Cmd { program: "netsh", args })
+    Some(Cmd {
+        program: "netsh",
+        args,
+    })
 }
 
 /// Linux: `ip -6 addr add <a>/64 dev <if> nodad` — без DAD адрес сразу
@@ -229,7 +235,10 @@ fn linux(op: &str, ifname: &str, v4: u32) -> Option<Cmd> {
     args.push(format!("{a}/{GROUP_PREFIX_LEN}"));
     args.push("dev".into());
     args.push(ifname.into());
-    Some(Cmd { program: "ip", args })
+    Some(Cmd {
+        program: "ip",
+        args,
+    })
 }
 
 /// macOS: `ifconfig <if> inet6 <a> prefixlen 64 alias`.
@@ -240,7 +249,10 @@ pub fn cmd_add_macos(ifname: &str, v4: u32) -> Option<Cmd> {
     let a = v6_of(v4)?;
     let mut args = vec![ifname.to_string(), "inet6".into(), a.to_string()];
     args.extend(strs(&["prefixlen", "64", "alias"]));
-    Some(Cmd { program: "ifconfig", args })
+    Some(Cmd {
+        program: "ifconfig",
+        args,
+    })
 }
 
 /// macOS: `ifconfig <if> inet6 <a> -alias`.
@@ -249,8 +261,16 @@ pub fn cmd_del_macos(ifname: &str, v4: u32) -> Option<Cmd> {
         return None;
     }
     let a = v6_of(v4)?;
-    let args = vec![ifname.to_string(), "inet6".into(), a.to_string(), "-alias".into()];
-    Some(Cmd { program: "ifconfig", args })
+    let args = vec![
+        ifname.to_string(),
+        "inet6".into(),
+        a.to_string(),
+        "-alias".into(),
+    ];
+    Some(Cmd {
+        program: "ifconfig",
+        args,
+    })
 }
 
 /// Адаптер оверлея: имя (Linux/macOS) и индекс интерфейса (Windows).
@@ -393,7 +413,12 @@ mod tests {
     #[test]
     fn чужие_ipv4_не_маршрутизируются() {
         let me = ip4(100, 66, 3, 1);
-        for dst in [ip4(10, 0, 0, 1), ip4(224, 0, 0, 1), ip4(255, 255, 255, 255), ip4(8, 8, 8, 8)] {
+        for dst in [
+            ip4(10, 0, 0, 1),
+            ip4(224, 0, 0, 1),
+            ip4(255, 255, 255, 255),
+            ip4(8, 8, 8, 8),
+        ] {
             assert_eq!(route_target(&v4_packet(me, dst)), None);
             assert_eq!(source_member(&v4_packet(dst, me)), None);
         }
@@ -406,25 +431,61 @@ mod tests {
         assert_eq!(w.program, "netsh");
         assert_eq!(
             w.args,
-            ["interface", "ipv6", "add", "address", "17", "fd66:766c:696e:5::9/64", "store=active"]
+            [
+                "interface",
+                "ipv6",
+                "add",
+                "address",
+                "17",
+                "fd66:766c:696e:5::9/64",
+                "store=active"
+            ]
         );
         let wd = cmd_del_windows(17, v4).unwrap();
-        assert_eq!(wd.args, ["interface", "ipv6", "delete", "address", "17", "fd66:766c:696e:5::9"]);
+        assert_eq!(
+            wd.args,
+            [
+                "interface",
+                "ipv6",
+                "delete",
+                "address",
+                "17",
+                "fd66:766c:696e:5::9"
+            ]
+        );
         let l = cmd_add_linux("vl0", v4).unwrap();
         assert_eq!(l.program, "ip");
         assert_eq!(
             l.args,
-            ["-6", "addr", "add", "fd66:766c:696e:5::9/64", "dev", "vl0", "nodad"]
+            [
+                "-6",
+                "addr",
+                "add",
+                "fd66:766c:696e:5::9/64",
+                "dev",
+                "vl0",
+                "nodad"
+            ]
         );
         assert_eq!(cmd_del_linux("vl0", v4).unwrap().args[2], "del");
         let m = cmd_add_macos("utun7", v4).unwrap();
         assert_eq!(m.program, "ifconfig");
         assert_eq!(
             m.args,
-            ["utun7", "inet6", "fd66:766c:696e:5::9", "prefixlen", "64", "alias"]
+            [
+                "utun7",
+                "inet6",
+                "fd66:766c:696e:5::9",
+                "prefixlen",
+                "64",
+                "alias"
+            ]
         );
         assert_eq!(cmd_del_macos("utun7", v4).unwrap().args[3], "-alias");
-        let ok = Iface { name: "vl0", index: 17 };
+        let ok = Iface {
+            name: "vl0",
+            index: 17,
+        };
         assert!(cmd_add(ok, ip4(10, 0, 0, 1)).is_none());
         assert!(cmd_add(ok, v4).is_some() && cmd_del(ok, v4).is_some());
     }

@@ -6,11 +6,11 @@
 
 use std::net::SocketAddr;
 
-use anyhow::{anyhow, bail, ensure, Result};
+use anyhow::{Result, anyhow, bail, ensure};
 use rand::Rng;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use crate::{ct_eq, derive_key, put_pub, put_str, Identity, Reader, SymKey, PROTOCOL_VERSION};
+use crate::{Identity, PROTOCOL_VERSION, Reader, SymKey, ct_eq, derive_key, put_pub, put_str};
 
 const HELLO_TAG: &[u8] = b"tunnel/v3/hello";
 const WELCOME_TAG: &[u8] = b"tunnel/v3/welcome";
@@ -52,7 +52,10 @@ impl EphemeralKey {
     /// DH с эфемерным ключом пира; точка малого порядка — ошибка.
     pub fn dh(&self, peer_eph: &[u8; 32]) -> Result<[u8; 32]> {
         let shared = self.secret.diffie_hellman(&PublicKey::from(*peer_eph));
-        ensure!(shared.was_contributory(), "x25519: эфемерный ключ пира малого порядка");
+        ensure!(
+            shared.was_contributory(),
+            "x25519: эфемерный ключ пира малого порядка"
+        );
         Ok(shared.to_bytes())
     }
 }
@@ -101,20 +104,34 @@ impl std::fmt::Debug for DirKeys {
 impl SessionKeys {
     /// `k = derive("tunnel/v3/session", ss || ee || client_eph || server_eph)`,
     /// `c2s = derive("tunnel/v3/c2s", k)`, `s2c = derive("tunnel/v3/s2c", k)`.
-    pub fn derive(ss: &[u8; 32], ee: &[u8; 32], client_eph: &[u8; 32], server_eph: &[u8; 32]) -> Self {
+    pub fn derive(
+        ss: &[u8; 32],
+        ee: &[u8; 32],
+        client_eph: &[u8; 32],
+        server_eph: &[u8; 32],
+    ) -> Self {
         let mut m = [0u8; 128];
         m[..32].copy_from_slice(ss);
         m[32..64].copy_from_slice(ee);
         m[64..96].copy_from_slice(client_eph);
         m[96..].copy_from_slice(server_eph);
         let k = derive_key(b"tunnel/v3/session", &m);
-        Self { c2s: derive_key(b"tunnel/v3/c2s", &k), s2c: derive_key(b"tunnel/v3/s2c", &k) }
+        Self {
+            c2s: derive_key(b"tunnel/v3/c2s", &k),
+            s2c: derive_key(b"tunnel/v3/s2c", &k),
+        }
     }
 
     pub fn for_role(&self, role: Role) -> DirKeys {
         match role {
-            Role::Client => DirKeys { tx: self.c2s, rx: self.s2c },
-            Role::Server => DirKeys { tx: self.s2c, rx: self.c2s },
+            Role::Client => DirKeys {
+                tx: self.c2s,
+                rx: self.s2c,
+            },
+            Role::Server => DirKeys {
+                tx: self.s2c,
+                rx: self.c2s,
+            },
         }
     }
 }
@@ -194,10 +211,18 @@ impl CookieSecret {
     }
 
     /// Cookie верен для текущего или предыдущего bucket'а.
-    pub fn verify(&self, addr: SocketAddr, eph_pub: &[u8; 32], cookie: &[u8; COOKIE_LEN], unix_secs: u64) -> bool {
+    pub fn verify(
+        &self,
+        addr: SocketAddr,
+        eph_pub: &[u8; 32],
+        cookie: &[u8; COOKIE_LEN],
+        unix_secs: u64,
+    ) -> bool {
         let b = cookie_bucket(unix_secs);
         let cur = ct_eq(&self.compute(addr, eph_pub, b), cookie);
-        let prev = b.checked_sub(1).is_some_and(|p| ct_eq(&self.compute(addr, eph_pub, p), cookie));
+        let prev = b
+            .checked_sub(1)
+            .is_some_and(|p| ct_eq(&self.compute(addr, eph_pub, p), cookie));
         cur | prev
     }
 }
@@ -273,7 +298,16 @@ impl Hello3 {
         let signed_len = r.p;
         let sig = r.array()?;
         r.finish()?;
-        Ok(Self { cookie, ed_pub, x_pub, eph_pub, name, flags, sig, signed: body[..signed_len].to_vec() })
+        Ok(Self {
+            cookie,
+            ed_pub,
+            x_pub,
+            eph_pub,
+            name,
+            flags,
+            sig,
+            signed: body[..signed_len].to_vec(),
+        })
     }
 
     /// Проверка подписи `ed_pub` над `"tunnel/v3/hello" || байты до sig`.
@@ -339,14 +373,23 @@ pub fn make_link(old: &Identity, new: &Identity) -> RotationLink {
     let new_ed = new.ed_pub();
     let new_x = new.x_pub();
     let sig = old.sign(&[ROTATE_TAG, &new_ed, &new_x].concat());
-    RotationLink { old_ed: old.ed_pub(), new_ed, new_x, sig }
+    RotationLink {
+        old_ed: old.ed_pub(),
+        new_ed,
+        new_x,
+        sig,
+    }
 }
 
 impl RotationLink {
     /// Подпись `old_ed` над `"tunnel/v3/rotate" || new_ed || new_x`.
     pub fn verify(&self) -> Result<()> {
-        Identity::verify(&self.old_ed, &[ROTATE_TAG, &self.new_ed, &self.new_x].concat(), &self.sig)
-            .map_err(|_| anyhow!("звено ротации: неверная подпись"))
+        Identity::verify(
+            &self.old_ed,
+            &[ROTATE_TAG, &self.new_ed, &self.new_x].concat(),
+            &self.sig,
+        )
+        .map_err(|_| anyhow!("звено ротации: неверная подпись"))
     }
 
     /// Проводная раскладка (она же — для хранения в `server.json`).
@@ -362,7 +405,12 @@ impl RotationLink {
     pub fn from_bytes(b: &[u8]) -> Result<Self> {
         ensure!(b.len() == LINK_LEN, "звено ротации: длина {}", b.len());
         let mut r = Reader::new(b);
-        Ok(Self { old_ed: r.pub_key()?, new_ed: r.pub_key()?, new_x: r.pub_key()?, sig: r.array()? })
+        Ok(Self {
+            old_ed: r.pub_key()?,
+            new_ed: r.pub_key()?,
+            new_x: r.pub_key()?,
+            sig: r.array()?,
+        })
     }
 
     fn read(r: &mut Reader) -> Result<Self> {
@@ -419,13 +467,24 @@ impl Welcome {
         let server_eph = r.pub_key()?;
         let n = r.u8()? as usize;
         ensure!(n <= MAX_LINKS, "WELCOME: {n} звеньев ротации");
-        let links = (0..n).map(|_| RotationLink::read(&mut r)).collect::<Result<Vec<_>>>()?;
+        let links = (0..n)
+            .map(|_| RotationLink::read(&mut r))
+            .collect::<Result<Vec<_>>>()?;
         let signed_len = r.p;
         let sig = r.array()?;
         r.finish()?;
-        Identity::verify(&server_ed, &welcome_signed(client_ed, client_eph, &body[..signed_len]), &sig)
-            .map_err(|_| anyhow!("WELCOME: неверная подпись"))?;
-        Ok(Self { server_ed, server_x, server_eph, links })
+        Identity::verify(
+            &server_ed,
+            &welcome_signed(client_ed, client_eph, &body[..signed_len]),
+            &sig,
+        )
+        .map_err(|_| anyhow!("WELCOME: неверная подпись"))?;
+        Ok(Self {
+            server_ed,
+            server_x,
+            server_eph,
+            links,
+        })
     }
 }
 
@@ -453,7 +512,9 @@ pub fn resolve_pin(pinned: &[u8; 32], w: &Welcome) -> Result<PinResolution> {
     }
     let chain_ok = |start: usize| -> bool {
         let tail = &w.links[start..];
-        let Some(last) = tail.last() else { return false };
+        let Some(last) = tail.last() else {
+            return false;
+        };
         last.new_ed == w.server_ed
             && last.new_x == w.server_x
             && tail.windows(2).all(|p| p[1].old_ed == p[0].new_ed)
@@ -462,7 +523,9 @@ pub fn resolve_pin(pinned: &[u8; 32], w: &Welcome) -> Result<PinResolution> {
     // Подделать звено от закреплённого ключа может только его владелец,
     // поэтому годится любое вхождение, от которого цепочка верна.
     if (0..w.links.len()).any(|i| w.links[i].old_ed == *pinned && chain_ok(i)) {
-        Ok(PinResolution::Rotated { new_ed: w.server_ed })
+        Ok(PinResolution::Rotated {
+            new_ed: w.server_ed,
+        })
     } else {
         bail!("ключ сервера не совпадает")
     }
@@ -498,19 +561,32 @@ mod tests {
         let ch = enc_challenge(&cookies.make(from, &p1.eph_pub, now));
         let cookie = dec_challenge(&ch).unwrap();
         // 3. Повтор с cookie, тем же eph и invisible.
-        let h2 = Hello3::encode(&client, &c_eph.public(), "alpha", HELLO_FLAG_INVISIBLE, Some(&cookie));
+        let h2 = Hello3::encode(
+            &client,
+            &c_eph.public(),
+            "alpha",
+            HELLO_FLAG_INVISIBLE,
+            Some(&cookie),
+        );
         let p2 = Hello3::decode(&h2).unwrap();
         assert!(cookies.verify(from, &p2.eph_pub, p2.cookie.as_ref().unwrap(), now + 5));
         p2.verify().unwrap();
         assert!(p2.invisible());
-        assert_eq!((p2.ed_pub, p2.x_pub, p2.name.as_str()), (client.ed_pub(), client.x_pub(), "alpha"));
+        assert_eq!(
+            (p2.ed_pub, p2.x_pub, p2.name.as_str()),
+            (client.ed_pub(), client.x_pub(), "alpha")
+        );
         // 4. WELCOME и ключи.
         let s_eph = EphemeralKey::generate();
         let w = Welcome::encode(&server, &s_eph.public(), &[], &p2.ed_pub, &p2.eph_pub);
         let srv = session_keys(Role::Server, &server, &s_eph, &p2.x_pub, &p2.eph_pub).unwrap();
         let wd = Welcome::decode(&w, &client.ed_pub(), &c_eph.public()).unwrap();
-        assert_eq!(resolve_pin(&server.ed_pub(), &wd).unwrap(), PinResolution::Same);
-        let cli = session_keys(Role::Client, &client, &c_eph, &wd.server_x, &wd.server_eph).unwrap();
+        assert_eq!(
+            resolve_pin(&server.ed_pub(), &wd).unwrap(),
+            PinResolution::Same
+        );
+        let cli =
+            session_keys(Role::Client, &client, &c_eph, &wd.server_x, &wd.server_eph).unwrap();
         assert_eq!(cli.tx, srv.rx);
         assert_eq!(cli.rx, srv.tx);
         assert_ne!(cli.tx, cli.rx, "направления разведены");
@@ -519,11 +595,15 @@ mod tests {
         let f = crate::seal_ctrl(&cli.tx, 0, crate::ctrl::CTRL_PING, b"");
         let (t, b) = crate::split_frame(&f).unwrap();
         assert!(crate::open_ctrl(&srv.rx, t, b).is_ok());
-        assert!(crate::open_ctrl(&srv.tx, t, b).is_err(), "свой же ключ направления не подходит");
+        assert!(
+            crate::open_ctrl(&srv.tx, t, b).is_err(),
+            "свой же ключ направления не подходит"
+        );
 
         // Новая попытка с другим eph даёт другие ключи (прямая секретность).
         let c_eph2 = EphemeralKey::generate();
-        let cli2 = session_keys(Role::Client, &client, &c_eph2, &wd.server_x, &wd.server_eph).unwrap();
+        let cli2 =
+            session_keys(Role::Client, &client, &c_eph2, &wd.server_x, &wd.server_eph).unwrap();
         assert_ne!(cli2.tx, cli.tx);
     }
 
@@ -533,7 +613,13 @@ mod tests {
         let server = Identity::generate();
         let eph = EphemeralKey::generate();
         let s_eph = EphemeralKey::generate();
-        let w = Welcome::encode(&server, &s_eph.public(), &[], &client.ed_pub(), &eph.public());
+        let w = Welcome::encode(
+            &server,
+            &s_eph.public(),
+            &[],
+            &client.ed_pub(),
+            &eph.public(),
+        );
         Welcome::decode(&w, &client.ed_pub(), &eph.public()).unwrap();
         let other = EphemeralKey::generate();
         assert!(Welcome::decode(&w, &client.ed_pub(), &other.public()).is_err());
@@ -542,7 +628,10 @@ mod tests {
         for i in 0..w.len() {
             let mut t = w.clone();
             t[i] ^= 0x10;
-            assert!(Welcome::decode(&t, &client.ed_pub(), &eph.public()).is_err(), "байт {i}");
+            assert!(
+                Welcome::decode(&t, &client.ed_pub(), &eph.public()).is_err(),
+                "байт {i}"
+            );
         }
         assert!(Welcome::decode(&w[..w.len() - 1], &client.ed_pub(), &eph.public()).is_err());
         let mut long = w.clone();
@@ -611,15 +700,30 @@ mod tests {
         let c = s.make(a, &eph, t);
         assert!(s.verify(a, &eph, &c, t));
         assert!(s.verify(a, &eph, &c, t + 29), "тот же bucket");
-        assert!(s.verify(a, &eph, &c, t + 59), "следующий bucket — ещё принимается");
+        assert!(
+            s.verify(a, &eph, &c, t + 59),
+            "следующий bucket — ещё принимается"
+        );
         assert!(!s.verify(a, &eph, &c, t + 60), "через два — нет");
         assert!(!s.verify(a, &eph, &c, t - 1), "из будущего bucket'а — нет");
-        assert!(!s.verify(addr("198.51.100.7:5001"), &eph, &c, t), "другой порт");
-        assert!(!s.verify(addr("198.51.100.8:5000"), &eph, &c, t), "другой IP");
+        assert!(
+            !s.verify(addr("198.51.100.7:5001"), &eph, &c, t),
+            "другой порт"
+        );
+        assert!(
+            !s.verify(addr("198.51.100.8:5000"), &eph, &c, t),
+            "другой IP"
+        );
         assert!(!s.verify(a, &[8u8; 32], &c, t), "другой eph");
-        assert!(!CookieSecret::from_bytes([6; 32]).verify(a, &eph, &c, t), "другой секрет");
+        assert!(
+            !CookieSecret::from_bytes([6; 32]).verify(a, &eph, &c, t),
+            "другой секрет"
+        );
         // IPv4 и он же как v4-mapped IPv6 — один cookie; настоящий IPv6 — свой.
-        let mapped = SocketAddr::new(IpAddr::V6(Ipv4Addr::new(198, 51, 100, 7).to_ipv6_mapped()), 5000);
+        let mapped = SocketAddr::new(
+            IpAddr::V6(Ipv4Addr::new(198, 51, 100, 7).to_ipv6_mapped()),
+            5000,
+        );
         assert_eq!(s.make(mapped, &eph, t), c);
         let v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5000);
         assert_ne!(s.make(v6, &eph, t), c);
@@ -639,7 +743,10 @@ mod tests {
         v[0] = 4;
         assert!(dec_challenge(&v).is_err());
         let u = enc_unsupported("обновите клиент");
-        assert_eq!(dec_unsupported(&u).unwrap(), (3, "обновите клиент".to_string()));
+        assert_eq!(
+            dec_unsupported(&u).unwrap(),
+            (3, "обновите клиент".to_string())
+        );
         assert!(dec_unsupported(&u[..3]).is_err());
         assert!(dec_unsupported(&[]).is_err());
     }
@@ -649,8 +756,26 @@ mod tests {
         let id = Identity::generate();
         let eph = EphemeralKey::generate();
         assert!(eph.dh(&[0; 32]).is_err());
-        assert!(session_keys(Role::Client, &id, &eph, &[0; 32], &EphemeralKey::generate().public()).is_err());
-        assert!(session_keys(Role::Client, &id, &eph, &Identity::generate().x_pub(), &[0; 32]).is_err());
+        assert!(
+            session_keys(
+                Role::Client,
+                &id,
+                &eph,
+                &[0; 32],
+                &EphemeralKey::generate().public()
+            )
+            .is_err()
+        );
+        assert!(
+            session_keys(
+                Role::Client,
+                &id,
+                &eph,
+                &Identity::generate().x_pub(),
+                &[0; 32]
+            )
+            .is_err()
+        );
     }
 
     /// Цепочка A → B → C → D; сервер сейчас D.
@@ -662,7 +787,12 @@ mod tests {
 
     fn welcome_from(server: &Identity, links: &[RotationLink]) -> Welcome {
         let (ced, ceph) = ([1u8; 32], [2u8; 32]);
-        Welcome::decode(&Welcome::encode(server, &[3; 32], links, &ced, &ceph), &ced, &ceph).unwrap()
+        Welcome::decode(
+            &Welcome::encode(server, &[3; 32], links, &ced, &ceph),
+            &ced,
+            &ceph,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -677,11 +807,15 @@ mod tests {
         for old in &ids[..3] {
             assert_eq!(
                 resolve_pin(&old.ed_pub(), &w).unwrap(),
-                PinResolution::Rotated { new_ed: cur.ed_pub() }
+                PinResolution::Rotated {
+                    new_ed: cur.ed_pub()
+                }
             );
         }
         // Чужой ключ — ошибка.
-        let err = resolve_pin(&Identity::generate().ed_pub(), &w).unwrap_err().to_string();
+        let err = resolve_pin(&Identity::generate().ed_pub(), &w)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("не совпадает"), "{err}");
         // Без цепочки старый ключ не принимается.
         assert!(resolve_pin(&ids[0].ed_pub(), &welcome_from(cur, &[])).is_err());

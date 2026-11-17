@@ -80,8 +80,11 @@ pub struct GroupSnap {
 
 impl GroupSnap {
     pub fn from_sess(gid: u32, g: &GroupSess, now: Instant) -> Self {
-        let mut members: Vec<PeerSnap> =
-            g.members.values().map(|p| PeerSnap::from_sess(p, now)).collect();
+        let mut members: Vec<PeerSnap> = g
+            .members
+            .values()
+            .map(|p| PeerSnap::from_sess(p, now))
+            .collect();
         members.sort_by_key(|p| p.ip);
         Self {
             gid,
@@ -228,7 +231,10 @@ impl CfgView {
             friends: c
                 .friends
                 .iter()
-                .map(|f| CfgFriend { pubkey: f.pubkey.clone(), alias: f.alias.clone() })
+                .map(|f| CfgFriend {
+                    pubkey: f.pubkey.clone(),
+                    alias: f.alias.clone(),
+                })
                 .collect(),
             autojoin: c.autojoin.clone(),
             invisible: c.invisible,
@@ -254,7 +260,10 @@ impl CfgView {
             friends: self
                 .friends
                 .iter()
-                .map(|f| crate::store::StoredFriend { pubkey: f.pubkey.clone(), alias: f.alias.clone() })
+                .map(|f| crate::store::StoredFriend {
+                    pubkey: f.pubkey.clone(),
+                    alias: f.alias.clone(),
+                })
                 .collect(),
             autojoin: self.autojoin.clone(),
             invisible: self.invisible,
@@ -311,7 +320,12 @@ mod tests {
                 tx_hist: vec![4, 5],
                 uptime_s: 3600,
             },
-            stats: StatsSnap { rx_bytes: 10, tx_bytes: 20, rx_pkts: 1, tx_pkts: 2 },
+            stats: StatsSnap {
+                rx_bytes: 10,
+                tx_bytes: 20,
+                rx_pkts: 1,
+                tx_pkts: 2,
+            },
             cfg: CfgView {
                 name: "alpha".into(),
                 status: String::new(),
@@ -320,7 +334,10 @@ mod tests {
                     pubkey: "ab".repeat(32),
                     label: "дом".into(),
                 }],
-                friends: vec![CfgFriend { pubkey: "cd".repeat(32), alias: "bravo".into() }],
+                friends: vec![CfgFriend {
+                    pubkey: "cd".repeat(32),
+                    alias: "bravo".into(),
+                }],
                 autojoin: vec![7],
                 invisible: true,
             },
@@ -349,11 +366,21 @@ mod tests {
     #[test]
     fn cfg_view_без_identity() {
         let cfg = Config {
-            identity: Some(StoredIdentity { ed_seed: "секрет-ed".into(), x_seed: "секрет-x".into() }),
+            identity: Some(StoredIdentity {
+                ed_seed: "секрет-ed".into(),
+                x_seed: "секрет-x".into(),
+            }),
             name: "alpha".into(),
             status: "st".into(),
-            servers: vec![StoredServer { addr: "a:1".into(), pubkey: "pk".into(), label: "l".into() }],
-            friends: vec![StoredFriend { pubkey: "fp".into(), alias: "f".into() }],
+            servers: vec![StoredServer {
+                addr: "a:1".into(),
+                pubkey: "pk".into(),
+                label: "l".into(),
+            }],
+            friends: vec![StoredFriend {
+                pubkey: "fp".into(),
+                alias: "f".into(),
+            }],
             autojoin: vec![1, 2],
             theme: "dark".into(),
             ..Config::default()

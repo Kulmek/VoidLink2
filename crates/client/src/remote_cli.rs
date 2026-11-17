@@ -115,7 +115,11 @@ impl Session<'_> {
     /// `Req` → `Ack`; отказ демона — ошибка с его текстом.
     fn req(&mut self, cmd: Cmd) -> Result<()> {
         let v = serde_json::to_value(&cmd)?;
-        match self.c.request(v, HANDSHAKE_TIMEOUT).map_err(|e| anyhow!("{e}"))? {
+        match self
+            .c
+            .request(v, HANDSHAKE_TIMEOUT)
+            .map_err(|e| anyhow!("{e}"))?
+        {
             AckResult::Ok => Ok(()),
             AckResult::Err(e) => bail!("{e}"),
         }
@@ -123,7 +127,11 @@ impl Session<'_> {
 
     /// Ждёт событие, для которого `f` вернёт `Some`. `Event::Error` (если `f`
     /// его не разобрал) — ошибка. `None` — таймаут.
-    fn wait<T>(&mut self, timeout: Duration, mut f: impl FnMut(&Event) -> Option<Result<T>>) -> Result<Option<T>> {
+    fn wait<T>(
+        &mut self,
+        timeout: Duration,
+        mut f: impl FnMut(&Event) -> Option<Result<T>>,
+    ) -> Result<Option<T>> {
         let deadline = Instant::now() + timeout;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -132,7 +140,9 @@ impl Session<'_> {
             }
             match self.c.recv(Some(left)) {
                 Ok(DaemonMsg::Event { ev, .. }) => {
-                    let Ok(ev) = serde_json::from_value::<Event>(ev) else { continue };
+                    let Ok(ev) = serde_json::from_value::<Event>(ev) else {
+                        continue;
+                    };
                     if let Some(r) = f(&ev) {
                         return r.map(Some);
                     }
@@ -199,7 +209,11 @@ fn gid_arg(v: Option<&String>) -> Result<u32> {
 }
 
 fn server_idx(cfg: &Config, tok: &str) -> Option<usize> {
-    if let Some(i) = cfg.servers.iter().position(|s| s.addr == tok || (!s.label.is_empty() && s.label == tok)) {
+    if let Some(i) = cfg
+        .servers
+        .iter()
+        .position(|s| s.addr == tok || (!s.label.is_empty() && s.label == tok))
+    {
         return Some(i);
     }
     tok.parse::<usize>().ok().filter(|n| *n < cfg.servers.len())
@@ -225,8 +239,24 @@ pub fn run(c: &mut IpcClient, cmd: &str, rest: &[String], out: &mut dyn Write) -
             writeln!(out, "friend code: {} (identity демона)", me.my_code)?;
             writeln!(out, "ed25519 pub: {}", proto::hex_of(&me.my_pub))?;
             let cfg = &s.snap.cfg;
-            writeln!(out, "name:        {}", if cfg.name.is_empty() { "(не задано)" } else { &cfg.name })?;
-            writeln!(out, "status:      {}", if cfg.status.is_empty() { "(не задано)" } else { &cfg.status })?;
+            writeln!(
+                out,
+                "name:        {}",
+                if cfg.name.is_empty() {
+                    "(не задано)"
+                } else {
+                    &cfg.name
+                }
+            )?;
+            writeln!(
+                out,
+                "status:      {}",
+                if cfg.status.is_empty() {
+                    "(не задано)"
+                } else {
+                    &cfg.status
+                }
+            )?;
         }
         "set-name" => {
             let name = rest.join(" ");
@@ -251,36 +281,64 @@ pub fn run(c: &mut IpcClient, cmd: &str, rest: &[String], out: &mut dyn Write) -
             };
             s.req(Cmd::SetInvisible(on))?;
             s.until("невидимка", |x| x.cfg.invisible == on)?;
-            writeln!(out, "невидимка {}", if on { "включена" } else { "выключена" })?;
+            writeln!(
+                out,
+                "невидимка {}",
+                if on {
+                    "включена"
+                } else {
+                    "выключена"
+                }
+            )?;
         }
         "add-server" => {
             let usage = "usage: add-server <addr> <code> [label]";
             let addr = rest.first().context(usage)?;
             let code = rest.get(1).context(usage)?;
-            addr.parse::<SocketAddr>().context("addr должен быть ip:port")?;
+            addr.parse::<SocketAddr>()
+                .context("addr должен быть ip:port")?;
             let pubkey = proto::Identity::parse_friend_code(code)?;
             let label = rest.get(2).cloned().unwrap_or_default();
             if s.snap.cfg.servers.iter().any(|x| x.addr == *addr) {
                 bail!("сервер {addr} уже добавлен");
             }
-            s.req(Cmd::AddServer { addr: addr.clone(), pubkey, label })?;
-            s.until("сервер в конфиге", |x| x.cfg.servers.iter().any(|v| v.addr == *addr))?;
+            s.req(Cmd::AddServer {
+                addr: addr.clone(),
+                pubkey,
+                label,
+            })?;
+            s.until("сервер в конфиге", |x| {
+                x.cfg.servers.iter().any(|v| v.addr == *addr)
+            })?;
             writeln!(out, "сервер {addr} добавлен (pubkey закреплён)")?;
         }
         "servers" => {
             if s.snap.cfg.servers.is_empty() {
-                writeln!(out, "(нет серверов; добавь: add-server <addr> <code> [label])")?;
+                writeln!(
+                    out,
+                    "(нет серверов; добавь: add-server <addr> <code> [label])"
+                )?;
             }
             for (n, x) in s.snap.cfg.servers.iter().enumerate() {
-                writeln!(out, "{}: {} {} [{}]", n, x.addr, if x.label.is_empty() { "-" } else { &x.label }, x.pubkey)?;
+                writeln!(
+                    out,
+                    "{}: {} {} [{}]",
+                    n,
+                    x.addr,
+                    if x.label.is_empty() { "-" } else { &x.label },
+                    x.pubkey
+                )?;
             }
         }
         "del-server" => {
             let tok = rest.first().context("usage: del-server <N|addr|label>")?;
-            let idx = server_idx(&s.cfg(), tok).with_context(|| format!("сервер {tok:?} не найден"))?;
+            let idx =
+                server_idx(&s.cfg(), tok).with_context(|| format!("сервер {tok:?} не найден"))?;
             let gone = s.snap.cfg.servers[idx].addr.clone();
             s.req(Cmd::DelServer { idx })?;
-            s.until("сервер удалён", |x| !x.cfg.servers.iter().any(|v| v.addr == gone))?;
+            s.until("сервер удалён", |x| {
+                !x.cfg.servers.iter().any(|v| v.addr == gone)
+            })?;
             writeln!(out, "удалено")?;
         }
         "groups" => {
@@ -306,7 +364,12 @@ pub fn run(c: &mut IpcClient, cmd: &str, rest: &[String], out: &mut dyn Write) -
         }
         "create" => {
             let private = rest.iter().any(|a| a == "--private");
-            let name: String = rest.iter().filter(|a| *a != "--private").cloned().collect::<Vec<_>>().join(" ");
+            let name: String = rest
+                .iter()
+                .filter(|a| *a != "--private")
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" ");
             if name.trim().is_empty() {
                 bail!("usage: create <имя> [--private]");
             }
@@ -314,35 +377,63 @@ pub fn run(c: &mut IpcClient, cmd: &str, rest: &[String], out: &mut dyn Write) -
             s.req(Cmd::Create { name, private })?;
             let (gid, name, ip) = s
                 .wait(REPLY_WAIT, |e| match e {
-                    Event::GroupJoined { gid, name, my_ip } if !known.contains(gid) => Some(Ok((*gid, name.clone(), *my_ip))),
+                    Event::GroupJoined { gid, name, my_ip } if !known.contains(gid) => {
+                        Some(Ok((*gid, name.clone(), *my_ip)))
+                    }
                     _ => None,
                 })?
                 .context("сервер не ответил — группа могла не создаться")?;
-            writeln!(out, "группа {gid} \"{name}\" создана, мой IP {} (autojoin — у демона)", proto::ip_str(ip))?;
+            writeln!(
+                out,
+                "группа {gid} \"{name}\" создана, мой IP {} (autojoin — у демона)",
+                proto::ip_str(ip)
+            )?;
         }
         "join" => {
             let gid = gid_arg(rest.first())?;
             s.req(Cmd::Join(gid))?;
             let (name, ip) = s
                 .wait(REPLY_WAIT, |e| match e {
-                    Event::GroupJoined { gid: g, name, my_ip } if *g == gid => Some(Ok((name.clone(), *my_ip))),
-                    Event::GroupDeleted { gid: g, .. } if *g == gid => Some(Err(anyhow!("группа {gid} удалена"))),
+                    Event::GroupJoined {
+                        gid: g,
+                        name,
+                        my_ip,
+                    } if *g == gid => Some(Ok((name.clone(), *my_ip))),
+                    Event::GroupDeleted { gid: g, .. } if *g == gid => {
+                        Some(Err(anyhow!("группа {gid} удалена")))
+                    }
                     _ => None,
                 })?
-                .or_else(|| s.snap.groups.iter().find(|g| g.gid == gid).map(|g| (g.name.clone(), g.my_ip)))
+                .or_else(|| {
+                    s.snap
+                        .groups
+                        .iter()
+                        .find(|g| g.gid == gid)
+                        .map(|g| (g.name.clone(), g.my_ip))
+                })
                 .context("сервер не ответил — повторите")?;
-            writeln!(out, "вошёл в {gid} \"{name}\", мой IP {} (autojoin — у демона)", proto::ip_str(ip))?;
+            writeln!(
+                out,
+                "вошёл в {gid} \"{name}\", мой IP {} (autojoin — у демона)",
+                proto::ip_str(ip)
+            )?;
         }
         "leave" => {
             let gid = gid_arg(rest.first())?;
             s.req(Cmd::Leave(gid))?;
-            s.wait_quiet(QUIET_WAIT, |e| matches!(e, Event::GroupLeft { gid: g, .. } if *g == gid))?;
+            s.wait_quiet(
+                QUIET_WAIT,
+                |e| matches!(e, Event::GroupLeft { gid: g, .. } if *g == gid),
+            )?;
             writeln!(out, "вышел из {gid} (autojoin снят)")?;
         }
         "delete" => {
             let gid = gid_arg(rest.first())?;
             s.req(Cmd::Delete(gid))?;
-            s.wait_quiet(QUIET_WAIT, |e| matches!(e, Event::GroupDeleted { gid: g, .. } if *g == gid))?;
+            s.wait_quiet(
+                QUIET_WAIT,
+                |e| matches!(e, Event::GroupDeleted { gid: g, .. } if *g == gid),
+            )?;
             writeln!(out, "группа {gid} удалена")?;
         }
         "rename" => {
@@ -357,7 +448,9 @@ pub fn run(c: &mut IpcClient, cmd: &str, rest: &[String], out: &mut dyn Write) -
         }
         "invite" | "kick" | "ban" | "unban" | "transfer" => {
             let gid = gid_arg(rest.first())?;
-            let peer = rest.get(1).with_context(|| format!("usage: {cmd} <gid> <peer (code|hex|alias)>"))?;
+            let peer = rest
+                .get(1)
+                .with_context(|| format!("usage: {cmd} <gid> <peer (code|hex|alias)>"))?;
             let pk = store::resolve_peer(&s.cfg(), peer)?;
             let c = match cmd {
                 "invite" => Cmd::Invite(gid, pk),
@@ -377,7 +470,9 @@ pub fn run(c: &mut IpcClient, cmd: &str, rest: &[String], out: &mut dyn Write) -
             } else {
                 for i in &s.snap.pending_invites {
                     let from = friend_name(&cfg, &i.from_pubkey, &i.from_name);
-                    let exp = i.expires_in_s.map(|x| engine::fmt_secs(x.min(u64::from(u32::MAX)) as u32));
+                    let exp = i
+                        .expires_in_s
+                        .map(|x| engine::fmt_secs(x.min(u64::from(u32::MAX)) as u32));
                     writeln!(
                         out,
                         "{:>4}  {:<20} от {from} (истекает через {})",
@@ -404,7 +499,9 @@ pub fn run(c: &mut IpcClient, cmd: &str, rest: &[String], out: &mut dyn Write) -
             s.req(Cmd::FriendGroups(pk))?;
             let items = s
                 .wait(REPLY_WAIT, |e| match e {
-                    Event::FriendGroups { pubkey, items } if *pubkey == pk => Some(Ok(items.clone())),
+                    Event::FriendGroups { pubkey, items } if *pubkey == pk => {
+                        Some(Ok(items.clone()))
+                    }
                     _ => None,
                 })?
                 .context("сервер не ответил — повторите")?;
@@ -427,13 +524,25 @@ pub fn run(c: &mut IpcClient, cmd: &str, rest: &[String], out: &mut dyn Write) -
             s.req(Cmd::GroupAdmin(gid))?;
             let (bans, invites) = s
                 .wait(REPLY_WAIT, |e| match e {
-                    Event::AdminInfo { gid: g, bans, invites } if *g == gid => Some(Ok((bans.clone(), invites.clone()))),
+                    Event::AdminInfo {
+                        gid: g,
+                        bans,
+                        invites,
+                    } if *g == gid => Some(Ok((bans.clone(), invites.clone()))),
                     _ => None,
                 })?
                 .context("сервер не ответил — повторите")?;
             let cfg = s.cfg();
             let who = |pk: &[u8; 32], name: &str| {
-                let shown = friend_name(&cfg, pk, if name.is_empty() { "(без имени)" } else { name });
+                let shown = friend_name(
+                    &cfg,
+                    pk,
+                    if name.is_empty() {
+                        "(без имени)"
+                    } else {
+                        name
+                    },
+                );
                 format!("{shown:<20} {}", proto::friend_code_of(pk))
             };
             writeln!(out, "баны группы {gid}:")?;
@@ -448,20 +557,38 @@ pub fn run(c: &mut IpcClient, cmd: &str, rest: &[String], out: &mut dyn Write) -
                 writeln!(out, "  (нет)")?;
             }
             for (pk, name, exp) in &invites {
-                writeln!(out, "  {}  истекает через {}", who(pk, name), engine::fmt_secs(*exp))?;
+                writeln!(
+                    out,
+                    "  {}  истекает через {}",
+                    who(pk, name),
+                    engine::fmt_secs(*exp)
+                )?;
             }
-            writeln!(out, "снять бан: unban {gid} <peer> · отозвать приглашение: kick {gid} <peer>")?;
+            writeln!(
+                out,
+                "снять бан: unban {gid} <peer> · отозвать приглашение: kick {gid} <peer>"
+            )?;
         }
         "add-friend" => {
             let code = rest.first().context("usage: add-friend <code> [alias]")?;
             let pubkey = proto::Identity::parse_friend_code(code)?;
             let alias = rest.get(1).cloned().unwrap_or_else(|| code.clone());
-            if s.snap.cfg.friends.iter().any(|f| f.pubkey == proto::hex_of(&pubkey)) {
+            if s.snap
+                .cfg
+                .friends
+                .iter()
+                .any(|f| f.pubkey == proto::hex_of(&pubkey))
+            {
                 bail!("друг уже добавлен");
             }
-            s.req(Cmd::AddFriend { pubkey, alias: alias.clone() })?;
+            s.req(Cmd::AddFriend {
+                pubkey,
+                alias: alias.clone(),
+            })?;
             let hex = proto::hex_of(&pubkey);
-            s.until("друг в конфиге", |x| x.cfg.friends.iter().any(|f| f.pubkey == hex))?;
+            s.until("друг в конфиге", |x| {
+                x.cfg.friends.iter().any(|f| f.pubkey == hex)
+            })?;
             writeln!(out, "друг добавлен: {alias} ({})", proto::hex_of(&pubkey))?;
         }
         "del-friend" => {
@@ -481,7 +608,9 @@ pub fn run(c: &mut IpcClient, cmd: &str, rest: &[String], out: &mut dyn Write) -
                 s.req(Cmd::DelFriend(*pk))?;
             }
             let hexes: Vec<String> = pks.iter().map(|pk| proto::hex_of(pk)).collect();
-            s.until("друг удалён", |x| !x.cfg.friends.iter().any(|f| hexes.contains(&f.pubkey)))?;
+            s.until("друг удалён", |x| {
+                !x.cfg.friends.iter().any(|f| hexes.contains(&f.pubkey))
+            })?;
             writeln!(out, "удалён")?;
         }
         "alias" => {
@@ -494,14 +623,26 @@ pub fn run(c: &mut IpcClient, cmd: &str, rest: &[String], out: &mut dyn Write) -
             let cfg = s.cfg();
             let pk = store::resolve_peer(&cfg, peer)?;
             let hex = proto::hex_of(&pk);
-            if cfg.friends.iter().any(|f| f.alias == name && f.pubkey != hex) {
+            if cfg
+                .friends
+                .iter()
+                .any(|f| f.alias == name && f.pubkey != hex)
+            {
                 bail!("имя {name:?} уже занято другим другом");
             }
             if !cfg.friends.iter().any(|f| f.pubkey == hex) {
                 bail!("друг {peer:?} не найден");
             }
-            s.req(Cmd::SetAlias { pubkey: pk, alias: name.clone() })?;
-            s.until("алиас", |x| x.cfg.friends.iter().any(|f| f.pubkey == hex && f.alias == name))?;
+            s.req(Cmd::SetAlias {
+                pubkey: pk,
+                alias: name.clone(),
+            })?;
+            s.until("алиас", |x| {
+                x.cfg
+                    .friends
+                    .iter()
+                    .any(|f| f.pubkey == hex && f.alias == name)
+            })?;
             writeln!(out, "друг переименован: {name}")?;
         }
         "friends" => {
@@ -512,7 +653,9 @@ pub fn run(c: &mut IpcClient, cmd: &str, rest: &[String], out: &mut dyn Write) -
                 writeln!(out, "{:<16} {}", f.alias, f.pubkey)?;
             }
         }
-        "run" => bail!("туннель уже поднят демоном — второй движок с той же identity выбил бы его с сервера"),
+        "run" => bail!(
+            "туннель уже поднят демоном — второй движок с той же identity выбил бы его с сервера"
+        ),
         "set-transport" | "set-mtu" | "dns" | "import-identity" => bail!(
             "{cmd}: при работающем демоне недоступно — это настройка движка демона, IPC-команды для неё нет \
 (остановите демон и повторите)"

@@ -22,10 +22,10 @@
 //!   спецификации). Прямая секретность — только у ctrl-канала.
 //! * Кодеки payload'ов — в [`payloads`].
 
-use anyhow::{anyhow, ensure, Result};
+use anyhow::{Result, anyhow, ensure};
 use chacha20poly1305::{
-    aead::{Aead, KeyInit, Payload},
     ChaCha20Poly1305, Nonce,
+    aead::{Aead, KeyInit, Payload},
 };
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use rand::Rng;
@@ -39,10 +39,10 @@ pub mod replay;
 #[cfg(test)]
 mod fuzz_tests;
 
-pub use frag::{Reassembler, FRAG_MAX_COUNT, FRAG_MAX_PAYLOAD, FRAG_THRESHOLD};
+pub use frag::{FRAG_MAX_COUNT, FRAG_MAX_PAYLOAD, FRAG_THRESHOLD, Reassembler};
 pub use handshake::{
-    resolve_pin, session_keys, CookieSecret, DirKeys, EphemeralKey, Hello3, PinResolution, Role,
-    RotationLink, SessionKeys, Welcome,
+    CookieSecret, DirKeys, EphemeralKey, Hello3, PinResolution, Role, RotationLink, SessionKeys,
+    Welcome, resolve_pin, session_keys,
 };
 pub use replay::ReplayWindow;
 
@@ -139,7 +139,10 @@ pub mod ctrl {
     /// Фреймы, которые ходят открытым текстом (всё прочее — шифрованные ctrl
     /// или фреймы группы).
     pub fn is_plaintext(typ: u8) -> bool {
-        matches!(typ, HELLO | HELLO3 | WELCOME | CHALLENGE | RESET | UNSUPPORTED)
+        matches!(
+            typ,
+            HELLO | HELLO3 | WELCOME | CHALLENGE | RESET | UNSUPPORTED
+        )
     }
 }
 
@@ -201,7 +204,10 @@ impl Identity {
     /// ошибка: пир прислал точку малого порядка, общий секрет предсказуем.
     pub fn dh(&self, peer_x_pub: &[u8; 32]) -> Result<[u8; 32]> {
         let shared = StaticSecret::from(self.x_seed).diffie_hellman(&PublicKey::from(*peer_x_pub));
-        ensure!(shared.was_contributory(), "x25519: ключ пира малого порядка");
+        ensure!(
+            shared.was_contributory(),
+            "x25519: ключ пира малого порядка"
+        );
         Ok(shared.to_bytes())
     }
 
@@ -420,7 +426,13 @@ pub fn seal_ctrl(key: &SymKey, counter: u64, typ: u8, payload: &[u8]) -> Vec<u8>
     assert!(payload.len() <= MAX_CTRL_PAYLOAD, "ctrl payload too long");
     let hdr = frame_header(typ, COUNTER_LEN + payload.len() + TAG_LEN);
     let ct = cipher(key)
-        .encrypt(&ctrl_nonce(counter), Payload { msg: payload, aad: &hdr })
+        .encrypt(
+            &ctrl_nonce(counter),
+            Payload {
+                msg: payload,
+                aad: &hdr,
+            },
+        )
         .expect("ctrl encrypt");
     let mut out = Vec::with_capacity(HDR_LEN + COUNTER_LEN + ct.len());
     out.extend_from_slice(&hdr);
@@ -449,7 +461,13 @@ pub fn open_ctrl(key: &SymKey, typ: u8, body: &[u8]) -> Result<(u64, Vec<u8>)> {
     let counter = read_counter(body);
     let hdr = frame_header(typ, body.len());
     let pt = cipher(key)
-        .decrypt(&ctrl_nonce(counter), Payload { msg: &body[COUNTER_LEN..], aad: &hdr })
+        .decrypt(
+            &ctrl_nonce(counter),
+            Payload {
+                msg: &body[COUNTER_LEN..],
+                aad: &hdr,
+            },
+        )
         .map_err(|_| anyhow!("ctrl decrypt failed"))?;
     Ok((counter, pt))
 }
@@ -481,7 +499,12 @@ impl GroupHeader {
 
     fn from_bytes(b: &[u8]) -> Self {
         let u = |i: usize| u32::from_be_bytes(b[i..i + 4].try_into().unwrap());
-        Self { gid: u(0), src: u(4), dst: u(8), epoch: u(12) }
+        Self {
+            gid: u(0),
+            src: u(4),
+            dst: u(8),
+            epoch: u(12),
+        }
     }
 }
 
@@ -497,7 +520,10 @@ fn group_nonce(src: u32, counter: u64) -> Nonce {
 /// релей не пересылал заведомый мусор. Тип не проверяется (`grp::is_group`).
 pub fn parse_group_header(datagram: &[u8]) -> Result<(u8, GroupHeader)> {
     let (typ, body) = split_frame(datagram)?;
-    ensure!(body.len() >= GRP_HDR_LEN + COUNTER_LEN + TAG_LEN, "group frame too short");
+    ensure!(
+        body.len() >= GRP_HDR_LEN + COUNTER_LEN + TAG_LEN,
+        "group frame too short"
+    );
     Ok((typ, GroupHeader::from_bytes(&body[..GRP_HDR_LEN])))
 }
 
@@ -507,12 +533,20 @@ pub fn parse_group_header(datagram: &[u8]) -> Result<(u8, GroupHeader)> {
 /// (gid, epoch). Payload длиннее `MAX_GROUP_PAYLOAD` — паника.
 pub fn seal_group(key: &SymKey, typ: u8, h: &GroupHeader, counter: u64, payload: &[u8]) -> Vec<u8> {
     assert!(payload.len() <= MAX_GROUP_PAYLOAD, "group payload too long");
-    let mut out =
-        Vec::with_capacity(HDR_LEN + GRP_HDR_LEN + COUNTER_LEN + payload.len() + TAG_LEN);
-    out.extend_from_slice(&frame_header(typ, GRP_HDR_LEN + COUNTER_LEN + payload.len() + TAG_LEN));
+    let mut out = Vec::with_capacity(HDR_LEN + GRP_HDR_LEN + COUNTER_LEN + payload.len() + TAG_LEN);
+    out.extend_from_slice(&frame_header(
+        typ,
+        GRP_HDR_LEN + COUNTER_LEN + payload.len() + TAG_LEN,
+    ));
     out.extend_from_slice(&h.to_bytes());
     let ct = cipher(key)
-        .encrypt(&group_nonce(h.src, counter), Payload { msg: payload, aad: &out })
+        .encrypt(
+            &group_nonce(h.src, counter),
+            Payload {
+                msg: payload,
+                aad: &out,
+            },
+        )
         .expect("group encrypt");
     out.extend_from_slice(&counter.to_le_bytes());
     out.extend_from_slice(&ct);
@@ -528,7 +562,13 @@ pub fn open_group(key: &SymKey, datagram: &[u8]) -> Result<(u8, GroupHeader, u64
     let rest = &datagram[HDR_LEN + GRP_HDR_LEN..];
     let counter = read_counter(rest);
     let pt = cipher(key)
-        .decrypt(&group_nonce(h.src, counter), Payload { msg: &rest[COUNTER_LEN..], aad })
+        .decrypt(
+            &group_nonce(h.src, counter),
+            Payload {
+                msg: &rest[COUNTER_LEN..],
+                aad,
+            },
+        )
         .map_err(|_| anyhow!("group decrypt failed"))?;
     Ok((typ, h, counter, pt))
 }
@@ -693,7 +733,11 @@ mod tests {
         let a = Identity::generate();
         let pk = a.ed_pub();
         let code = a.friend_code();
-        assert_eq!(code.len(), 4 + FRIEND_CODE_CHARS + 6, "TUN- + 52 символа + 6 дефисов");
+        assert_eq!(
+            code.len(),
+            4 + FRIEND_CODE_CHARS + 6,
+            "TUN- + 52 символа + 6 дефисов"
+        );
         // Перевод строки и пробелы из буфера обмена, нижний регистр.
         assert_eq!(parse_friend_code(&format!("  {code}\r\n")).unwrap(), pk);
         assert_eq!(parse_friend_code(&code.to_lowercase()).unwrap(), pk);
@@ -729,7 +773,10 @@ mod tests {
 
     #[test]
     fn hex_туда_обратно_и_мусор_без_паники() {
-        assert_eq!(hex_to_bytes(&hex_of(&[0, 1, 0xab, 0xff])).unwrap(), vec![0, 1, 0xab, 0xff]);
+        assert_eq!(
+            hex_to_bytes(&hex_of(&[0, 1, 0xab, 0xff])).unwrap(),
+            vec![0, 1, 0xab, 0xff]
+        );
         assert!(hex_to_bytes("abc").is_err());
         assert!(hex_to_bytes("zz").is_err());
         // Многобайтовый UTF-8 не режется посреди символа.
@@ -774,20 +821,30 @@ mod tests {
         for i in 0..HDR_LEN {
             let mut t = frame.clone();
             t[i] ^= 0x80;
-            let ok = split_frame(&t).and_then(|(ty, b)| open_ctrl(&key, ty, b)).is_ok();
+            let ok = split_frame(&t)
+                .and_then(|(ty, b)| open_ctrl(&key, ty, b))
+                .is_ok();
             assert!(!ok, "заголовок {i}");
         }
         // Обрезка.
         assert!(open_ctrl(&key, typ, &body[..COUNTER_LEN + TAG_LEN - 1]).is_err());
         assert!(ctrl_counter(&body[..3]).is_none());
         // Nonce: 4 нуля || counter LE.
-        assert_eq!(ctrl_nonce(0x0102).as_slice(), &[0, 0, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            ctrl_nonce(0x0102).as_slice(),
+            &[0, 0, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0]
+        );
     }
 
     #[test]
     fn group_туда_обратно_и_tamper() {
         let key = [42u8; 32];
-        let h = GroupHeader { gid: 7, src: 0x6442_0702, dst: 0x6442_0703, epoch: 9 };
+        let h = GroupHeader {
+            gid: 7,
+            src: 0x6442_0702,
+            dst: 0x6442_0703,
+            epoch: 9,
+        };
         let g = seal_group(&key, grp::DATA, &h, 5, b"data");
         assert_eq!(g.len(), HDR_LEN + GRP_HDR_LEN + COUNTER_LEN + 4 + TAG_LEN);
         assert_eq!(parse_group_header(&g).unwrap(), (grp::DATA, h));
@@ -813,7 +870,10 @@ mod tests {
         assert!(parse_group_header(&short).is_err());
         assert!(open_group(&key, &short).is_err());
         // Nonce: src BE || counter LE.
-        assert_eq!(group_nonce(0x0A0B0C0D, 1).as_slice(), &[10, 11, 12, 13, 1, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            group_nonce(0x0A0B0C0D, 1).as_slice(),
+            &[10, 11, 12, 13, 1, 0, 0, 0, 0, 0, 0, 0]
+        );
     }
 
     #[test]
@@ -827,12 +887,44 @@ mod tests {
     fn типы_не_пересекаются() {
         use crate::ctrl::*;
         let all = [
-            HELLO, CREATE_GROUP, LIST_GROUPS, JOIN_GROUP, LEAVE_GROUP, INVITE, KICK, BAN,
-            RENAME_GROUP, DELETE_GROUP, STATUS, CTRL_PING, FRIEND_GROUPS, DECLINE_INVITE,
-            LIST_INVITES, HELLO3, GET_GROUP, UNBAN, GROUP_ADMIN, TRANSFER_OWNER, CANDIDATES,
-            PRESENCE, WELCOME, GROUP_STATE, GROUP_LIST, GROUP_UPDATE, INVITE_RCVD, ERROR,
-            INVITE_DECLINED, INVITE_LIST, KICKED, ADMIN_INFO, CHALLENGE, CTRL_PONG,
-            FRIEND_GROUPS_RESP, RESET, FRAG, UNSUPPORTED,
+            HELLO,
+            CREATE_GROUP,
+            LIST_GROUPS,
+            JOIN_GROUP,
+            LEAVE_GROUP,
+            INVITE,
+            KICK,
+            BAN,
+            RENAME_GROUP,
+            DELETE_GROUP,
+            STATUS,
+            CTRL_PING,
+            FRIEND_GROUPS,
+            DECLINE_INVITE,
+            LIST_INVITES,
+            HELLO3,
+            GET_GROUP,
+            UNBAN,
+            GROUP_ADMIN,
+            TRANSFER_OWNER,
+            CANDIDATES,
+            PRESENCE,
+            WELCOME,
+            GROUP_STATE,
+            GROUP_LIST,
+            GROUP_UPDATE,
+            INVITE_RCVD,
+            ERROR,
+            INVITE_DECLINED,
+            INVITE_LIST,
+            KICKED,
+            ADMIN_INFO,
+            CHALLENGE,
+            CTRL_PONG,
+            FRIEND_GROUPS_RESP,
+            RESET,
+            FRAG,
+            UNSUPPORTED,
         ];
         let uniq: std::collections::HashSet<u8> = all.iter().copied().collect();
         assert_eq!(uniq.len(), all.len());

@@ -55,12 +55,16 @@ impl Endpoint {
     pub fn for_data_dir(dir: &Path) -> Endpoint {
         #[cfg(unix)]
         {
-            Endpoint { path: dir.join(tunnel_ipc::transport::DEFAULT_SOCKET_FILE) }
+            Endpoint {
+                path: dir.join(tunnel_ipc::transport::DEFAULT_SOCKET_FILE),
+            }
         }
         #[cfg(windows)]
         {
             let _ = dir;
-            Endpoint { name: tunnel_ipc::transport::DEFAULT_PIPE_NAME.to_string() }
+            Endpoint {
+                name: tunnel_ipc::transport::DEFAULT_PIPE_NAME.to_string(),
+            }
         }
     }
 
@@ -97,13 +101,24 @@ impl Endpoint {
         let r = tunnel_ipc::connect(&self.name);
         match r {
             Ok(c) => Ok(Some(c)),
-            Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused) => Ok(None),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                Ok(None)
+            }
             Err(e) => Err(e),
         }
     }
 
     /// Подключение с `Hello`. `Ok(None)` — демона нет (см. [`Endpoint::open`]).
-    pub fn connect(&self, kind: ClientKind, timeout: Duration) -> Result<Option<IpcClient>, ClientError> {
+    pub fn connect(
+        &self,
+        kind: ClientKind,
+        timeout: Duration,
+    ) -> Result<Option<IpcClient>, ClientError> {
         match self.open().map_err(ClientError::Connect)? {
             None => Ok(None),
             Some(conn) => IpcClient::handshake(conn, kind, CLIENT_VER, timeout).map(Some),
@@ -183,14 +198,20 @@ pub struct IpcEngine {
 /// `{"engine": null, …}` — это не снимок.
 fn parse_snapshot(v: serde_json::Value) -> Result<Snapshot, String> {
     if v.get("engine").is_some() {
-        let why = v.get("error").and_then(|e| e.as_str()).unwrap_or("движок не запущен");
+        let why = v
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("движок не запущен");
         return Err(format!("демон работает без движка: {why}"));
     }
     serde_json::from_value(v).map_err(|e| format!("неверный снимок демона: {e}"))
 }
 
 /// `Subscribe` и чтение до первого снимка: события до него — история кольца.
-pub(crate) fn subscribe(c: &mut IpcClient, timeout: Duration) -> Result<(Snapshot, Vec<Event>), String> {
+pub(crate) fn subscribe(
+    c: &mut IpcClient,
+    timeout: Duration,
+) -> Result<(Snapshot, Vec<Event>), String> {
     c.subscribe(SNAPSHOTS_MS).map_err(|e| e.to_string())?;
     let deadline = Instant::now() + timeout;
     let mut history = Vec::new();
@@ -222,7 +243,8 @@ impl IpcEngine {
             Ok(None) => bail!("демон не запущен ({})", ep.describe()),
             Err(e) => bail!("{e}"),
         };
-        let me = Me::from_json(c.me()).ok_or_else(|| anyhow!("демон не сообщил identity (me: {})", c.me()))?;
+        let me = Me::from_json(c.me())
+            .ok_or_else(|| anyhow!("демон не сообщил identity (me: {})", c.me()))?;
         let (snap, history) = subscribe(&mut c, HANDSHAKE_TIMEOUT).map_err(|e| anyhow!(e))?;
         let shared = Arc::new(Shared {
             snap: Mutex::new(Arc::new(snap)),
@@ -236,7 +258,13 @@ impl IpcEngine {
         let worker = std::thread::Builder::new()
             .name("ipc-engine".into())
             .spawn(move || worker(c, ep2, me2, sh, rx))?;
-        Ok(IpcEngine { me, shared, cmds: Mutex::new(tx), worker: Some(worker), ui_dir })
+        Ok(IpcEngine {
+            me,
+            shared,
+            cmds: Mutex::new(tx),
+            worker: Some(worker),
+            ui_dir,
+        })
     }
 }
 
@@ -256,7 +284,9 @@ fn worker(c: IpcClient, ep: Endpoint, me: Me, sh: Arc<Shared>, cmds: Receiver<Cm
             // Команды, пришедшие без связи, не отправлены — сказать.
             loop {
                 match cmds.try_recv() {
-                    Ok(_) => sh.push(Event::Error(format!("{DAEMON_DOWN} — команда не отправлена"))),
+                    Ok(_) => sh.push(Event::Error(format!(
+                        "{DAEMON_DOWN} — команда не отправлена"
+                    ))),
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => return,
                 }
@@ -268,7 +298,9 @@ fn worker(c: IpcClient, ep: Endpoint, me: Me, sh: Arc<Shared>, cmds: Receiver<Cm
             next_try = Instant::now() + RECONNECT_EVERY;
             if let Ok(Some(mut c)) = ep.connect(ClientKind::Tui, HANDSHAKE_TIMEOUT) {
                 if Me::from_json(c.me()).as_ref() != Some(&me) {
-                    sh.push(Event::Error("демон работает с другой identity — перезапустите TUI".into()));
+                    sh.push(Event::Error(
+                        "демон работает с другой identity — перезапустите TUI".into(),
+                    ));
                 }
                 if let Ok((snap, _seen)) = subscribe(&mut c, HANDSHAKE_TIMEOUT) {
                     *lock(&sh.snap) = Arc::new(snap);
@@ -284,9 +316,13 @@ fn worker(c: IpcClient, ep: Endpoint, me: Me, sh: Arc<Shared>, cmds: Receiver<Cm
             match cmds.try_recv() {
                 Ok(Cmd::Quit) => {}
                 Ok(cmd) => {
-                    let sent = serde_json::to_value(&cmd).map_err(|e| e.to_string()).and_then(|v| c.send_req(v).map_err(|e| e.to_string()));
+                    let sent = serde_json::to_value(&cmd)
+                        .map_err(|e| e.to_string())
+                        .and_then(|v| c.send_req(v).map_err(|e| e.to_string()));
                     if sent.is_err() {
-                        sh.push(Event::Error(format!("{DAEMON_DOWN} — команда не отправлена")));
+                        sh.push(Event::Error(format!(
+                            "{DAEMON_DOWN} — команда не отправлена"
+                        )));
                         lost = true;
                         break;
                     }
@@ -310,7 +346,10 @@ fn worker(c: IpcClient, ep: Endpoint, me: Me, sh: Arc<Shared>, cmds: Receiver<Cm
                         *lock(&sh.snap) = Arc::new(s);
                     }
                 }
-                Ok(DaemonMsg::Ack { result: AckResult::Err(e), .. }) => sh.push(Event::Error(e)),
+                Ok(DaemonMsg::Ack {
+                    result: AckResult::Err(e),
+                    ..
+                }) => sh.push(Event::Error(e)),
                 Ok(DaemonMsg::Shutdown { reason }) => {
                     sh.push(Event::Notice(format!("демон завершается: {reason}")));
                     lost = true;
@@ -345,7 +384,9 @@ impl EngineApi for IpcEngine {
         if self.unavailable() {
             bail!("{DAEMON_DOWN} — команда не отправлена");
         }
-        lock(&self.cmds).send(cmd).map_err(|_| anyhow!("{DAEMON_DOWN} — команда не отправлена"))
+        lock(&self.cmds)
+            .send(cmd)
+            .map_err(|_| anyhow!("{DAEMON_DOWN} — команда не отправлена"))
     }
 
     fn me(&self) -> &Me {
@@ -366,7 +407,10 @@ impl EngineApi for IpcEngine {
 
     fn save_theme(&self, theme: &str) -> Result<()> {
         match &self.ui_dir {
-            Some(d) => UiPrefs { theme: theme.to_string() }.save(d),
+            Some(d) => UiPrefs {
+                theme: theme.to_string(),
+            }
+            .save(d),
             None => Ok(()),
         }
     }
@@ -391,9 +435,17 @@ mod tests {
 
     #[test]
     fn ui_prefs_в_файле() {
-        let d = std::env::temp_dir().join(format!("vl-ui-{}-{}", std::process::id(), rand::random::<u32>()));
+        let d = std::env::temp_dir().join(format!(
+            "vl-ui-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
         assert_eq!(UiPrefs::load(&d), UiPrefs::default());
-        UiPrefs { theme: "light".into() }.save(&d).unwrap();
+        UiPrefs {
+            theme: "light".into(),
+        }
+        .save(&d)
+        .unwrap();
         assert_eq!(UiPrefs::load(&d).theme, "light");
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -401,7 +453,11 @@ mod tests {
     #[test]
     fn снимок_без_движка_не_снимок() {
         assert!(parse_snapshot(serde_json::json!({"engine": null})).is_err());
-        assert!(parse_snapshot(serde_json::json!({"engine": null, "error": "нет TUN"})).unwrap_err().contains("нет TUN"));
+        assert!(
+            parse_snapshot(serde_json::json!({"engine": null, "error": "нет TUN"}))
+                .unwrap_err()
+                .contains("нет TUN")
+        );
         let s = serde_json::to_value(Snapshot::default()).unwrap();
         assert_eq!(parse_snapshot(s).unwrap(), Snapshot::default());
     }
@@ -434,10 +490,19 @@ mod tests {
                     joined_s_ago: 5,
                     members: Vec::new(),
                 }],
-                meta: MetaSnap { connected: true, server: "127.0.0.1:5599".into(), uptime_s: 3, ..MetaSnap::default() },
+                meta: MetaSnap {
+                    connected: true,
+                    server: "127.0.0.1:5599".into(),
+                    uptime_s: 3,
+                    ..MetaSnap::default()
+                },
                 cfg: crate::snapshot::CfgView {
                     name: name.into(),
-                    servers: vec![CfgServer { addr: "127.0.0.1:5599".into(), pubkey: "ab".repeat(32), label: "дом".into() }],
+                    servers: vec![CfgServer {
+                        addr: "127.0.0.1:5599".into(),
+                        pubkey: "ab".repeat(32),
+                        label: "дом".into(),
+                    }],
                     ..Default::default()
                 },
                 ..Snapshot::default()
@@ -447,7 +512,11 @@ mod tests {
         impl FakeDaemon {
             pub fn start(tag: &str) -> FakeDaemon {
                 // Короткий путь: лимит sun_path ~104 байта на macOS.
-                let path = std::env::temp_dir().join(format!("vlf-{tag}-{}-{}.sock", std::process::id(), rand::random::<u16>()));
+                let path = std::env::temp_dir().join(format!(
+                    "vlf-{tag}-{}-{}.sock",
+                    std::process::id(),
+                    rand::random::<u16>()
+                ));
                 let _ = std::fs::remove_file(&path);
                 let listener = Listener::bind(&path).unwrap();
                 let d = FakeDaemon {
@@ -486,27 +555,48 @@ mod tests {
             }
         }
 
-        fn serve(mut c: Conn, snap: Arc<Mutex<Snapshot>>, reqs: Arc<Mutex<Vec<serde_json::Value>>>) {
+        fn serve(
+            mut c: Conn,
+            snap: Arc<Mutex<Snapshot>>,
+            reqs: Arc<Mutex<Vec<serde_json::Value>>>,
+        ) {
             let mut seq = 0u64;
-            let me = Me { my_pub: [9; 32], my_code: "TUN-FAKE".into() };
+            let me = Me {
+                my_pub: [9; 32],
+                my_code: "TUN-FAKE".into(),
+            };
             loop {
-                let Ok(m) = read_msg::<_, ClientMsg>(&mut c) else { return };
+                let Ok(m) = read_msg::<_, ClientMsg>(&mut c) else {
+                    return;
+                };
                 let reply: Vec<DaemonMsg> = match m {
                     ClientMsg::Hello { .. } => {
-                        vec![DaemonMsg::Welcome { proto: tunnel_ipc::PROTO_VERSION, daemon_ver: "t".into(), me: me.to_json() }]
+                        vec![DaemonMsg::Welcome {
+                            proto: tunnel_ipc::PROTO_VERSION,
+                            daemon_ver: "t".into(),
+                            me: me.to_json(),
+                        }]
                     }
                     ClientMsg::Subscribe { .. } => {
                         seq += 1;
-                        let hist = serde_json::to_value(Event::Notice("старое событие".into())).unwrap();
+                        let hist =
+                            serde_json::to_value(Event::Notice("старое событие".into())).unwrap();
                         let s = serde_json::to_value(&*snap.lock().unwrap()).unwrap();
-                        vec![DaemonMsg::Event { seq, ev: hist }, DaemonMsg::Snapshot { seq, snap: s }]
+                        vec![
+                            DaemonMsg::Event { seq, ev: hist },
+                            DaemonMsg::Snapshot { seq, snap: s },
+                        ]
                     }
                     ClientMsg::Req { id, cmd } => {
                         reqs.lock().unwrap().push(cmd.clone());
                         seq += 1;
-                        let result =
-                            if cmd.get("Join").is_some() { AckResult::Err("нет сервера".into()) } else { AckResult::Ok };
-                        let ev = serde_json::to_value(Event::Notice(format!("принято: {cmd}"))).unwrap();
+                        let result = if cmd.get("Join").is_some() {
+                            AckResult::Err("нет сервера".into())
+                        } else {
+                            AckResult::Ok
+                        };
+                        let ev =
+                            serde_json::to_value(Event::Notice(format!("принято: {cmd}"))).unwrap();
                         vec![DaemonMsg::Ack { id, result }, DaemonMsg::Event { seq, ev }]
                     }
                     ClientMsg::Bye => return,
@@ -518,14 +608,16 @@ mod tests {
                 }
             }
         }
-
     }
 
     #[cfg(unix)]
     fn eventually(what: &str, mut f: impl FnMut() -> bool) {
         let t0 = Instant::now();
         while !f() {
-            assert!(t0.elapsed() < Duration::from_secs(10), "не дождались: {what}");
+            assert!(
+                t0.elapsed() < Duration::from_secs(10),
+                "не дождались: {what}"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -550,14 +642,21 @@ mod tests {
         let mut got = Vec::new();
         eventually("Notice и Error", || {
             got.extend(eng.poll_events());
-            got.iter().any(|e| matches!(e, Event::Error(m) if m == "нет сервера"))
+            got.iter()
+                .any(|e| matches!(e, Event::Error(m) if m == "нет сервера"))
                 && got.iter().filter(|e| matches!(e, Event::Notice(_))).count() == 2
         });
         // Quit не уходит демону: закрытие фронтенда туннель не трогает.
         eng.send(Cmd::Quit).unwrap();
         std::thread::sleep(Duration::from_millis(100));
         let reqs = d.reqs.lock().unwrap().clone();
-        assert_eq!(reqs, vec![serde_json::json!("RefreshList"), serde_json::json!({"Join": 7})]);
+        assert_eq!(
+            reqs,
+            vec![
+                serde_json::json!("RefreshList"),
+                serde_json::json!({"Join": 7})
+            ]
+        );
     }
 
     #[cfg(unix)]
@@ -572,20 +671,29 @@ mod tests {
         let mut got = Vec::new();
         eventually("Disconnected", || {
             got.extend(eng.poll_events());
-            got.iter().any(|e| matches!(e, Event::Disconnected(r) if r == DAEMON_DOWN))
+            got.iter()
+                .any(|e| matches!(e, Event::Disconnected(r) if r == DAEMON_DOWN))
         });
         // Переподключение (раз в секунду) — Hello, свежий снимок, без истории.
         eventually("связь восстановлена", || {
             got.extend(eng.poll_events());
-            got.iter().any(|e| matches!(e, Event::Notice(n) if n.contains("восстановлена")))
+            got.iter()
+                .any(|e| matches!(e, Event::Notice(n) if n.contains("восстановлена")))
         });
         assert!(!eng.unavailable());
         assert_eq!(eng.snapshot().cfg.name, "после рестарта");
         assert!(eng.snapshot().meta.connected);
-        assert!(!got.iter().any(|e| matches!(e, Event::Notice(n) if n == "старое событие")), "история после переподключения");
+        assert!(
+            !got.iter()
+                .any(|e| matches!(e, Event::Notice(n) if n == "старое событие")),
+            "история после переподключения"
+        );
         // Команды снова доходят.
         eng.send(Cmd::RefreshList).unwrap();
-        eventually("команда после переподключения", || d.reqs.lock().unwrap().len() == 1);
+        eventually(
+            "команда после переподключения",
+            || d.reqs.lock().unwrap().len() == 1,
+        );
     }
 
     #[cfg(unix)]
@@ -598,7 +706,12 @@ mod tests {
         drop(d);
         eventually("демон недоступен", || eng.unavailable());
         assert!(!eng.snapshot().meta.connected);
-        assert!(eng.send(Cmd::RefreshList).unwrap_err().to_string().contains(DAEMON_DOWN));
+        assert!(
+            eng.send(Cmd::RefreshList)
+                .unwrap_err()
+                .to_string()
+                .contains(DAEMON_DOWN)
+        );
         assert!(!path.exists());
     }
 
@@ -608,7 +721,11 @@ mod tests {
         use crate::tui::app::App;
         let d = fake::FakeDaemon::start("t");
         let eng = IpcEngine::connect(&d.endpoint(), None).unwrap();
-        let mut app = App::new(eng.me().my_pub, &eng.me().my_code, &crate::store::Config::default());
+        let mut app = App::new(
+            eng.me().my_pub,
+            &eng.me().my_code,
+            &crate::store::Config::default(),
+        );
         app.sync(&eng);
         assert_eq!(app.my_name, "alpha");
         assert!(app.groups.iter().any(|g| g.name == "игроки" && g.mine));
@@ -649,7 +766,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn нет_демона_нет_соединения() {
-        let ep = Endpoint::unix(std::env::temp_dir().join(format!("vl-nosock-{}", std::process::id())));
+        let ep =
+            Endpoint::unix(std::env::temp_dir().join(format!("vl-nosock-{}", std::process::id())));
         assert!(ep.open().unwrap().is_none());
         assert!(IpcEngine::connect(&ep, None).is_err());
     }

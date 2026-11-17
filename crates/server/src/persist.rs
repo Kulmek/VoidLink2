@@ -79,7 +79,9 @@ pub struct Store {
 impl Store {
     pub fn new(dir: &Path) -> Self {
         let _ = std::fs::create_dir_all(dir);
-        Self { path: dir.join("server.json") }
+        Self {
+            path: dir.join("server.json"),
+        }
     }
 
     /// `Ok(None)` — файла нет (первый запуск). Битый файл — ошибка: раньше

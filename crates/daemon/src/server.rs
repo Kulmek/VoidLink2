@@ -22,7 +22,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use tunnel_ipc::{AckResult, ClientMsg, CodecError, Conn, DaemonMsg, Listener, PROTO_VERSION, check_hello, read_msg, write_msg};
+use tunnel_ipc::{
+    AckResult, ClientMsg, CodecError, Conn, DaemonMsg, Listener, PROTO_VERSION, check_hello,
+    read_msg, write_msg,
+};
 
 use crate::hub::{Backend, DEFAULT_QUEUE, Hub, HubMsg, Subscription, TICK};
 use crate::log::{Level, LogFn};
@@ -91,8 +94,14 @@ impl IpcServer {
             log,
         });
         let sh = shared.clone();
-        let accept = std::thread::Builder::new().name("ipc-accept".into()).spawn(move || accept_loop(hub, listener, sh))?;
-        Ok(IpcServer { shared, accept: Some(accept), wake: Box::new(wake) })
+        let accept = std::thread::Builder::new()
+            .name("ipc-accept".into())
+            .spawn(move || accept_loop(hub, listener, sh))?;
+        Ok(IpcServer {
+            shared,
+            accept: Some(accept),
+            wake: Box::new(wake),
+        })
     }
 
     /// Unix: сокет `<data_dir>/daemon.sock`. Каталог данных создаётся (или
@@ -109,13 +118,22 @@ impl IpcServer {
         match tunnel_ipc::transport::cleanup_stale(&path) {
             Ok(true) => {
                 if let Some(l) = &log {
-                    l(Level::Warn, &format!("удалён устаревший сокет {}", path.display()));
+                    l(
+                        Level::Warn,
+                        &format!("удалён устаревший сокет {}", path.display()),
+                    );
                 }
             }
             Ok(false) => {}
-            Err(e) => return Err(io::Error::new(e.kind(), format!("сокет {}: {e}", path.display()))),
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("сокет {}: {e}", path.display()),
+                ));
+            }
         }
-        let listener = Listener::bind(&path).map_err(|e| io::Error::new(e.kind(), format!("сокет {}: {e}", path.display())))?;
+        let listener = Listener::bind(&path)
+            .map_err(|e| io::Error::new(e.kind(), format!("сокет {}: {e}", path.display())))?;
         if let Some(l) = &log {
             l(Level::Info, &format!("IPC: сокет {}", path.display()));
         }
@@ -170,7 +188,9 @@ impl IpcServer {
                 .iter()
                 .map(|e| {
                     let w = e.writer.clone();
-                    let msg = DaemonMsg::Shutdown { reason: reason.to_string() };
+                    let msg = DaemonMsg::Shutdown {
+                        reason: reason.to_string(),
+                    };
                     std::thread::spawn(move || {
                         let mut w = w.lock().unwrap_or_else(|e| e.into_inner());
                         let _ = write_msg(&mut *w, &msg);
@@ -221,7 +241,10 @@ pub fn socket_path(data_dir: &std::path::Path) -> std::path::PathBuf {
 fn prepare_private_dir(dir: &std::path::Path, log: Option<&LogFn>) -> io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     if !dir.exists() {
-        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
     }
     let md = std::fs::metadata(dir)?;
     // SAFETY: geteuid не имеет предусловий.
@@ -229,7 +252,14 @@ fn prepare_private_dir(dir: &std::path::Path, log: Option<&LogFn>) -> io::Result
     if md.is_dir() && md.uid() == uid && md.mode() & 0o077 != 0 {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
         if let Some(l) = log {
-            l(Level::Warn, &format!("права каталога {} изменены на 0700 (было {:o})", dir.display(), md.mode() & 0o777));
+            l(
+                Level::Warn,
+                &format!(
+                    "права каталога {} изменены на 0700 (было {:o})",
+                    dir.display(),
+                    md.mode() & 0o777
+                ),
+            );
         }
     }
     Ok(())
@@ -263,7 +293,11 @@ fn accept_loop<B: Backend + 'static>(hub: Arc<Hub<B>>, listener: Listener, sh: A
     }
 }
 
-fn spawn_conn<B: Backend + 'static>(hub: &Arc<Hub<B>>, conn: Conn, sh: &Arc<Shared>) -> io::Result<()> {
+fn spawn_conn<B: Backend + 'static>(
+    hub: &Arc<Hub<B>>,
+    conn: Conn,
+    sh: &Arc<Shared>,
+) -> io::Result<()> {
     #[cfg(unix)]
     {
         conn.set_read_timeout(Some(HELLO_TIMEOUT))?;
@@ -274,13 +308,30 @@ fn spawn_conn<B: Backend + 'static>(hub: &Arc<Hub<B>>, conn: Conn, sh: &Arc<Shar
     let writer = Arc::new(Mutex::new(conn.try_clone()?));
     let mut conns = sh.conns();
     let (hub, sh2, w) = (hub.clone(), sh.clone(), writer.clone());
-    let thread = std::thread::Builder::new().name(format!("ipc-conn-{id}")).spawn(move || {
-        let mut c = Session { id, hub, reader: conn, writer: w, sh: sh2.clone(), closed: Arc::new(AtomicBool::new(false)), forwarder: None };
-        c.run();
-        c.close();
-        sh2.conns().remove(&id);
-    })?;
-    conns.insert(id, Entry { ctl, writer, thread: Some(thread) });
+    let thread = std::thread::Builder::new()
+        .name(format!("ipc-conn-{id}"))
+        .spawn(move || {
+            let mut c = Session {
+                id,
+                hub,
+                reader: conn,
+                writer: w,
+                sh: sh2.clone(),
+                closed: Arc::new(AtomicBool::new(false)),
+                forwarder: None,
+            };
+            c.run();
+            c.close();
+            sh2.conns().remove(&id);
+        })?;
+    conns.insert(
+        id,
+        Entry {
+            ctl,
+            writer,
+            thread: Some(thread),
+        },
+    );
     Ok(())
 }
 
@@ -306,23 +357,39 @@ impl<B: Backend + 'static> Session<B> {
         match read_msg::<_, ClientMsg>(&mut self.reader) {
             Ok(ClientMsg::Hello { proto, kind, ver }) => {
                 if let Err(rej) = check_hello(proto) {
-                    self.sh.log(Level::Warn, &format!("IPC {id}: {kind:?} {ver}: версия {proto} ≠ {PROTO_VERSION}, отказ"));
+                    self.sh.log(
+                        Level::Warn,
+                        &format!(
+                            "IPC {id}: {kind:?} {ver}: версия {proto} ≠ {PROTO_VERSION}, отказ"
+                        ),
+                    );
                     let _ = self.send(&rej);
                     return;
                 }
-                self.sh.log(Level::Debug, &format!("IPC {id}: {kind:?} {ver} подключён"));
-                let welcome = DaemonMsg::Welcome { proto: PROTO_VERSION, daemon_ver: DAEMON_VER.into(), me: self.hub.me() };
+                self.sh
+                    .log(Level::Debug, &format!("IPC {id}: {kind:?} {ver} подключён"));
+                let welcome = DaemonMsg::Welcome {
+                    proto: PROTO_VERSION,
+                    daemon_ver: DAEMON_VER.into(),
+                    me: self.hub.me(),
+                };
                 if self.send(&welcome).is_err() {
                     return;
                 }
             }
             Ok(other) => {
-                self.sh.log(Level::Warn, &format!("IPC {id}: первым пришло не Hello ({other:?}), закрываю"));
-                let _ = self.send(&DaemonMsg::Reject { reason: "первым сообщением должен быть Hello".into() });
+                self.sh.log(
+                    Level::Warn,
+                    &format!("IPC {id}: первым пришло не Hello ({other:?}), закрываю"),
+                );
+                let _ = self.send(&DaemonMsg::Reject {
+                    reason: "первым сообщением должен быть Hello".into(),
+                });
                 return;
             }
             Err(e) => {
-                self.sh.log(Level::Debug, &format!("IPC {id}: до Hello: {e}"));
+                self.sh
+                    .log(Level::Debug, &format!("IPC {id}: до Hello: {e}"));
                 return;
             }
         }
@@ -343,7 +410,10 @@ impl<B: Backend + 'static> Session<B> {
                 }
                 Ok(ClientMsg::Subscribe { snapshots_ms }) => {
                     if self.forwarder.is_some() {
-                        self.sh.log(Level::Debug, &format!("IPC {id}: повторный Subscribe — игнорирую"));
+                        self.sh.log(
+                            Level::Debug,
+                            &format!("IPC {id}: повторный Subscribe — игнорирую"),
+                        );
                         continue;
                     }
                     let sub = self.hub.subscribe(DEFAULT_QUEUE);
@@ -353,10 +423,14 @@ impl<B: Backend + 'static> Session<B> {
                         stop_conn: self.reader.try_clone().ok(),
                         snap_every: Duration::from_millis(u64::from(snapshots_ms)),
                     };
-                    match std::thread::Builder::new().name(format!("ipc-sub-{id}")).spawn(move || fw.run(sub)) {
+                    match std::thread::Builder::new()
+                        .name(format!("ipc-sub-{id}"))
+                        .spawn(move || fw.run(sub))
+                    {
                         Ok(h) => self.forwarder = Some(h),
                         Err(e) => {
-                            self.sh.log(Level::Warn, &format!("IPC {id}: поток подписки: {e}"));
+                            self.sh
+                                .log(Level::Warn, &format!("IPC {id}: поток подписки: {e}"));
                             return;
                         }
                     }
@@ -366,7 +440,8 @@ impl<B: Backend + 'static> Session<B> {
                     return;
                 }
                 Ok(ClientMsg::Hello { .. }) => {
-                    self.sh.log(Level::Warn, &format!("IPC {id}: повторный Hello, закрываю"));
+                    self.sh
+                        .log(Level::Warn, &format!("IPC {id}: повторный Hello, закрываю"));
                     return;
                 }
                 Err(CodecError::Closed) => {
@@ -375,7 +450,8 @@ impl<B: Backend + 'static> Session<B> {
                 }
                 Err(e) => {
                     if !self.closed.load(Ordering::SeqCst) && !self.sh.stop.load(Ordering::SeqCst) {
-                        self.sh.log(Level::Warn, &format!("IPC {id}: {e}, закрываю"));
+                        self.sh
+                            .log(Level::Warn, &format!("IPC {id}: {e}, закрываю"));
                     }
                     return;
                 }
@@ -422,7 +498,10 @@ impl Forwarder {
     /// `false` — запись не удалась.
     fn stream(&self, sub: &Subscription) -> bool {
         for (seq, ev) in &sub.history {
-            if !self.write(&DaemonMsg::Event { seq: *seq, ev: (**ev).clone() }) {
+            if !self.write(&DaemonMsg::Event {
+                seq: *seq,
+                ev: (**ev).clone(),
+            }) {
                 return false;
             }
         }
@@ -431,8 +510,14 @@ impl Forwarder {
         // снимке. Это разные вещи: событие клиент уже видел, а состояние
         // после него — ещё нет.
         let (mut snap_seq, snap) = (sub.snapshot.0, &sub.snapshot.1);
-        let mut sent_seq = sub.history.last().map_or(snap_seq, |(q, _)| snap_seq.max(*q));
-        if !self.write(&DaemonMsg::Snapshot { seq: snap_seq, snap: (**snap).clone() }) {
+        let mut sent_seq = sub
+            .history
+            .last()
+            .map_or(snap_seq, |(q, _)| snap_seq.max(*q));
+        if !self.write(&DaemonMsg::Snapshot {
+            seq: snap_seq,
+            snap: (**snap).clone(),
+        }) {
             return false;
         }
         let mut last_snap = Instant::now();
@@ -448,7 +533,10 @@ impl Forwarder {
                         continue; // уже покрыто снимком подписки
                     }
                     sent_seq = seq;
-                    DaemonMsg::Event { seq, ev: (*ev).clone() }
+                    DaemonMsg::Event {
+                        seq,
+                        ev: (*ev).clone(),
+                    }
                 }
                 HubMsg::Snapshot { seq, snap } => {
                     // Снимок с новыми событиями (seq впереди отправленного
@@ -461,7 +549,10 @@ impl Forwarder {
                     snap_seq = snap_seq.max(seq);
                     sent_seq = sent_seq.max(seq);
                     last_snap = Instant::now();
-                    DaemonMsg::Snapshot { seq, snap: (*snap).clone() }
+                    DaemonMsg::Snapshot {
+                        seq,
+                        snap: (*snap).clone(),
+                    }
                 }
             };
             if !self.write(&out) {

@@ -4,7 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -16,10 +16,10 @@ use crate::engine::{Cmd, Event};
 use crate::snapshot::Snapshot;
 use crate::store::{self, Config, StoredFriend, StoredServer};
 use crate::tui::admin::{self, AdminAction, AdminView, BanEntry, InviteEntry, MemberEntry};
-use crate::tui::servers::{ServerEntry, ServersAction, ServersView};
 use crate::tui::badges::Transport;
-use crate::tui::{clipboard, keymap};
+use crate::tui::servers::{ServerEntry, ServersAction, ServersView};
 use crate::tui::theme::ThemeKind;
+use crate::tui::{clipboard, keymap};
 
 pub const TOAST_TTL: Duration = Duration::from_secs(5);
 /// Окно приглашения первые мгновения не принимает «Принять»/«Отклонить»:
@@ -551,14 +551,20 @@ impl App {
             if self.has_invite(i.gid) {
                 continue;
             }
-            let skip = snap.groups.iter().any(|g| g.gid == i.gid) || snap.cfg.autojoin.contains(&i.gid);
+            let skip =
+                snap.groups.iter().any(|g| g.gid == i.gid) || snap.cfg.autojoin.contains(&i.gid);
             let inv = InvitePopup {
                 gid: i.gid,
                 group_name: i.group_name.clone(),
                 from_name: i.from_name.clone(),
                 from_pubkey: i.from_pubkey,
-                received_at: now.checked_sub(Duration::from_millis(i.received_ms_ago)).unwrap_or(now),
-                expires_at: i.expires_in_s.filter(|s| *s > 0).map(|s| now + Duration::from_secs(s)),
+                received_at: now
+                    .checked_sub(Duration::from_millis(i.received_ms_ago))
+                    .unwrap_or(now),
+                expires_at: i
+                    .expires_in_s
+                    .filter(|s| *s > 0)
+                    .map(|s| now + Duration::from_secs(s)),
                 shown_at: None,
             };
             self.on_invite(inv, skip);
@@ -576,8 +582,14 @@ impl App {
         // В снимке — целые секунды работы: момент старта переставляем, только
         // если он ушёл больше чем на секунду (иначе часы «в сети» дрожат).
         let now = Instant::now();
-        let started = now.checked_sub(Duration::from_secs(meta.uptime_s)).unwrap_or(now);
-        let drift = if started > self.started { started - self.started } else { self.started - started };
+        let started = now
+            .checked_sub(Duration::from_secs(meta.uptime_s))
+            .unwrap_or(now);
+        let drift = if started > self.started {
+            started - self.started
+        } else {
+            self.started - started
+        };
         if drift > Duration::from_millis(1500) {
             self.started = started;
         }
@@ -669,7 +681,11 @@ impl App {
             self.servers = cfg
                 .servers
                 .iter()
-                .map(|s| StoredServer { addr: s.addr.clone(), pubkey: s.pubkey.clone(), label: s.label.clone() })
+                .map(|s| StoredServer {
+                    addr: s.addr.clone(),
+                    pubkey: s.pubkey.clone(),
+                    label: s.label.clone(),
+                })
                 .collect();
             self.autojoin = cfg.autojoin.clone();
             // Тема — локальная настройка фронтенда, в снимке её нет.
@@ -807,7 +823,13 @@ impl App {
                     self.on_admin_info(gid, bans, invites);
                 }
                 E::AdminInfo { gid, bans, invites } => {
-                    let names = |v: Vec<String>| if v.is_empty() { "—".to_string() } else { v.join(", ") };
+                    let names = |v: Vec<String>| {
+                        if v.is_empty() {
+                            "—".to_string()
+                        } else {
+                            v.join(", ")
+                        }
+                    };
                     let bans = names(bans.into_iter().map(|(_, n)| n).collect());
                     let invites = names(
                         invites
@@ -815,7 +837,10 @@ impl App {
                             .map(|(_, n, exp)| format!("{n} ({})", crate::engine::fmt_secs(exp)))
                             .collect(),
                     );
-                    self.log(MsgKind::Info, format!("группа {gid}: баны: {bans}; приглашения: {invites}"));
+                    self.log(
+                        MsgKind::Info,
+                        format!("группа {gid}: баны: {bans}; приглашения: {invites}"),
+                    );
                 }
                 E::PeerOnline { gid, ip, name } => {
                     self.log(
@@ -830,14 +855,17 @@ impl App {
                     );
                 }
                 E::Direct { gid, ip, name } => {
-                    let msg = format!(
-                        "прямой канал с {name} ({}) в {gid}",
-                        proto::ip_str(ip)
-                    );
+                    let msg = format!("прямой канал с {name} ({}) в {gid}", proto::ip_str(ip));
                     self.log(MsgKind::Ok, msg.clone());
                     self.toast(MsgKind::Ok, msg);
                 }
-                E::Invite { gid, group_name, from_pubkey, from_name, expires_in } => {
+                E::Invite {
+                    gid,
+                    group_name,
+                    from_pubkey,
+                    from_name,
+                    expires_in,
+                } => {
                     // Уже в группе или в автовходе (движок войдёт сам) — окно
                     // не показываем: сервер повторяет приглашения после HELLO.
                     // История демона — только в лог.
@@ -848,14 +876,18 @@ impl App {
                         from_name,
                         from_pubkey,
                         received_at: Instant::now(),
-                        expires_at: (expires_in > 0).then(|| {
-                            Instant::now() + Duration::from_secs(expires_in as u64)
-                        }),
+                        expires_at: (expires_in > 0)
+                            .then(|| Instant::now() + Duration::from_secs(expires_in as u64)),
                         shown_at: None,
                     };
                     self.on_invite(inv, skip);
                 }
-                E::InviteDeclined { gid, group_name, by_pubkey, by_name } => {
+                E::InviteDeclined {
+                    gid,
+                    group_name,
+                    by_pubkey,
+                    by_name,
+                } => {
                     let who = self.friend_alias(&by_pubkey).unwrap_or(by_name);
                     let msg = format!("{who} отклонил приглашение в «{group_name}» ({gid})");
                     self.log(MsgKind::Warn, msg.clone());
@@ -870,7 +902,11 @@ impl App {
                     }
                 }
                 // Неполное окно движок дочитывает сам (LIST_INVITES).
-                E::InvitesSynced { gids, from, complete } => {
+                E::InvitesSynced {
+                    gids,
+                    from,
+                    complete,
+                } => {
                     for (gid, name) in self.sync_invites(&gids, from, complete) {
                         // Вошли сами (JOIN тратит приглашение) — не тостить.
                         if in_group(gid) {
@@ -1037,7 +1073,8 @@ impl App {
 
     /// Отказ отправлен — запомнить gid (см. [`INVITE_DECLINE_MEMORY`]).
     pub fn note_declined(&mut self, gid: u32) {
-        self.declined.retain(|(g, t)| *g != gid && t.elapsed() < INVITE_DECLINE_MEMORY);
+        self.declined
+            .retain(|(g, t)| *g != gid && t.elapsed() < INVITE_DECLINE_MEMORY);
         self.declined.push((gid, Instant::now()));
     }
 
@@ -1243,7 +1280,9 @@ impl App {
         let f = self.filter.to_lowercase();
         self.groups
             .iter()
-            .filter(|g| f.is_empty() || g.name.to_lowercase().contains(&f) || g.gid.to_string() == f)
+            .filter(|g| {
+                f.is_empty() || g.name.to_lowercase().contains(&f) || g.gid.to_string() == f
+            })
             .collect()
     }
 
@@ -1264,22 +1303,29 @@ impl App {
     }
 
     pub fn selected_group(&self) -> Option<&GroupView> {
-        self.sel_group.and_then(|g| self.groups.iter().find(|x| x.gid == g))
+        self.sel_group
+            .and_then(|g| self.groups.iter().find(|x| x.gid == g))
     }
 
     pub fn selected_friend(&self) -> Option<&FriendView> {
-        self.sel_friend.and_then(|f| self.friends.iter().find(|x| x.pubkey == f))
+        self.sel_friend
+            .and_then(|f| self.friends.iter().find(|x| x.pubkey == f))
     }
 
     pub fn selected_peer(&self) -> Option<&PeerView> {
-        self.sel_peer.and_then(|p| self.peers.iter().find(|x| x.pubkey == p))
+        self.sel_peer
+            .and_then(|p| self.peers.iter().find(|x| x.pubkey == p))
     }
 
     // ---------- клавиши ----------
 
     pub fn handle_key(&mut self, key: KeyEvent, eng: &dyn EngineApi) {
         // Хоткеи работают и в русской раскладке; в полях ввода — как есть.
-        let key = if self.text_input_active() { key } else { latin_key(key) };
+        let key = if self.text_input_active() {
+            key
+        } else {
+            latin_key(key)
+        };
         if !self.stack.is_empty() {
             self.handle_popup_key(key, eng);
             return;
@@ -1364,7 +1410,11 @@ impl App {
 
     /// Число неотвеченных приглашений: в очереди, отложенные и открытое окно.
     pub fn pending_invites(&self) -> usize {
-        let shown = self.stack.iter().filter(|p| matches!(p, Popup::Invite(_))).count();
+        let shown = self
+            .stack
+            .iter()
+            .filter(|p| matches!(p, Popup::Invite(_)))
+            .count();
         self.invites.len() + self.later_invites.len() + shown
     }
 
@@ -1566,9 +1616,11 @@ impl App {
                 // Строка «приватная группа» в создании группы — переключатель.
                 let r = self.hits.popup.get();
                 if let Some(Popup::Input(inp)) = self.stack.last()
-                    && matches!(inp.action, InputAction::CreateGroup) && y == r.y + 2 {
-                        self.handle_key(key(KeyCode::Tab), eng);
-                    }
+                    && matches!(inp.action, InputAction::CreateGroup)
+                    && y == r.y + 2
+                {
+                    self.handle_key(key(KeyCode::Tab), eng);
+                }
             }
             Hit::Panel(f) => self.focus = f,
             Hit::Item(f, i) => {
@@ -1655,7 +1707,11 @@ impl App {
             _ => return,
         };
         self.focus = focus;
-        let delta = if focus == Focus::Log { delta * 3 } else { delta };
+        let delta = if focus == Focus::Log {
+            delta * 3
+        } else {
+            delta
+        };
         self.move_sel_by(delta, false);
     }
 
@@ -1676,11 +1732,12 @@ impl App {
             }
             Focus::Groups => {
                 if let Some(g) = self.selected_group()
-                    && !g.mine {
-                        let gid = g.gid;
-                        self.send(eng, Cmd::Join(gid));
-                        self.toast(MsgKind::Info, format!("входим в группу {gid}"));
-                    }
+                    && !g.mine
+                {
+                    let gid = g.gid;
+                    self.send(eng, Cmd::Join(gid));
+                    self.toast(MsgKind::Info, format!("входим в группу {gid}"));
+                }
             }
             Focus::Peers | Focus::Log => {}
         }
@@ -1768,13 +1825,15 @@ impl App {
                 }
                 _ => {}
             },
-            Popup::FriendCard(card) => if let KeyCode::Char('c') = key.code {
-                self.copy_toast(
-                    &proto::friend_code_of(&card.pubkey),
-                    "friend code друга скопирован".into(),
-                );
-                self.stack.push(Popup::FriendCard(card));
-            },
+            Popup::FriendCard(card) => {
+                if let KeyCode::Char('c') = key.code {
+                    self.copy_toast(
+                        &proto::friend_code_of(&card.pubkey),
+                        "friend code друга скопирован".into(),
+                    );
+                    self.stack.push(Popup::FriendCard(card));
+                }
+            }
             Popup::ListPick(mut p) => match key.code {
                 KeyCode::Up => {
                     if !p.items.is_empty() {
@@ -1869,17 +1928,26 @@ impl App {
         }
     }
 
-    fn submit_input(&mut self, action: InputAction, value: String, private: bool, eng: &dyn EngineApi) {
+    fn submit_input(
+        &mut self,
+        action: InputAction,
+        value: String,
+        private: bool,
+        eng: &dyn EngineApi,
+    ) {
         match action {
             InputAction::CreateGroup => {
                 if value.is_empty() {
                     self.toast(MsgKind::Error, "пустое имя группы".into());
                     return;
                 }
-                self.send(eng, Cmd::Create {
-                    name: value,
-                    private,
-                });
+                self.send(
+                    eng,
+                    Cmd::Create {
+                        name: value,
+                        private,
+                    },
+                );
             }
             InputAction::RenameGroup(gid) => {
                 if value.is_empty() {
@@ -2197,7 +2265,10 @@ impl App {
         let mut cfg = self.cfg_view();
         rename_friend_in(&mut cfg, &pk, name)?;
         let alias = name.trim().to_string();
-        eng.send(Cmd::SetAlias { pubkey: pk, alias: alias.clone() })?;
+        eng.send(Cmd::SetAlias {
+            pubkey: pk,
+            alias: alias.clone(),
+        })?;
         if let Some(f) = self.friends.iter_mut().find(|f| f.pubkey == pk) {
             f.alias = alias;
         }
@@ -2207,11 +2278,22 @@ impl App {
     /// Друг в конфиг движка (`Cmd::AddFriend`); в своём списке — сразу.
     /// Отказ — тост, `false`.
     fn add_friend(&mut self, eng: &dyn EngineApi, pk: [u8; 32], alias: &str) -> bool {
-        if !self.send(eng, Cmd::AddFriend { pubkey: pk, alias: alias.to_string() }) {
+        if !self.send(
+            eng,
+            Cmd::AddFriend {
+                pubkey: pk,
+                alias: alias.to_string(),
+            },
+        ) {
             return false;
         }
         if !self.friends.iter().any(|f| f.pubkey == pk) {
-            self.friends.push(FriendView { alias: alias.to_string(), pubkey: pk, online: false, shared_groups: 0 });
+            self.friends.push(FriendView {
+                alias: alias.to_string(),
+                pubkey: pk,
+                online: false,
+                shared_groups: 0,
+            });
         }
         true
     }
@@ -2219,7 +2301,12 @@ impl App {
     /// Удалить друзей с алиасом `alias` (`Cmd::DelFriend`). `Err` — такого
     /// нет; `Ok(false)` — движок отказал (тост уже показан).
     fn del_friend(&mut self, eng: &dyn EngineApi, alias: &str) -> Result<bool> {
-        let pks: Vec<[u8; 32]> = self.friends.iter().filter(|f| f.alias == alias).map(|f| f.pubkey).collect();
+        let pks: Vec<[u8; 32]> = self
+            .friends
+            .iter()
+            .filter(|f| f.alias == alias)
+            .map(|f| f.pubkey)
+            .collect();
         if pks.is_empty() {
             return Err(anyhow!("друг не найден"));
         }
@@ -2255,7 +2342,10 @@ impl App {
             friends: self
                 .friends
                 .iter()
-                .map(|f| StoredFriend { pubkey: proto::hex_of(&f.pubkey), alias: f.alias.clone() })
+                .map(|f| StoredFriend {
+                    pubkey: proto::hex_of(&f.pubkey),
+                    alias: f.alias.clone(),
+                })
                 .collect(),
             autojoin: self.autojoin.clone(),
             theme: self.theme_kind.as_str().to_string(),
@@ -2322,7 +2412,9 @@ impl App {
 
     /// Открыт ли экран управления группой `gid`.
     pub fn admin_open(&self, gid: u32) -> bool {
-        self.stack.iter().any(|p| matches!(p, Popup::Admin(v) if v.gid == gid))
+        self.stack
+            .iter()
+            .any(|p| matches!(p, Popup::Admin(v) if v.gid == gid))
     }
 
     /// «m» на выбранной группе: экран управления (только своя группа).
@@ -2365,10 +2457,17 @@ impl App {
         invites: Vec<([u8; 32], String, u32)>,
     ) {
         let members = self.groups.iter().find(|g| g.gid == gid).map(admin_members);
-        let bans: Vec<BanEntry> = bans.into_iter().map(|(pk, name)| BanEntry { pk, name }).collect();
+        let bans: Vec<BanEntry> = bans
+            .into_iter()
+            .map(|(pk, name)| BanEntry { pk, name })
+            .collect();
         let invites: Vec<InviteEntry> = invites
             .into_iter()
-            .map(|(pk, name, exp)| InviteEntry { pk, name, expires_in_secs: exp as u64 })
+            .map(|(pk, name, exp)| InviteEntry {
+                pk,
+                name,
+                expires_in_secs: exp as u64,
+            })
             .collect();
         for p in self.stack.iter_mut() {
             if let Popup::Admin(v) = p
@@ -2399,8 +2498,18 @@ impl App {
                 .iter()
                 .find(|e| &e.pk == pk)
                 .map(|e| e.name.clone())
-                .or_else(|| v.invites.iter().find(|e| &e.pk == pk).map(|e| e.name.clone()))
-                .or_else(|| v.members.iter().find(|e| &e.pk == pk).map(|e| e.name.clone()))
+                .or_else(|| {
+                    v.invites
+                        .iter()
+                        .find(|e| &e.pk == pk)
+                        .map(|e| e.name.clone())
+                })
+                .or_else(|| {
+                    v.members
+                        .iter()
+                        .find(|e| &e.pk == pk)
+                        .map(|e| e.name.clone())
+                })
                 .unwrap_or_else(|| proto::hex_of(&pk[..4])),
             _ => proto::hex_of(&pk[..4]),
         };
@@ -2481,9 +2590,15 @@ impl App {
             Nothing,
         }
         let then = match &act {
-            ServersAction::Add { addr, pubkey, label } => {
-                Then::Cmd(Cmd::AddServer { addr: addr.clone(), pubkey: *pubkey, label: label.clone() })
-            }
+            ServersAction::Add {
+                addr,
+                pubkey,
+                label,
+            } => Then::Cmd(Cmd::AddServer {
+                addr: addr.clone(),
+                pubkey: *pubkey,
+                label: label.clone(),
+            }),
             ServersAction::Delete(i) => Then::Cmd(Cmd::DelServer { idx: *i }),
             ServersAction::SetAdapter { name, dll } => Then::Adapter(name.clone(), dll.clone()),
             ServersAction::Close | ServersAction::Switch(_) => Then::Nothing,
@@ -2516,7 +2631,9 @@ impl App {
                 (None, false)
             }
             ServersAction::Switch(i) => {
-                let Some(s) = cfg.servers.get(i) else { return (None, false) };
+                let Some(s) = cfg.servers.get(i) else {
+                    return (None, false);
+                };
                 let Some(addr) = resolve_addr(&s.addr) else {
                     self.toast(MsgKind::Error, format!("адрес {} не разрешается", s.addr));
                     return (None, false);
@@ -2529,9 +2646,20 @@ impl App {
                 if let Some(Popup::Servers(v)) = self.stack.last_mut() {
                     v.notice = Some(format!("переключаемся на {addr}…"));
                 }
-                (Some(Cmd::SwitchServer { addr, pubkey, label }), false)
+                (
+                    Some(Cmd::SwitchServer {
+                        addr,
+                        pubkey,
+                        label,
+                    }),
+                    false,
+                )
             }
-            ServersAction::Add { addr, pubkey, label } => {
+            ServersAction::Add {
+                addr,
+                pubkey,
+                label,
+            } => {
                 cfg.servers.push(StoredServer {
                     addr: addr.clone(),
                     pubkey: proto::hex_of(&pubkey),
@@ -2566,9 +2694,13 @@ impl App {
                 if let Some(Popup::Servers(v)) = self.stack.last_mut() {
                     v.adapter_name = name;
                     v.dll_path = dll;
-                    v.notice = Some("адаптер и dll сохранены — применится после перезапуска".into());
+                    v.notice =
+                        Some("адаптер и dll сохранены — применится после перезапуска".into());
                 }
-                self.toast(MsgKind::Ok, "адаптер сохранён — применится после перезапуска".into());
+                self.toast(
+                    MsgKind::Ok,
+                    "адаптер сохранён — применится после перезапуска".into(),
+                );
                 (None, true)
             }
         }
@@ -2658,7 +2790,9 @@ impl App {
                 self.send(eng, Cmd::Transfer(gid, pk));
             }
             Command::Admin(gid) => {
-                let gid = gid.or(self.sel_group).ok_or_else(|| anyhow!("не выбрана группа"))?;
+                let gid = gid
+                    .or(self.sel_group)
+                    .ok_or_else(|| anyhow!("не выбрана группа"))?;
                 let cmd = self.open_admin_for(gid)?;
                 self.send(eng, cmd);
             }
@@ -2676,10 +2810,19 @@ impl App {
                     .find(|s| s.addr == tok || (!s.label.is_empty() && s.label == tok))
                     .or_else(|| tok.parse::<usize>().ok().and_then(|n| cfg.servers.get(n)))
                     .ok_or_else(|| anyhow!("сервер {tok:?} не найден"))?;
-                let addr: std::net::SocketAddr =
-                    s.addr.parse().map_err(|_| anyhow!("неверный адрес сервера {}", s.addr))?;
+                let addr: std::net::SocketAddr = s
+                    .addr
+                    .parse()
+                    .map_err(|_| anyhow!("неверный адрес сервера {}", s.addr))?;
                 let pubkey = hex32(&s.pubkey).ok_or_else(|| anyhow!("неверный ключ сервера"))?;
-                self.send(eng, Cmd::SwitchServer { addr, pubkey, label: s.label.clone() });
+                self.send(
+                    eng,
+                    Cmd::SwitchServer {
+                        addr,
+                        pubkey,
+                        label: s.label.clone(),
+                    },
+                );
             }
             Command::AddFriend { code, alias } => {
                 let pk = proto::Identity::parse_friend_code(&code)?;
@@ -2745,7 +2888,10 @@ pub enum Command {
     /// Показать отложенные приглашения.
     Invites,
     Leave(u32),
-    Create { name: String, private: bool },
+    Create {
+        name: String,
+        private: bool,
+    },
     Rename(u32, String),
     Delete(u32),
     Invite(u32, String),
@@ -2760,14 +2906,20 @@ pub enum Command {
     Invisible(bool),
     /// Переключиться на сервер из списка: номер, адрес или метка.
     Server(String),
-    AddFriend { code: String, alias: String },
+    AddFriend {
+        code: String,
+        alias: String,
+    },
     DelFriend(String),
     SetName(String),
     SetStatus(String),
     Sort(Sort),
     Copy(String),
     /// Новый алиас друга: `:alias <друг> <имя>`.
-    Alias { friend: String, name: String },
+    Alias {
+        friend: String,
+        name: String,
+    },
     Quit,
 }
 
@@ -2841,13 +2993,19 @@ pub fn parse_command(line: &str) -> Result<Command> {
                 .ok_or_else(|| anyhow!("нужен peer (friend code | hex | alias)"))?
                 .to_string(),
         ),
-        "admin" | "bans" => Command::Admin(if rest.is_empty() { None } else { Some(gid_of(0)?) }),
-        "servers" => Command::Servers,
-        "invisible" => Command::Invisible(match rest.first().map(|s| s.to_lowercase()).as_deref() {
-            Some("on") => true,
-            Some("off") => false,
-            _ => return Err(anyhow!("invisible on|off")),
+        "admin" | "bans" => Command::Admin(if rest.is_empty() {
+            None
+        } else {
+            Some(gid_of(0)?)
         }),
+        "servers" => Command::Servers,
+        "invisible" => {
+            Command::Invisible(match rest.first().map(|s| s.to_lowercase()).as_deref() {
+                Some("on") => true,
+                Some("off") => false,
+                _ => return Err(anyhow!("invisible on|off")),
+            })
+        }
         "server" => Command::Server(
             rest.first()
                 .ok_or_else(|| anyhow!("нужен сервер: номер, адрес или метка"))?
@@ -2885,12 +3043,7 @@ pub fn parse_command(line: &str) -> Result<Command> {
                 _ => Sort::Name,
             })
         }
-        "copy" => Command::Copy(
-            rest.first()
-                .copied()
-                .unwrap_or("ip")
-                .to_lowercase(),
-        ),
+        "copy" => Command::Copy(rest.first().copied().unwrap_or("ip").to_lowercase()),
         "alias" => {
             let friend = rest
                 .first()
@@ -2964,7 +3117,14 @@ pub fn latin_key(mut key: KeyEvent) -> KeyEvent {
 }
 
 fn invisible_msg(on: bool) -> String {
-    format!("невидимка {}", if on { "включена" } else { "выключена" })
+    format!(
+        "невидимка {}",
+        if on {
+            "включена"
+        } else {
+            "выключена"
+        }
+    )
 }
 
 /// Друг по алиасу, friend code или hex (только из списка друзей).
@@ -2988,7 +3148,11 @@ pub fn rename_friend_in(cfg: &mut Config, pk: &[u8; 32], name: &str) -> Result<(
         return Err(anyhow!("пустой алиас"));
     }
     let hex = proto::hex_of(pk);
-    if cfg.friends.iter().any(|f| f.alias == name && f.pubkey != hex) {
+    if cfg
+        .friends
+        .iter()
+        .any(|f| f.alias == name && f.pubkey != hex)
+    {
         return Err(anyhow!("алиас «{name}» уже занят"));
     }
     let f = cfg
@@ -3007,7 +3171,11 @@ mod tests {
     use super::*;
 
     fn app() -> App {
-        let cfg = Config { name: "alpha".into(), status: "тест".into(), ..Config::default() };
+        let cfg = Config {
+            name: "alpha".into(),
+            status: "тест".into(),
+            ..Config::default()
+        };
         App::new([7; 32], "TUN-TEST-CODE", &cfg)
     }
 
@@ -3036,7 +3204,10 @@ mod tests {
         );
         assert_eq!(parse_command("quit").unwrap(), Command::Quit);
         assert_eq!(parse_command("sort rtt").unwrap(), Command::Sort(Sort::Rtt));
-        assert_eq!(parse_command("copy code").unwrap(), Command::Copy("code".into()));
+        assert_eq!(
+            parse_command("copy code").unwrap(),
+            Command::Copy("code".into())
+        );
     }
 
     #[test]
@@ -3155,8 +3326,14 @@ mod tests {
         let mut a = online();
         a.on_invite(inv(5), false);
         assert_eq!(shown_gid(&a), Some(5));
-        assert!(a.toasts.iter().any(|t| t.text.contains("g5")), "тост остаётся");
-        assert!(a.log.iter().any(|l| l.text.contains("g5")), "строка лога остаётся");
+        assert!(
+            a.toasts.iter().any(|t| t.text.contains("g5")),
+            "тост остаётся"
+        );
+        assert!(
+            a.log.iter().any(|l| l.text.contains("g5")),
+            "строка лога остаётся"
+        );
         // Посторонняя клавиша окно не закрывает и ничего не шлёт.
         assert!(press(&mut a, KeyCode::Char('z')).is_none());
         assert_eq!(shown_gid(&a), Some(5));
@@ -3171,7 +3348,10 @@ mod tests {
         assert!(a.stack.is_empty() && !a.has_invite(5));
 
         a.on_invite(inv(6), false);
-        assert!(matches!(press(&mut a, KeyCode::Char('y')), Some(Cmd::Join(6))));
+        assert!(matches!(
+            press(&mut a, KeyCode::Char('y')),
+            Some(Cmd::Join(6))
+        ));
         // Русская раскладка: «н» на месте «y», но читается как «нет» —
         // не принимает (и не отклоняет), окно остаётся, видна подсказка.
         a.on_invite(inv(7), false);
@@ -3192,7 +3372,10 @@ mod tests {
         a.on_invite(inv(2), false);
         a.on_invite(inv(3), false);
         assert!(press(&mut a, KeyCode::Esc).is_none()); // 1 — «позже»
-        assert!(matches!(press(&mut a, KeyCode::Char('n')), Some(Cmd::DeclineInvite(2))));
+        assert!(matches!(
+            press(&mut a, KeyCode::Char('n')),
+            Some(Cmd::DeclineInvite(2))
+        ));
         assert_eq!(shown_gid(&a), Some(3));
         a.stack.push(Popup::Confirm(ConfirmPopup {
             title: String::new(),
@@ -3207,9 +3390,15 @@ mod tests {
         a.on_server(a2);
         assert!(!a.has_invite(1) && !a.has_invite(3));
         assert!(a.invites.is_empty() && a.later_invites.is_empty() && a.declined.is_empty());
-        assert!(matches!(a.stack.as_slice(), [Popup::Help]), "окна без gid остаются");
+        assert!(
+            matches!(a.stack.as_slice(), [Popup::Help]),
+            "окна без gid остаются"
+        );
         a.reopen_invites();
-        assert!(shown_gid(&a).is_none(), "«o» не вернёт приглашение старого сервера");
+        assert!(
+            shown_gid(&a).is_none(),
+            "«o» не вернёт приглашение старого сервера"
+        );
         // Отказ на старом сервере не глушит приглашение с тем же gid на новом.
         a.stack.clear();
         a.on_invite(inv(2), false);
@@ -3220,10 +3409,16 @@ mod tests {
     fn приглашение_отклонить_шлёт_decline() {
         let mut a = online();
         a.on_invite(inv(3), false);
-        assert!(matches!(press(&mut a, KeyCode::Char('n')), Some(Cmd::DeclineInvite(3))));
+        assert!(matches!(
+            press(&mut a, KeyCode::Char('n')),
+            Some(Cmd::DeclineInvite(3))
+        ));
         assert!(a.stack.is_empty() && !a.has_invite(3));
         a.on_invite(inv(4), false);
-        assert!(matches!(press(&mut a, KeyCode::Char('т')), Some(Cmd::DeclineInvite(4))));
+        assert!(matches!(
+            press(&mut a, KeyCode::Char('т')),
+            Some(Cmd::DeclineInvite(4))
+        ));
     }
 
     #[test]
@@ -3261,7 +3456,10 @@ mod tests {
         assert_eq!(a.invites.len(), 1);
         assert_eq!(a.invites[0].group_name, "новое имя");
         // Ответ на первое — сразу показывается второе.
-        assert!(matches!(press(&mut a, KeyCode::Char('n')), Some(Cmd::DeclineInvite(1))));
+        assert!(matches!(
+            press(&mut a, KeyCode::Char('n')),
+            Some(Cmd::DeclineInvite(1))
+        ));
         assert_eq!(shown_gid(&a), Some(2));
         assert!(matches!(press(&mut a, KeyCode::Enter), Some(Cmd::Join(2))));
         assert!(a.stack.is_empty() && a.invites.is_empty());
@@ -3272,7 +3470,10 @@ mod tests {
         let mut a = online();
         a.open_create_group();
         a.on_invite(inv(9), false);
-        assert!(matches!(a.stack.last(), Some(Popup::Input(_))), "ввод пользователя не тронут");
+        assert!(
+            matches!(a.stack.last(), Some(Popup::Input(_))),
+            "ввод пользователя не тронут"
+        );
         assert_eq!(a.stack.len(), 1);
         assert_eq!(a.invites.len(), 1);
         // Окно ввода закрыли — приглашение показывается.
@@ -3286,7 +3487,10 @@ mod tests {
         let mut a = online();
         a.filtering = true;
         a.on_invite(inv(9), false);
-        assert!(a.stack.is_empty(), "буквы фильтра ушли бы в окно приглашения");
+        assert!(
+            a.stack.is_empty(),
+            "буквы фильтра ушли бы в окно приглашения"
+        );
         assert_eq!(a.invites.len(), 1);
         a.pump_invites();
         assert!(a.stack.is_empty());
@@ -3302,11 +3506,16 @@ mod tests {
         for g in [1, 2, 3] {
             a.on_invite(inv(g), false);
         }
-        let Some(Popup::Invite(i)) = a.stack.pop() else { panic!() };
+        let Some(Popup::Invite(i)) = a.stack.pop() else {
+            panic!()
+        };
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(a.invite_key(i, ctrl_c).is_none());
         a.pump_invites();
-        assert!(a.stack.is_empty(), "следующий Ctrl-C должен выйти, а не открыть окно");
+        assert!(
+            a.stack.is_empty(),
+            "следующий Ctrl-C должен выйти, а не открыть окно"
+        );
         assert!(a.invites.is_empty());
         let later: Vec<u32> = a.later_invites.iter().map(|i| i.gid).collect();
         assert_eq!(later, vec![1, 2, 3], "ничего не потеряно, порядок тот же");
@@ -3368,14 +3577,23 @@ mod tests {
         a.on_invite(inv(1), false);
         a.on_invite(inv(2), false);
         // Отклонили 1, затем 2 (защиту от промаха press() снимает).
-        assert!(matches!(press(&mut a, KeyCode::Char('n')), Some(Cmd::DeclineInvite(1))));
-        assert!(matches!(press(&mut a, KeyCode::Char('n')), Some(Cmd::DeclineInvite(2))));
+        assert!(matches!(
+            press(&mut a, KeyCode::Char('n')),
+            Some(Cmd::DeclineInvite(1))
+        ));
+        assert!(matches!(
+            press(&mut a, KeyCode::Char('n')),
+            Some(Cmd::DeclineInvite(2))
+        ));
         assert!(!a.has_invite(2));
         // Ответ на отказ от 1 пришёл поздно — собран до отказа от 2: [2].
         let mut stale = inv(2);
         stale.received_at = Instant::now();
         a.on_invite(stale, false);
-        assert!(!a.has_invite(2) && a.stack.is_empty(), "отклонённое снова на экране");
+        assert!(
+            !a.has_invite(2) && a.stack.is_empty(),
+            "отклонённое снова на экране"
+        );
         assert!(a.sync_invites(&[2], 0, true).is_empty());
         // То же для `:decline`-пути — через note_declined.
         a.on_invite(inv(3), false);
@@ -3415,7 +3633,10 @@ mod tests {
         // Список собран сервером до приглашения 2 и пришёл после него.
         let gone = a.sync_invites(&[], 0, true);
         assert_eq!(gone, vec![(1, "g1".to_string())]);
-        assert!(a.has_invite(2), "свежее приглашение не снято устаревшим списком");
+        assert!(
+            a.has_invite(2),
+            "свежее приглашение не снято устаревшим списком"
+        );
     }
 
     #[test]
@@ -3436,21 +3657,29 @@ mod tests {
         let mut a = online();
         a.on_invite(inv(4), false);
         // Окно только что появилось: Enter и «n» не отвечают.
-        let Some(Popup::Invite(i)) = a.stack.pop() else { panic!() };
+        let Some(Popup::Invite(i)) = a.stack.pop() else {
+            panic!()
+        };
         assert!(i.shown_at.is_some());
         assert!(a.invite_key(i, key(KeyCode::Enter)).is_none());
         assert_eq!(shown_gid(&a), Some(4));
-        let Some(Popup::Invite(i)) = a.stack.pop() else { panic!() };
+        let Some(Popup::Invite(i)) = a.stack.pop() else {
+            panic!()
+        };
         assert!(a.invite_key(i, key(KeyCode::Char('n'))).is_none());
         assert_eq!(shown_gid(&a), Some(4));
         // Esc («Позже») — сразу; приглашение не отклонено.
-        let Some(Popup::Invite(i)) = a.stack.pop() else { panic!() };
+        let Some(Popup::Invite(i)) = a.stack.pop() else {
+            panic!()
+        };
         assert!(a.invite_key(i, key(KeyCode::Esc)).is_none());
         assert!(a.stack.is_empty());
         assert!(a.has_invite(4));
         // Ctrl-«n» / Ctrl-C — тоже только «Позже».
         a.reopen_invites();
-        let Some(Popup::Invite(mut i)) = a.stack.pop() else { panic!() };
+        let Some(Popup::Invite(mut i)) = a.stack.pop() else {
+            panic!()
+        };
         i.shown_at = None;
         let ctrl_n = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL);
         assert!(a.invite_key(i, ctrl_n).is_none());
@@ -3476,7 +3705,10 @@ mod tests {
     fn приглашение_без_связи_и_уже_в_группе() {
         let mut a = app(); // не подключено
         a.on_invite(inv(5), false);
-        assert!(press(&mut a, KeyCode::Enter).is_none(), "без связи команда не уйдёт");
+        assert!(
+            press(&mut a, KeyCode::Enter).is_none(),
+            "без связи команда не уйдёт"
+        );
         assert!(a.has_invite(5), "приглашение отложено, не потеряно");
         // Уже участник / автовход — окна нет, только лог.
         let mut a = online();
@@ -3556,30 +3788,56 @@ mod tests {
     fn управление_группой_открыть_получить_снять_бан_отозвать_передать() {
         let mut a = owner_app();
         assert!(matches!(a.open_admin(), Some(Cmd::GroupAdmin(1))));
-        assert_eq!(admin_view(&a).members.len(), 1, "кандидаты на передачу — участники группы");
+        assert_eq!(
+            admin_view(&a).members.len(),
+            1,
+            "кандидаты на передачу — участники группы"
+        );
         assert!(a.admin_open(1));
 
-        a.on_admin_info(1, vec![([3; 32], "charlie".into())], vec![([4; 32], "delta".into(), 3600)]);
+        a.on_admin_info(
+            1,
+            vec![([3; 32], "charlie".into())],
+            vec![([4; 32], "delta".into(), 3600)],
+        );
         let v = admin_view(&a);
         assert_eq!(v.bans.len(), 1);
         assert_eq!(v.invites[0].expires_in_secs, 3600);
 
         // Разбанить → UNBAN и повторный запрос данных.
         let cmds = a.admin_key(key(KeyCode::Enter));
-        assert!(matches!(cmds[..], [Cmd::Unban(1, pk), Cmd::GroupAdmin(1)] if pk == [3; 32]), "{cmds:?}");
+        assert!(
+            matches!(cmds[..], [Cmd::Unban(1, pk), Cmd::GroupAdmin(1)] if pk == [3; 32]),
+            "{cmds:?}"
+        );
         // Отозвать приглашение → KICK приглашённого и обновление.
         assert!(a.admin_key(key(KeyCode::Char('2'))).is_empty());
         let cmds = a.admin_key(key(KeyCode::Enter));
-        assert!(matches!(cmds[..], [Cmd::Kick(1, pk), Cmd::GroupAdmin(1)] if pk == [4; 32]), "{cmds:?}");
+        assert!(
+            matches!(cmds[..], [Cmd::Kick(1, pk), Cmd::GroupAdmin(1)] if pk == [4; 32]),
+            "{cmds:?}"
+        );
         // r — обновить.
-        assert!(matches!(a.admin_key(key(KeyCode::Char('r')))[..], [Cmd::GroupAdmin(1)]));
+        assert!(matches!(
+            a.admin_key(key(KeyCode::Char('r')))[..],
+            [Cmd::GroupAdmin(1)]
+        ));
         // Передача — только после явного «y».
         assert!(a.admin_key(key(KeyCode::Char('3'))).is_empty());
-        assert!(a.admin_key(key(KeyCode::Enter)).is_empty(), "Enter лишь открывает подтверждение");
+        assert!(
+            a.admin_key(key(KeyCode::Enter)).is_empty(),
+            "Enter лишь открывает подтверждение"
+        );
         assert!(admin_view(&a).confirm.is_some());
-        assert!(a.admin_key(key(KeyCode::Enter)).is_empty(), "повторный Enter не передаёт");
+        assert!(
+            a.admin_key(key(KeyCode::Enter)).is_empty(),
+            "повторный Enter не передаёт"
+        );
         let cmds = a.admin_key(key(KeyCode::Char('y')));
-        assert!(matches!(cmds[..], [Cmd::Transfer(1, pk)] if pk == [2; 32]), "{cmds:?}");
+        assert!(
+            matches!(cmds[..], [Cmd::Transfer(1, pk)] if pk == [2; 32]),
+            "{cmds:?}"
+        );
         assert!(a.stack.is_empty(), "после передачи экран закрыт");
     }
 
@@ -3613,8 +3871,16 @@ mod tests {
     fn servers_cfg() -> Config {
         Config {
             servers: vec![
-                StoredServer { addr: "127.0.0.1:5599".into(), pubkey: proto::hex_of(&[1; 32]), label: "дом".into() },
-                StoredServer { addr: "127.0.0.2:5600".into(), pubkey: proto::hex_of(&[2; 32]), label: String::new() },
+                StoredServer {
+                    addr: "127.0.0.1:5599".into(),
+                    pubkey: proto::hex_of(&[1; 32]),
+                    label: "дом".into(),
+                },
+                StoredServer {
+                    addr: "127.0.0.2:5600".into(),
+                    pubkey: proto::hex_of(&[2; 32]),
+                    label: String::new(),
+                },
             ],
             ..Config::default()
         }
@@ -3665,7 +3931,10 @@ mod tests {
         // Движок сообщил о переключении — текущий отмечен.
         a.on_server_switched("127.0.0.2:5600".parse().unwrap());
         assert_eq!(servers_view(&a).current, 1);
-        assert!(matches!(srv_key(&mut a, &mut cfg, KeyCode::Esc), (None, false)));
+        assert!(matches!(
+            srv_key(&mut a, &mut cfg, KeyCode::Esc),
+            (None, false)
+        ));
         assert!(a.stack.is_empty());
     }
 
@@ -3694,7 +3963,10 @@ mod tests {
 
         // Удалить (с подтверждением); текущий удалить нельзя.
         srv_key(&mut a, &mut cfg, KeyCode::Home);
-        assert!(matches!(srv_key(&mut a, &mut cfg, KeyCode::Char('d')), (None, false)));
+        assert!(matches!(
+            srv_key(&mut a, &mut cfg, KeyCode::Char('d')),
+            (None, false)
+        ));
         assert_eq!(cfg.servers.len(), 3);
         srv_key(&mut a, &mut cfg, KeyCode::Down);
         srv_key(&mut a, &mut cfg, KeyCode::Char('d'));
@@ -3716,7 +3988,13 @@ mod tests {
         assert!(cmd.is_none() && save);
         assert_eq!(cfg.adapter, "Game");
         assert_eq!(cfg.dll, "C:\\w.dll");
-        assert!(servers_view(&a).notice.as_deref().unwrap_or("").contains("после перезапуска"));
+        assert!(
+            servers_view(&a)
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("после перезапуска")
+        );
     }
 
     // ---------- раскладка, алиасы, невидимка ----------
@@ -3737,8 +4015,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir()
-            .join(format!("voidlink-tui-{}-{nanos}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("voidlink-tui-{}-{nanos}", std::process::id()));
         let server = tunnel_server::Server::start(tunnel_server::Config {
             listen: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
             data_dir: dir,
@@ -3764,7 +4041,10 @@ mod tests {
     fn eventually(what: &str, mut f: impl FnMut() -> bool) {
         let t0 = Instant::now();
         while !f() {
-            assert!(t0.elapsed() < Duration::from_secs(5), "не дождались: {what}");
+            assert!(
+                t0.elapsed() < Duration::from_secs(5),
+                "не дождались: {what}"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -3772,8 +4052,14 @@ mod tests {
     fn friend_cfg() -> Config {
         Config {
             friends: vec![
-                StoredFriend { pubkey: proto::hex_of(&[2; 32]), alias: "bob".into() },
-                StoredFriend { pubkey: proto::hex_of(&[3; 32]), alias: "eve".into() },
+                StoredFriend {
+                    pubkey: proto::hex_of(&[2; 32]),
+                    alias: "bob".into(),
+                },
+                StoredFriend {
+                    pubkey: proto::hex_of(&[3; 32]),
+                    alias: "eve".into(),
+                },
             ],
             ..Config::default()
         }
@@ -3790,7 +4076,10 @@ mod tests {
         assert_eq!(latin_key(ch('Щ')).code, KeyCode::Char('O'));
         assert_eq!(latin_key(ch('o')).code, KeyCode::Char('o'));
         let ctrl = KeyEvent::new(KeyCode::Char('с'), KeyModifiers::CONTROL);
-        assert_eq!(latin_key(ctrl), KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(
+            latin_key(ctrl),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+        );
         assert!(!a.text_input_active());
         a.filtering = true;
         assert!(a.text_input_active(), "строка поиска — текст");
@@ -3829,7 +4118,10 @@ mod tests {
         a.handle_key(ch('ы'), &eng);
         assert_ne!(a.sort, before);
         // Ctrl+С (кириллица) — выход.
-        a.handle_key(KeyEvent::new(KeyCode::Char('с'), KeyModifiers::CONTROL), &eng);
+        a.handle_key(
+            KeyEvent::new(KeyCode::Char('с'), KeyModifiers::CONTROL),
+            &eng,
+        );
         assert!(a.quit);
     }
 
@@ -3861,13 +4153,31 @@ mod tests {
         assert!(a.stack.is_empty());
         let alias = |eng: &dyn EngineApi, pk: [u8; 32]| {
             let hex = proto::hex_of(&pk);
-            eng.snapshot().cfg.friends.iter().find(|f| f.pubkey == hex).unwrap().alias.clone()
+            eng.snapshot()
+                .cfg
+                .friends
+                .iter()
+                .find(|f| f.pubkey == hex)
+                .unwrap()
+                .alias
+                .clone()
         };
-        eventually("алиас Боря в конфиге движка", || alias(&eng, [2; 32]) == "Боря");
-        assert_eq!(a.friends.iter().find(|f| f.pubkey == [2; 32]).unwrap().alias, "Боря");
+        eventually("алиас Боря в конфиге движка", || {
+            alias(&eng, [2; 32]) == "Боря"
+        });
+        assert_eq!(
+            a.friends
+                .iter()
+                .find(|f| f.pubkey == [2; 32])
+                .unwrap()
+                .alias,
+            "Боря"
+        );
         // :alias по алиасу; занятый алиас и неизвестный друг — ошибки.
         a.run_command("alias eve Ева Ивановна", &eng).unwrap();
-        eventually("алиас Ева в конфиге движка", || alias(&eng, [3; 32]) == "Ева Ивановна");
+        eventually("алиас Ева в конфиге движка", || {
+            alias(&eng, [3; 32]) == "Ева Ивановна"
+        });
         assert!(a.run_command("alias Боря Ева Ивановна", &eng).is_err());
         assert!(a.run_command("alias nobody x", &eng).is_err());
         // Вне списка друзей «r» — обновление списка групп.
@@ -3880,7 +4190,10 @@ mod tests {
     fn парс_алиаса_и_правка_конфига() {
         assert_eq!(
             parse_command("alias bob Боря Петров").unwrap(),
-            Command::Alias { friend: "bob".into(), name: "Боря Петров".into() }
+            Command::Alias {
+                friend: "bob".into(),
+                name: "Боря Петров".into()
+            }
         );
         assert!(parse_command("alias bob").is_err());
         assert!(parse_command("alias").is_err());
@@ -3891,7 +4204,10 @@ mod tests {
         assert!(rename_friend_in(&mut cfg, &[2; 32], "eve").is_err());
         assert!(rename_friend_in(&mut cfg, &[4; 32], "x").is_err());
         assert_eq!(resolve_friend_in(&cfg, "eve").unwrap(), [3; 32]);
-        assert_eq!(resolve_friend_in(&cfg, &proto::hex_of(&[2; 32])).unwrap(), [2; 32]);
+        assert_eq!(
+            resolve_friend_in(&cfg, &proto::hex_of(&[2; 32])).unwrap(),
+            [2; 32]
+        );
     }
 
     #[test]
@@ -3900,14 +4216,24 @@ mod tests {
         let mut a = app();
         assert!(!a.invisible);
         a.handle_key(key(KeyCode::F(3)), &eng);
-        let row = SETTING_ROWS.iter().position(|r| *r == SettingRow::Invisible).unwrap();
+        let row = SETTING_ROWS
+            .iter()
+            .position(|r| *r == SettingRow::Invisible)
+            .unwrap();
         for _ in 0..row {
             a.handle_key(key(KeyCode::Down), &eng);
         }
         a.handle_key(key(KeyCode::Enter), &eng);
         assert!(a.invisible);
-        assert!(a.toasts.iter().any(|t| t.text.contains("невидимка включена")));
-        assert!(matches!(a.stack.last(), Some(Popup::Settings(_))), "настройки остаются открытыми");
+        assert!(
+            a.toasts
+                .iter()
+                .any(|t| t.text.contains("невидимка включена"))
+        );
+        assert!(
+            matches!(a.stack.last(), Some(Popup::Settings(_))),
+            "настройки остаются открытыми"
+        );
         a.stack.clear();
         a.run_command("invisible off", &eng).unwrap();
         assert!(!a.invisible);

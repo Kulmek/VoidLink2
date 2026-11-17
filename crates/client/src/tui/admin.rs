@@ -359,7 +359,11 @@ pub fn human_expiry(secs: u64) -> String {
 
 /// Короткий отпечаток ключа: первые 4 байта в hex.
 fn short_pk(pk: &[u8; 32]) -> String {
-    pk[..4].iter().map(|b| format!("{b:02x}")).collect::<String>() + "…"
+    pk[..4]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
+        + "…"
 }
 
 fn key(code: KeyCode) -> KeyEvent {
@@ -525,7 +529,11 @@ fn draw_table(f: &mut Frame, th: &Theme, v: &AdminView, area: Rect) {
         ),
         AdminTab::Invites => (
             Row::new(["Имя", "Ключ", "Истекает"]),
-            vec![Constraint::Fill(1), Constraint::Length(10), Constraint::Length(11)],
+            vec![
+                Constraint::Fill(1),
+                Constraint::Length(10),
+                Constraint::Length(11),
+            ],
             v.invites
                 .iter()
                 .map(|e| {
@@ -544,7 +552,11 @@ fn draw_table(f: &mut Frame, th: &Theme, v: &AdminView, area: Rect) {
         ),
         AdminTab::Transfer => (
             Row::new(["Имя", "IP", "Ключ"]),
-            vec![Constraint::Fill(1), Constraint::Length(15), Constraint::Length(10)],
+            vec![
+                Constraint::Fill(1),
+                Constraint::Length(15),
+                Constraint::Length(10),
+            ],
             v.members
                 .iter()
                 .map(|e| {
@@ -562,7 +574,10 @@ fn draw_table(f: &mut Frame, th: &Theme, v: &AdminView, area: Rect) {
     let visible = area.height.saturating_sub(1) as usize;
     let need_scroll = len > visible;
     let table_area = if need_scroll {
-        Rect { width: area.width.saturating_sub(1), ..area }
+        Rect {
+            width: area.width.saturating_sub(1),
+            ..area
+        }
     } else {
         area
     };
@@ -608,7 +623,11 @@ fn draw_actions(f: &mut Frame, th: &Theme, v: &AdminView, row: Rect) {
     let refresh = ("Обновить (r)", Btn::Normal, key(KeyCode::Char('r')));
     let close = ("Закрыть (Esc)", Btn::Normal, key(KeyCode::Esc));
     // При пустом списке главная кнопка — нейтральная: делать нечего.
-    let items = [(main.0, if empty { Btn::Normal } else { main.1 }, enter), refresh, close];
+    let items = [
+        (main.0, if empty { Btn::Normal } else { main.1 }, enter),
+        refresh,
+        close,
+    ];
     if v.confirm.is_none() {
         draw_buttons(f, th, &v.hits.buttons, row, &items);
     } else {
@@ -639,9 +658,16 @@ fn draw_confirm(f: &mut Frame, th: &Theme, v: &AdminView, c: &TransferConfirm, a
         )),
     ];
     let inner = block.inner(rect);
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }).block(block), rect);
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: true }).block(block),
+        rect,
+    );
     if inner.height >= 2 {
-        let row = Rect { y: inner.bottom() - 1, height: 1, ..inner };
+        let row = Rect {
+            y: inner.bottom() - 1,
+            height: 1,
+            ..inner
+        };
         draw_buttons(
             f,
             th,
@@ -673,16 +699,38 @@ mod tests {
         let mut v = AdminView::new(7, "Дача");
         v.set_data(
             vec![
-                BanEntry { pk: pk(1), name: "troll".into() },
-                BanEntry { pk: pk(2), name: "спамер".into() },
+                BanEntry {
+                    pk: pk(1),
+                    name: "troll".into(),
+                },
+                BanEntry {
+                    pk: pk(2),
+                    name: "спамер".into(),
+                },
             ],
             vec![
-                InviteEntry { pk: pk(3), name: "вася".into(), expires_in_secs: 6 * 86400 + 100 },
-                InviteEntry { pk: pk(4), name: "петя".into(), expires_in_secs: 3 * 3600 + 5 },
+                InviteEntry {
+                    pk: pk(3),
+                    name: "вася".into(),
+                    expires_in_secs: 6 * 86400 + 100,
+                },
+                InviteEntry {
+                    pk: pk(4),
+                    name: "петя".into(),
+                    expires_in_secs: 3 * 3600 + 5,
+                },
             ],
             vec![
-                MemberEntry { pk: pk(5), name: "маша".into(), ip: Ipv4Addr::new(10, 66, 0, 5) },
-                MemberEntry { pk: pk(6), name: "коля".into(), ip: Ipv4Addr::new(10, 66, 0, 6) },
+                MemberEntry {
+                    pk: pk(5),
+                    name: "маша".into(),
+                    ip: Ipv4Addr::new(10, 66, 0, 5),
+                },
+                MemberEntry {
+                    pk: pk(6),
+                    name: "коля".into(),
+                    ip: Ipv4Addr::new(10, 66, 0, 6),
+                },
             ],
         );
         v
@@ -762,7 +810,10 @@ mod tests {
                 let buf = render(&v, kind, 80, 20);
                 let s = text(&buf);
                 assert!(s.contains("Управление группой «Дача»"), "{s}");
-                assert!(s.contains("Баны (2)") && s.contains("Приглашения (2)"), "{s}");
+                assert!(
+                    s.contains("Баны (2)") && s.contains("Приглашения (2)"),
+                    "{s}"
+                );
                 // Скруглённая рамка цвета акцента.
                 let (x0, y0) = find(&buf, "╭");
                 assert_eq!(buf[(x0, y0)].fg, th.accent.fg.unwrap());
@@ -807,10 +858,22 @@ mod tests {
             let mut v = demo();
             for tab in AdminTab::ALL {
                 v.set_tab(tab);
-                for (w, h) in [(80, 24), (40, 12), (30, 10), (20, 6), (10, 4), (3, 3), (1, 1), (0, 0)] {
+                for (w, h) in [
+                    (80, 24),
+                    (40, 12),
+                    (30, 10),
+                    (20, 6),
+                    (10, 4),
+                    (3, 3),
+                    (1, 1),
+                    (0, 0),
+                ] {
                     let _ = render(&v, kind, w, h);
                 }
-                v.confirm = Some(TransferConfirm { pk: pk(5), name: "маша".into() });
+                v.confirm = Some(TransferConfirm {
+                    pk: pk(5),
+                    name: "маша".into(),
+                });
                 for (w, h) in [(40, 12), (20, 6), (5, 3)] {
                     let _ = render(&v, kind, w, h);
                 }
@@ -826,14 +889,22 @@ mod tests {
     #[test]
     fn длинный_список_прокручивается_с_полосой() {
         let mut v = AdminView::new(1, "g");
-        let bans = (0..40u8).map(|i| BanEntry { pk: pk(i), name: format!("user{i}") }).collect();
+        let bans = (0..40u8)
+            .map(|i| BanEntry {
+                pk: pk(i),
+                name: format!("user{i}"),
+            })
+            .collect();
         v.set_data(bans, vec![], vec![]);
         handle_key(&mut v, k(KeyCode::End));
         assert_eq!(v.selected, 39);
         let buf = render(&v, ThemeKind::Dark, 80, 30);
         let s = text(&buf);
         assert!(s.contains("user39") && !s.contains("user0 "), "{s}");
-        assert!(s.contains('█') || s.contains('▐') || s.contains('║'), "нет полосы: {s}");
+        assert!(
+            s.contains('█') || s.contains('▐') || s.contains('║'),
+            "нет полосы: {s}"
+        );
         let (_, off) = v.hits.rows.get();
         assert!(off > 0);
     }
@@ -858,7 +929,10 @@ mod tests {
         assert_eq!(v.selected, 1);
         assert_eq!(handle_key(&mut v, k(KeyCode::Down)), None);
         assert_eq!(v.selected, 1, "упор в край");
-        assert_eq!(handle_key(&mut v, k(KeyCode::Enter)), Some(AdminAction::Unban(7, pk(2))));
+        assert_eq!(
+            handle_key(&mut v, k(KeyCode::Enter)),
+            Some(AdminAction::Unban(7, pk(2)))
+        );
 
         assert_eq!(handle_key(&mut v, k(KeyCode::Tab)), None);
         assert_eq!(v.tab, AdminTab::Invites);
@@ -870,12 +944,18 @@ mod tests {
 
         assert_eq!(handle_key(&mut v, k(KeyCode::Char('3'))), None);
         assert_eq!(v.tab, AdminTab::Transfer);
-        assert_eq!(handle_key(&mut v, k(KeyCode::Char('r'))), Some(AdminAction::Refresh(7)));
+        assert_eq!(
+            handle_key(&mut v, k(KeyCode::Char('r'))),
+            Some(AdminAction::Refresh(7))
+        );
         assert_eq!(handle_key(&mut v, k(KeyCode::BackTab)), None);
         assert_eq!(v.tab, AdminTab::Invites);
         assert_eq!(handle_key(&mut v, k(KeyCode::Left)), None);
         assert_eq!(v.tab, AdminTab::Bans);
-        assert_eq!(handle_key(&mut v, k(KeyCode::Esc)), Some(AdminAction::Close));
+        assert_eq!(
+            handle_key(&mut v, k(KeyCode::Esc)),
+            Some(AdminAction::Close)
+        );
     }
 
     #[test]
@@ -892,7 +972,10 @@ mod tests {
         handle_key(&mut v, k(KeyCode::Enter));
         assert_eq!(handle_key(&mut v, k(KeyCode::Tab)), None);
         assert_eq!(v.tab, AdminTab::Transfer);
-        assert_eq!(handle_key(&mut v, k(KeyCode::Char('y'))), Some(AdminAction::Transfer(7, pk(6))));
+        assert_eq!(
+            handle_key(&mut v, k(KeyCode::Char('y'))),
+            Some(AdminAction::Transfer(7, pk(6)))
+        );
         assert!(v.confirm.is_none());
     }
 
@@ -921,7 +1004,10 @@ mod tests {
         assert_eq!(handle_key(&mut v, k(KeyCode::Char('д'))), None);
         assert!(v.confirm.is_some());
         // Физическая Y — «н», подтверждение.
-        assert_eq!(handle_key(&mut v, k(KeyCode::Char('н'))), Some(AdminAction::Transfer(7, pk(5))));
+        assert_eq!(
+            handle_key(&mut v, k(KeyCode::Char('н'))),
+            Some(AdminAction::Transfer(7, pk(5)))
+        );
     }
 
     #[test]
@@ -945,7 +1031,11 @@ mod tests {
         v.set_tab(AdminTab::Transfer);
         handle_key(&mut v, k(KeyCode::Enter));
         assert!(v.confirm.is_some());
-        let members = vec![MemberEntry { pk: pk(6), name: "коля".into(), ip: Ipv4Addr::new(10, 66, 0, 6) }];
+        let members = vec![MemberEntry {
+            pk: pk(6),
+            name: "коля".into(),
+            ip: Ipv4Addr::new(10, 66, 0, 6),
+        }];
         v.set_data(v.bans.clone(), v.invites.clone(), members);
         assert!(v.confirm.is_none());
         assert_eq!(v.selected, 0);
@@ -965,17 +1055,28 @@ mod tests {
         assert_eq!(handle_mouse(&mut v, click(x, y)), None);
         assert_eq!(v.selected, 1);
         let (x, y) = find(&buf, "Отозвать");
-        assert_eq!(handle_mouse(&mut v, click(x, y)), Some(AdminAction::RevokeInvite(7, pk(4))));
+        assert_eq!(
+            handle_mouse(&mut v, click(x, y)),
+            Some(AdminAction::RevokeInvite(7, pk(4)))
+        );
 
         // Колесо — выбор с упором в края.
-        let wheel = |kind| MouseEvent { kind, column: 0, row: 0, modifiers: KeyModifiers::NONE };
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
         handle_mouse(&mut v, wheel(MouseEventKind::ScrollUp));
         handle_mouse(&mut v, wheel(MouseEventKind::ScrollUp));
         assert_eq!(v.selected, 0);
 
         // Кнопка «Обновить» и клик мимо попапа.
         let (x, y) = find(&buf, "Обновить");
-        assert_eq!(handle_mouse(&mut v, click(x, y)), Some(AdminAction::Refresh(7)));
+        assert_eq!(
+            handle_mouse(&mut v, click(x, y)),
+            Some(AdminAction::Refresh(7))
+        );
         assert_eq!(handle_mouse(&mut v, click(0, 0)), Some(AdminAction::Close));
     }
 
@@ -990,7 +1091,10 @@ mod tests {
 
         let buf = render(&v, ThemeKind::Contrast, 80, 20);
         let s = text(&buf);
-        assert!(s.contains("Передать владение?") && s.contains("маша"), "{s}");
+        assert!(
+            s.contains("Передать владение?") && s.contains("маша"),
+            "{s}"
+        );
         // Клик мимо окна подтверждения — только отмена.
         assert_eq!(handle_mouse(&mut v, click(0, 0)), None);
         assert!(v.confirm.is_none());
@@ -998,6 +1102,9 @@ mod tests {
         handle_key(&mut v, k(KeyCode::Enter));
         let buf = render(&v, ThemeKind::Contrast, 80, 20);
         let (x, y) = find(&buf, "Да, передать");
-        assert_eq!(handle_mouse(&mut v, click(x, y)), Some(AdminAction::Transfer(7, pk(5))));
+        assert_eq!(
+            handle_mouse(&mut v, click(x, y)),
+            Some(AdminAction::Transfer(7, pk(5)))
+        );
     }
 }

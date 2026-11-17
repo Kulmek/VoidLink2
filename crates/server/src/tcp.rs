@@ -184,7 +184,14 @@ impl TcpSender {
     }
 
     fn close_all(&self) {
-        let drained: Vec<Conn> = self.reg.conns.lock().unwrap().drain().map(|(_, c)| c).collect();
+        let drained: Vec<Conn> = self
+            .reg
+            .conns
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, c)| c)
+            .collect();
         for c in drained {
             let _ = c.stream.shutdown(Shutdown::Both);
         }
@@ -304,7 +311,9 @@ fn admit(
     limits: &TcpLimits,
 ) -> io::Result<()> {
     stream.set_nodelay(true)?;
-    let tick = READ_TICK.min(limits.idle_timeout).max(Duration::from_millis(10));
+    let tick = READ_TICK
+        .min(limits.idle_timeout)
+        .max(Duration::from_millis(10));
     stream.set_read_timeout(Some(tick))?;
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     let reader_stream = stream.try_clone()?;
@@ -335,14 +344,16 @@ fn admit(
     let on_close = on_close.clone();
     let max_frame = limits.max_frame;
     let idle = limits.idle_timeout;
-    let spawned = thread::Builder::new().name("tcp-reader".into()).spawn(move || {
-        reader_loop(reader_stream, peer, max_frame, idle, &handler);
-        // Закрытие: запись реестра сбрасывается вместе с отправителем очереди —
-        // писатель выйдет.
-        if reader_reg.remove_if(peer, id) {
-            on_close(Peer::Tcp(peer));
-        }
-    });
+    let spawned = thread::Builder::new()
+        .name("tcp-reader".into())
+        .spawn(move || {
+            reader_loop(reader_stream, peer, max_frame, idle, &handler);
+            // Закрытие: запись реестра сбрасывается вместе с отправителем очереди —
+            // писатель выйдет.
+            if reader_reg.remove_if(peer, id) {
+                on_close(Peer::Tcp(peer));
+            }
+        });
     if let Err(e) = spawned {
         // Убираем запись: отправитель очереди сброшен, писатель завершится.
         reg.remove_if(peer, id);
@@ -363,7 +374,9 @@ fn read_full(s: &mut TcpStream, buf: &mut [u8], last_frame: Instant, idle: Durat
             Err(e)
                 if matches!(
                     e.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
                 ) => {}
             Err(_) => return false,
         }
@@ -375,7 +388,13 @@ fn read_full(s: &mut TcpStream, buf: &mut [u8], last_frame: Instant, idle: Durat
 }
 
 /// Читать рамки до ошибки, простоя или нарушения формата.
-fn reader_loop(mut s: TcpStream, peer: SocketAddr, max_frame: usize, idle: Duration, handler: &FrameHandler) {
+fn reader_loop(
+    mut s: TcpStream,
+    peer: SocketAddr,
+    max_frame: usize,
+    idle: Duration,
+    handler: &FrameHandler,
+) {
     let mut buf = vec![0u8; max_frame];
     let mut last_frame = Instant::now();
     loop {
@@ -502,7 +521,10 @@ mod tests {
         assert_eq!(read_frame(&mut c).unwrap(), b"reply");
 
         drop(c);
-        assert!(wait_until(|| !s.is_live(addr)), "закрытое соединение убрано из реестра");
+        assert!(
+            wait_until(|| !s.is_live(addr)),
+            "закрытое соединение убрано из реестра"
+        );
     }
 
     #[test]
@@ -513,12 +535,16 @@ mod tests {
         let on_close: CloseHandler = Arc::new(move |p| {
             let _ = ctx.lock().unwrap().send(p);
         });
-        let t = TcpTransport::start_with_close(loopback(), h, on_close, TcpLimits::default()).unwrap();
+        let t =
+            TcpTransport::start_with_close(loopback(), h, on_close, TcpLimits::default()).unwrap();
         let c = TcpStream::connect(t.local_addr()).unwrap();
         let me = c.local_addr().unwrap();
         assert!(wait_until(|| t.sender().conn_count() == 1));
         drop(c);
-        assert_eq!(crx.recv_timeout(Duration::from_secs(3)).unwrap(), Peer::Tcp(me));
+        assert_eq!(
+            crx.recv_timeout(Duration::from_secs(3)).unwrap(),
+            Peer::Tcp(me)
+        );
     }
 
     #[test]
@@ -543,7 +569,10 @@ mod tests {
         c.write_all(&101u16.to_le_bytes()).unwrap();
         assert!(is_closed(&mut c));
         assert!(rx.try_recv().is_err());
-        assert!(!t.sender().send(Peer::Tcp(c.local_addr().unwrap()), &[1u8; 101]));
+        assert!(
+            !t.sender()
+                .send(Peer::Tcp(c.local_addr().unwrap()), &[1u8; 101])
+        );
     }
 
     #[test]

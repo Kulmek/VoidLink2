@@ -88,7 +88,10 @@ pub enum Action {
     CopyIp,
     CopyCode,
     /// Войти (`join = true`) или выйти из группы.
-    ToggleGroup { gid: u32, join: bool },
+    ToggleGroup {
+        gid: u32,
+        join: bool,
+    },
     AcceptInvite(u32),
     DeclineInvite(u32),
     StopTunnel,
@@ -102,7 +105,9 @@ impl Action {
             Action::OpenTui => "open".into(),
             Action::CopyIp => "copy-ip".into(),
             Action::CopyCode => "copy-code".into(),
-            Action::ToggleGroup { gid, join } => format!("group:{gid}:{}", if join { 1 } else { 0 }),
+            Action::ToggleGroup { gid, join } => {
+                format!("group:{gid}:{}", if join { 1 } else { 0 })
+            }
             Action::AcceptInvite(gid) => format!("accept:{gid}"),
             Action::DeclineInvite(gid) => format!("decline:{gid}"),
             Action::StopTunnel => "stop".into(),
@@ -127,7 +132,10 @@ impl Action {
                             "0" => false,
                             _ => return None,
                         };
-                        Action::ToggleGroup { gid: gid.parse().ok()?, join }
+                        Action::ToggleGroup {
+                            gid: gid.parse().ok()?,
+                            join,
+                        }
                     }
                     "accept" => Action::AcceptInvite(rest.parse().ok()?),
                     "decline" => Action::DeclineInvite(rest.parse().ok()?),
@@ -140,18 +148,34 @@ impl Action {
     /// Действие выполняет сам трей (буфер обмена, запуск TUI, остановка
     /// службы через UAC `sc stop`, выход), а не демон через `TrayBackend::act`.
     pub fn is_local(self) -> bool {
-        matches!(self, Action::OpenTui | Action::CopyIp | Action::CopyCode | Action::StopTunnel | Action::Exit)
+        matches!(
+            self,
+            Action::OpenTui | Action::CopyIp | Action::CopyCode | Action::StopTunnel | Action::Exit
+        )
     }
 }
 
 /// Пункт меню — независимое от `muda` описание.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuEntry {
-    Item { action: Action, label: String, enabled: bool },
-    Check { action: Action, label: String, checked: bool, enabled: bool },
+    Item {
+        action: Action,
+        label: String,
+        enabled: bool,
+    },
+    Check {
+        action: Action,
+        label: String,
+        checked: bool,
+        enabled: bool,
+    },
     /// Неактивная строка-подпись (статус, «нет групп»).
     Label(String),
-    Submenu { label: String, enabled: bool, items: Vec<MenuEntry> },
+    Submenu {
+        label: String,
+        enabled: bool,
+        items: Vec<MenuEntry>,
+    },
     Separator,
 }
 
@@ -170,7 +194,11 @@ pub fn build_menu(s: &TrayState) -> Vec<MenuEntry> {
     let online = s.conn == Conn::Connected;
     let mut m = vec![
         MenuEntry::Label(format!("Tunnel: {}", conn_text(s.conn))),
-        MenuEntry::Item { action: Action::OpenTui, label: "Открыть Tunnel".into(), enabled: true },
+        MenuEntry::Item {
+            action: Action::OpenTui,
+            label: "Открыть Tunnel".into(),
+            enabled: true,
+        },
         MenuEntry::Separator,
     ];
 
@@ -180,7 +208,10 @@ pub fn build_menu(s: &TrayState) -> Vec<MenuEntry> {
     } else {
         for g in &s.groups {
             m.push(MenuEntry::Check {
-                action: Action::ToggleGroup { gid: g.gid, join: !g.joined },
+                action: Action::ToggleGroup {
+                    gid: g.gid,
+                    join: !g.joined,
+                },
                 label: g.name.clone(),
                 checked: g.joined,
                 enabled: online,
@@ -197,12 +228,24 @@ pub fn build_menu(s: &TrayState) -> Vec<MenuEntry> {
             label: format!("{} (от {})", i.group_name, i.from),
             enabled: true,
             items: vec![
-                MenuEntry::Item { action: Action::AcceptInvite(i.gid), label: "Принять".into(), enabled: online },
-                MenuEntry::Item { action: Action::DeclineInvite(i.gid), label: "Отклонить".into(), enabled: online },
+                MenuEntry::Item {
+                    action: Action::AcceptInvite(i.gid),
+                    label: "Принять".into(),
+                    enabled: online,
+                },
+                MenuEntry::Item {
+                    action: Action::DeclineInvite(i.gid),
+                    label: "Отклонить".into(),
+                    enabled: online,
+                },
             ],
         })
         .collect();
-    m.push(MenuEntry::Submenu { label: format!("Приглашения ({n})"), enabled: n > 0, items });
+    m.push(MenuEntry::Submenu {
+        label: format!("Приглашения ({n})"),
+        enabled: n > 0,
+        items,
+    });
     m.push(MenuEntry::Separator);
 
     m.push(MenuEntry::Item {
@@ -219,8 +262,16 @@ pub fn build_menu(s: &TrayState) -> Vec<MenuEntry> {
         enabled: s.my_code.is_some(),
     });
     m.push(MenuEntry::Separator);
-    m.push(MenuEntry::Item { action: Action::StopTunnel, label: "Остановить туннель".into(), enabled: daemon });
-    m.push(MenuEntry::Item { action: Action::Exit, label: "Выход".into(), enabled: true });
+    m.push(MenuEntry::Item {
+        action: Action::StopTunnel,
+        label: "Остановить туннель".into(),
+        enabled: daemon,
+    });
+    m.push(MenuEntry::Item {
+        action: Action::Exit,
+        label: "Выход".into(),
+        enabled: true,
+    });
     m
 }
 
@@ -325,10 +376,17 @@ pub const DISCONNECT_NOTIFY_AFTER: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Notice {
-    Invite { gid: u32, group_name: String, from: String },
+    Invite {
+        gid: u32,
+        group_name: String,
+        from: String,
+    },
     /// Группа пропала без нашего выхода: исключили или удалили.
     /// Источник — только `TrayState::kicked` (события демона), не разница снимков.
-    Kicked { gid: u32, group_name: String },
+    Kicked {
+        gid: u32,
+        group_name: String,
+    },
     Disconnected,
     /// Ответ на своё действие из трея (`Ack` с ошибкой) и т.п. — показывается
     /// при любом `NotifyMode`: в TUI об этом никто не скажет.
@@ -339,13 +397,20 @@ impl Notice {
     /// Заголовок и текст toast.
     pub fn text(&self) -> (String, String) {
         match self {
-            Notice::Invite { group_name, from, .. } => {
-                ("Приглашение в группу".into(), format!("{from} приглашает в «{group_name}»"))
-            }
-            Notice::Kicked { group_name, .. } => {
-                ("Группа недоступна".into(), format!("Вы больше не в группе «{group_name}»"))
-            }
-            Notice::Disconnected => ("Нет связи".into(), "Tunnel не на связи больше 30 секунд".into()),
+            Notice::Invite {
+                group_name, from, ..
+            } => (
+                "Приглашение в группу".into(),
+                format!("{from} приглашает в «{group_name}»"),
+            ),
+            Notice::Kicked { group_name, .. } => (
+                "Группа недоступна".into(),
+                format!("Вы больше не в группе «{group_name}»"),
+            ),
+            Notice::Disconnected => (
+                "Нет связи".into(),
+                "Tunnel не на связи больше 30 секунд".into(),
+            ),
             Notice::Error(text) => ("Tunnel: ошибка".into(), text.clone()),
         }
     }
@@ -366,7 +431,11 @@ pub struct Notifier {
 
 impl Notifier {
     pub fn new(mode: NotifyMode) -> Self {
-        Self { mode, first: true, ..Default::default() }
+        Self {
+            mode,
+            first: true,
+            ..Default::default()
+        }
     }
 
     /// Отметить своё действие (вызывать при клике до `act`/локального выполнения).
@@ -394,7 +463,11 @@ impl Notifier {
             if !first {
                 for i in &s.invites {
                     if !self.seen_invites.contains(&i.gid) {
-                        out.push(Notice::Invite { gid: i.gid, group_name: i.group_name.clone(), from: i.from.clone() });
+                        out.push(Notice::Invite {
+                            gid: i.gid,
+                            group_name: i.group_name.clone(),
+                            from: i.from.clone(),
+                        });
                     }
                 }
             }
@@ -404,7 +477,10 @@ impl Notifier {
         // Исключение/удаление группы — только по событиям демона: по разнице
         // снимков нельзя отличить kick от своего выхода через CLI/TUI.
         for k in &s.kicked {
-            out.push(Notice::Kicked { gid: k.gid, group_name: k.group_name.clone() });
+            out.push(Notice::Kicked {
+                gid: k.gid,
+                group_name: k.group_name.clone(),
+            });
         }
 
         // Обрыв > 30 с: один раз за эпизод, только если связь была.
@@ -447,10 +523,22 @@ mod tests {
             server_label: Some("home".into()),
             my_code: Some("ABCD-EFGH".into()),
             groups: vec![
-                TrayGroup { gid: 1, name: "дом".into(), joined: true },
-                TrayGroup { gid: 2, name: "работа".into(), joined: false },
+                TrayGroup {
+                    gid: 1,
+                    name: "дом".into(),
+                    joined: true,
+                },
+                TrayGroup {
+                    gid: 2,
+                    name: "работа".into(),
+                    joined: false,
+                },
             ],
-            invites: vec![TrayInvite { gid: 7, group_name: "игры".into(), from: "петя".into() }],
+            invites: vec![TrayInvite {
+                gid: 7,
+                group_name: "игры".into(),
+                from: "петя".into(),
+            }],
             kicked: Vec::new(),
             errors: Vec::new(),
             tui_open: false,
@@ -472,9 +560,10 @@ mod tests {
     }
 
     fn by_action(m: &[MenuEntry], a: Action) -> Option<&MenuEntry> {
-        find(m, &|e| {
-            matches!(e, MenuEntry::Item { action, .. } | MenuEntry::Check { action, .. } if *action == a)
-        })
+        find(
+            m,
+            &|e| matches!(e, MenuEntry::Item { action, .. } | MenuEntry::Check { action, .. } if *action == a),
+        )
     }
 
     #[test]
@@ -483,8 +572,14 @@ mod tests {
             Action::OpenTui,
             Action::CopyIp,
             Action::CopyCode,
-            Action::ToggleGroup { gid: 42, join: true },
-            Action::ToggleGroup { gid: u32::MAX, join: false },
+            Action::ToggleGroup {
+                gid: 42,
+                join: true,
+            },
+            Action::ToggleGroup {
+                gid: u32::MAX,
+                join: false,
+            },
             Action::AcceptInvite(3),
             Action::DeclineInvite(0),
             Action::StopTunnel,
@@ -493,7 +588,15 @@ mod tests {
         for a in all {
             assert_eq!(Action::from_id(&a.to_id()), Some(a), "{a:?}");
         }
-        for bad in ["", "group:1", "group:x:1", "group:1:2", "accept:", "zzz:1", "accept:-1"] {
+        for bad in [
+            "",
+            "group:1",
+            "group:x:1",
+            "group:1:2",
+            "accept:",
+            "zzz:1",
+            "accept:-1",
+        ] {
             assert_eq!(Action::from_id(bad), None, "{bad}");
         }
         assert!(Action::Exit.is_local() && Action::StopTunnel.is_local());
@@ -503,8 +606,21 @@ mod tests {
     #[test]
     fn menu_groups_checks_and_toggle_direction() {
         let m = build_menu(&st());
-        match by_action(&m, Action::ToggleGroup { gid: 1, join: false }).unwrap() {
-            MenuEntry::Check { checked, enabled, label, .. } => {
+        match by_action(
+            &m,
+            Action::ToggleGroup {
+                gid: 1,
+                join: false,
+            },
+        )
+        .unwrap()
+        {
+            MenuEntry::Check {
+                checked,
+                enabled,
+                label,
+                ..
+            } => {
                 assert!(*checked && *enabled);
                 assert_eq!(label, "дом");
             }
@@ -519,8 +635,14 @@ mod tests {
     #[test]
     fn menu_invites_submenu() {
         let m = build_menu(&st());
-        let sub = find(&m, &|e| matches!(e, MenuEntry::Submenu { label, .. } if label == "Приглашения (1)")).unwrap();
-        let MenuEntry::Submenu { enabled, items, .. } = sub else { unreachable!() };
+        let sub = find(
+            &m,
+            &|e| matches!(e, MenuEntry::Submenu { label, .. } if label == "Приглашения (1)"),
+        )
+        .unwrap();
+        let MenuEntry::Submenu { enabled, items, .. } = sub else {
+            unreachable!()
+        };
         assert!(*enabled);
         assert_eq!(items.len(), 1);
         assert!(by_action(items, Action::AcceptInvite(7)).is_some());
@@ -535,23 +657,73 @@ mod tests {
     #[test]
     fn menu_fixed_items_and_enabling() {
         let m = build_menu(&st());
-        for a in [Action::OpenTui, Action::CopyIp, Action::CopyCode, Action::StopTunnel, Action::Exit] {
-            assert!(matches!(by_action(&m, a), Some(MenuEntry::Item { enabled: true, .. })), "{a:?}");
+        for a in [
+            Action::OpenTui,
+            Action::CopyIp,
+            Action::CopyCode,
+            Action::StopTunnel,
+            Action::Exit,
+        ] {
+            assert!(
+                matches!(
+                    by_action(&m, a),
+                    Some(MenuEntry::Item { enabled: true, .. })
+                ),
+                "{a:?}"
+            );
         }
-        assert!(matches!(by_action(&m, Action::CopyIp), Some(MenuEntry::Item { label, .. }) if label.contains("10.1.0.5")));
-        assert!(matches!(m.last(), Some(MenuEntry::Item { action: Action::Exit, .. })));
+        assert!(
+            matches!(by_action(&m, Action::CopyIp), Some(MenuEntry::Item { label, .. }) if label.contains("10.1.0.5"))
+        );
+        assert!(matches!(
+            m.last(),
+            Some(MenuEntry::Item {
+                action: Action::Exit,
+                ..
+            })
+        ));
 
         // Служба недоступна: «Открыть» и «Выход» живы, остальное серое.
-        let s = TrayState { groups: st().groups, ..Default::default() };
+        let s = TrayState {
+            groups: st().groups,
+            ..Default::default()
+        };
         let m = build_menu(&s);
-        assert!(matches!(by_action(&m, Action::OpenTui), Some(MenuEntry::Item { enabled: true, .. })));
-        assert!(matches!(by_action(&m, Action::Exit), Some(MenuEntry::Item { enabled: true, .. })));
+        assert!(matches!(
+            by_action(&m, Action::OpenTui),
+            Some(MenuEntry::Item { enabled: true, .. })
+        ));
+        assert!(matches!(
+            by_action(&m, Action::Exit),
+            Some(MenuEntry::Item { enabled: true, .. })
+        ));
         for a in [Action::CopyIp, Action::CopyCode, Action::StopTunnel] {
-            assert!(matches!(by_action(&m, a), Some(MenuEntry::Item { enabled: false, .. })), "{a:?}");
+            assert!(
+                matches!(
+                    by_action(&m, a),
+                    Some(MenuEntry::Item { enabled: false, .. })
+                ),
+                "{a:?}"
+            );
         }
-        assert!(matches!(by_action(&m, Action::ToggleGroup { gid: 1, join: false }), Some(MenuEntry::Check { enabled: false, .. })));
+        assert!(matches!(
+            by_action(
+                &m,
+                Action::ToggleGroup {
+                    gid: 1,
+                    join: false
+                }
+            ),
+            Some(MenuEntry::Check { enabled: false, .. })
+        ));
         assert!(matches!(&m[0], MenuEntry::Label(t) if t.contains("служба недоступна")));
-        assert!(find(&build_menu(&TrayState::default()), &|e| matches!(e, MenuEntry::Label(t) if t == "Групп нет")).is_some());
+        assert!(
+            find(
+                &build_menu(&TrayState::default()),
+                &|e| matches!(e, MenuEntry::Label(t) if t == "Групп нет")
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -559,7 +731,10 @@ mod tests {
         let t = tooltip(&st());
         assert_eq!(t, "Tunnel — подключён\nIP: 10.1.0.5 (+1)\nСервер: home");
         assert_eq!(tooltip(&TrayState::default()), "Tunnel — служба недоступна");
-        let s = TrayState { server_label: Some("я".repeat(300)), ..st() };
+        let s = TrayState {
+            server_label: Some("я".repeat(300)),
+            ..st()
+        };
         let t = tooltip(&s);
         assert!(t.encode_utf16().count() <= TOOLTIP_MAX);
         assert!(t.ends_with('…'));
@@ -583,12 +758,31 @@ mod tests {
     fn notify_invites_only_new_and_not_on_first_snapshot() {
         let t0 = Instant::now();
         let mut n = Notifier::new(NotifyMode::Always);
-        assert!(n.observe(&st(), t0).is_empty(), "стартовые приглашения молча");
+        assert!(
+            n.observe(&st(), t0).is_empty(),
+            "стартовые приглашения молча"
+        );
         let mut s = st();
-        s.invites.push(TrayInvite { gid: 8, group_name: "кино".into(), from: "оля".into() });
-        assert_eq!(n.observe(&s, t0), vec![Notice::Invite { gid: 8, group_name: "кино".into(), from: "оля".into() }]);
+        s.invites.push(TrayInvite {
+            gid: 8,
+            group_name: "кино".into(),
+            from: "оля".into(),
+        });
+        assert_eq!(
+            n.observe(&s, t0),
+            vec![Notice::Invite {
+                gid: 8,
+                group_name: "кино".into(),
+                from: "оля".into()
+            }]
+        );
         assert!(n.observe(&s, t0).is_empty(), "повтор не уведомляет");
-        let (title, body) = Notice::Invite { gid: 8, group_name: "кино".into(), from: "оля".into() }.text();
+        let (title, body) = Notice::Invite {
+            gid: 8,
+            group_name: "кино".into(),
+            from: "оля".into(),
+        }
+        .text();
         assert!(title.contains("Приглашение") && body.contains("кино") && body.contains("оля"));
     }
 
@@ -604,8 +798,17 @@ mod tests {
         assert!(n.observe(&s, t0).is_empty());
 
         // Событие демона — уведомляем.
-        s.kicked.push(TrayKick { gid: 2, group_name: "работа".into() });
-        assert_eq!(n.observe(&s, t0), vec![Notice::Kicked { gid: 2, group_name: "работа".into() }]);
+        s.kicked.push(TrayKick {
+            gid: 2,
+            group_name: "работа".into(),
+        });
+        assert_eq!(
+            n.observe(&s, t0),
+            vec![Notice::Kicked {
+                gid: 2,
+                group_name: "работа".into()
+            }]
+        );
     }
 
     #[test]
@@ -614,7 +817,10 @@ mod tests {
         let mut n = Notifier::new(NotifyMode::Always);
         n.observe(&st(), t0);
         n.on_action(Action::StopTunnel);
-        let down = TrayState { conn: Conn::DaemonDown, ..Default::default() };
+        let down = TrayState {
+            conn: Conn::DaemonDown,
+            ..Default::default()
+        };
         assert!(n.observe(&down, t0).is_empty());
         assert!(n.observe(&down, t0 + Duration::from_secs(31)).is_empty());
         assert!(n.observe(&down, t0 + Duration::from_secs(120)).is_empty());
@@ -624,11 +830,21 @@ mod tests {
     fn notify_no_old_invites_when_daemon_starts_later() {
         let t0 = Instant::now();
         let mut n = Notifier::new(NotifyMode::Always);
-        let down = TrayState { conn: Conn::DaemonDown, ..Default::default() };
+        let down = TrayState {
+            conn: Conn::DaemonDown,
+            ..Default::default()
+        };
         assert!(n.observe(&down, t0).is_empty());
-        assert!(n.observe(&st(), t0).is_empty(), "первый живой снимок — база");
+        assert!(
+            n.observe(&st(), t0).is_empty(),
+            "первый живой снимок — база"
+        );
         let mut s = st();
-        s.invites.push(TrayInvite { gid: 8, group_name: "кино".into(), from: "оля".into() });
+        s.invites.push(TrayInvite {
+            gid: 8,
+            group_name: "кино".into(),
+            from: "оля".into(),
+        });
         assert_eq!(n.observe(&s, t0).len(), 1);
     }
 
@@ -637,23 +853,38 @@ mod tests {
         let t0 = Instant::now();
         let mut n = Notifier::new(NotifyMode::Always);
         // Без связи с самого старта — не уведомляем.
-        let off = TrayState { conn: Conn::Offline, ..st() };
+        let off = TrayState {
+            conn: Conn::Offline,
+            ..st()
+        };
         assert!(n.observe(&off, t0).is_empty());
         assert!(n.observe(&off, t0 + Duration::from_secs(60)).is_empty());
 
         n.observe(&st(), t0 + Duration::from_secs(61));
-        let rec = TrayState { conn: Conn::Reconnecting, ..st() };
+        let rec = TrayState {
+            conn: Conn::Reconnecting,
+            ..st()
+        };
         let base = t0 + Duration::from_secs(62);
         assert!(n.observe(&rec, base).is_empty());
         assert!(n.observe(&rec, base + Duration::from_secs(29)).is_empty());
-        assert_eq!(n.observe(&rec, base + Duration::from_secs(30)), vec![Notice::Disconnected]);
-        assert!(n.observe(&rec, base + Duration::from_secs(90)).is_empty(), "один раз за эпизод");
+        assert_eq!(
+            n.observe(&rec, base + Duration::from_secs(30)),
+            vec![Notice::Disconnected]
+        );
+        assert!(
+            n.observe(&rec, base + Duration::from_secs(90)).is_empty(),
+            "один раз за эпизод"
+        );
 
         // Связь вернулась и снова пропала — новый эпизод.
         n.observe(&st(), base + Duration::from_secs(100));
         let b2 = base + Duration::from_secs(101);
         assert!(n.observe(&rec, b2).is_empty());
-        assert_eq!(n.observe(&rec, b2 + Duration::from_secs(31)), vec![Notice::Disconnected]);
+        assert_eq!(
+            n.observe(&rec, b2 + Duration::from_secs(31)),
+            vec![Notice::Disconnected]
+        );
     }
 
     #[test]
@@ -668,7 +899,11 @@ mod tests {
         n.observe(&st(), t0);
         let mut s = st();
         s.tui_open = true;
-        s.invites.push(TrayInvite { gid: 9, group_name: "x".into(), from: "y".into() });
+        s.invites.push(TrayInvite {
+            gid: 9,
+            group_name: "x".into(),
+            from: "y".into(),
+        });
         assert!(n.observe(&s, t0).is_empty(), "TUI открыт — молчим");
         // Уже увиденное при открытом TUI не всплывает после закрытия.
         s.tui_open = false;
@@ -683,7 +918,10 @@ mod tests {
         s.tui_open = true;
         s.errors.push("нет сервера".into());
         assert_eq!(n.observe(&s, t0), vec![Notice::Error("нет сервера".into())]);
-        let down = TrayState { errors: vec!["служба недоступна".into()], ..Default::default() };
+        let down = TrayState {
+            errors: vec!["служба недоступна".into()],
+            ..Default::default()
+        };
         assert_eq!(n.observe(&down, t0).len(), 1);
         assert_eq!(Notice::Error("x".into()).text().1, "x");
     }

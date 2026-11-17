@@ -268,13 +268,18 @@ impl Server {
                 eprintln!("[server] новое состояние в {}", cfg.data_dir.display());
             } else {
                 let n = shared.state.read().unwrap().groups.len();
-                eprintln!("[server] загружено: {n} групп(ы) из {}", cfg.data_dir.display());
+                eprintln!(
+                    "[server] загружено: {n} групп(ы) из {}",
+                    cfg.data_dir.display()
+                );
             }
             if n_links > 0 {
                 eprintln!("[server] цепочка ротации ключа: {n_links} звен(а/ьев)");
             }
             if !chain_ok {
-                eprintln!("[server] ВНИМАНИЕ: цепочка ротации в server.json не ведёт к текущему ключу");
+                eprintln!(
+                    "[server] ВНИМАНИЕ: цепочка ротации в server.json не ведёт к текущему ключу"
+                );
             }
         }
         // Сразу на диск: иначе новая identity, напечатанная ниже, терялась бы
@@ -283,12 +288,17 @@ impl Server {
         save_now(&shared);
 
         let workers = if cfg.workers == 0 {
-            thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(2, 8)
+            thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(2)
+                .clamp(2, 8)
         } else {
             cfg.workers
         };
         let mut threads = Vec::new();
-        shared.expected_threads.store(workers + 1, Ordering::Relaxed);
+        shared
+            .expected_threads
+            .store(workers + 1, Ordering::Relaxed);
         for i in 0..workers {
             let sh = shared.clone();
             sh.alive.fetch_add(1, Ordering::Relaxed);
@@ -324,7 +334,12 @@ impl Server {
                 let sh = shared.clone();
                 Arc::new(move |peer| drop_session_at(&sh, peer.addr()))
             };
-            match tcp::TcpTransport::start_with_close(addr, on_frame, on_close, tcp::TcpLimits::default()) {
+            match tcp::TcpTransport::start_with_close(
+                addr,
+                on_frame,
+                on_close,
+                tcp::TcpLimits::default(),
+            ) {
                 Ok(t) => {
                     let _ = shared.tcp.set(t.sender());
                     Some(t)
@@ -348,7 +363,12 @@ impl Server {
                     let sh = shared.clone();
                     Arc::new(move || refresh_gauges(&sh))
                 };
-                Some(metrics::MetricsServer::start_with_refresh(maddr, shared.metrics.clone(), health, refresh)?)
+                Some(metrics::MetricsServer::start_with_refresh(
+                    maddr,
+                    shared.metrics.clone(),
+                    health,
+                    refresh,
+                )?)
             }
             None => None,
         };
@@ -434,7 +454,9 @@ pub fn rotate_key(data_dir: &Path) -> Result<RotatedKey> {
     let store = persist::Store::new(data_dir);
     // Запущенный сервер пишет файл под той же блокировкой: его сохранение не
     // вклинится между нашим чтением и записью (и не затрёт новый ключ).
-    let _lock = store.lock().with_context(|| format!("блокировка server.json в {}", data_dir.display()))?;
+    let _lock = store
+        .lock()
+        .with_context(|| format!("блокировка server.json в {}", data_dir.display()))?;
     let mut p = store.load()?.context("server.json пропал")?;
     for l in &p.rotations {
         parse_link(l)?;
@@ -503,7 +525,13 @@ impl Bucket {
 /// записями чистится от восполнившихся корзин; не помогло — отказ новому
 /// адресу (поток с подменой адресов не раздувает карту и не вытесняет
 /// корзины тех, кто реально исчерпал запас).
-fn ip_take(m: &mut HashMap<IpAddr, Bucket>, key: IpAddr, rate: f64, burst: f64, cap: usize) -> bool {
+fn ip_take(
+    m: &mut HashMap<IpAddr, Bucket>,
+    key: IpAddr,
+    rate: f64,
+    burst: f64,
+    cap: usize,
+) -> bool {
     if let Some(b) = m.get_mut(&key) {
         return b.take(rate, burst);
     }
@@ -514,7 +542,9 @@ fn ip_take(m: &mut HashMap<IpAddr, Bucket>, key: IpAddr, rate: f64, burst: f64, 
             return false;
         }
     }
-    m.entry(key).or_insert_with(|| Bucket::new(burst)).take(rate, burst)
+    m.entry(key)
+        .or_insert_with(|| Bucket::new(burst))
+        .take(rate, burst)
 }
 
 struct Session {
@@ -660,7 +690,8 @@ impl State {
         }
         let now = Instant::now();
         if self.retired_eph.len() >= RETIRED_EPH_PURGE {
-            self.retired_eph.retain(|_, t| now.duration_since(*t) < RETIRED_EPH_TTL);
+            self.retired_eph
+                .retain(|_, t| now.duration_since(*t) < RETIRED_EPH_TTL);
         }
         self.retired_eph.insert((ses.ed_pub, ses.eph_pub), now);
         Some(ses)
@@ -669,7 +700,9 @@ impl State {
     /// Эфемерный ключ закрытой сессии этой identity, cookie под него ещё
     /// может быть жив.
     fn eph_retired(&self, ed: &[u8; 32], eph: &[u8; 32]) -> bool {
-        self.retired_eph.get(&(*ed, *eph)).is_some_and(|t| t.elapsed() < RETIRED_EPH_TTL)
+        self.retired_eph
+            .get(&(*ed, *eph))
+            .is_some_and(|t| t.elapsed() < RETIRED_EPH_TTL)
     }
 
     fn groups_of(&self, pk: &[u8; 32]) -> Vec<u32> {
@@ -708,7 +741,10 @@ impl State {
 
     /// Секунд до истечения приглашения (вверх: живое не показывается как 0).
     fn expires_in(&self, inv: &Invite, now_ms: u64) -> u32 {
-        let left = inv.created_ms.saturating_add(self.invite_ttl_ms).saturating_sub(now_ms);
+        let left = inv
+            .created_ms
+            .saturating_add(self.invite_ttl_ms)
+            .saturating_sub(now_ms);
         left.div_ceil(1000).min(u32::MAX as u64) as u32
     }
 }
@@ -768,7 +804,10 @@ impl Drop for Alive<'_> {
 fn healthy(sh: &Shared) -> bool {
     !sh.stop.load(Ordering::Relaxed)
         && sh.alive.load(Ordering::Relaxed) == sh.expected_threads.load(Ordering::Relaxed)
-        && sh.now_ms().saturating_sub(sh.last_tick.load(Ordering::Relaxed)) < duration_ms(HEALTH_TICK_MAX)
+        && sh
+            .now_ms()
+            .saturating_sub(sh.last_tick.load(Ordering::Relaxed))
+            < duration_ms(HEALTH_TICK_MAX)
 }
 
 /// Датчики метрик — из авторитетного состояния.
@@ -778,8 +817,16 @@ fn refresh_gauges(sh: &Shared) {
     let m = &sh.metrics;
     metrics::Metrics::set(&m.sessions, s.sessions.len() as u64);
     metrics::Metrics::set(&m.groups, s.groups.len() as u64);
-    metrics::Metrics::set(&m.members, s.groups.values().map(|g| g.members.len() as u64).sum());
-    let pending = s.groups.values().flat_map(|g| g.invites.values()).filter(|i| s.invite_live(i, now)).count();
+    metrics::Metrics::set(
+        &m.members,
+        s.groups.values().map(|g| g.members.len() as u64).sum(),
+    );
+    let pending = s
+        .groups
+        .values()
+        .flat_map(|g| g.invites.values())
+        .filter(|i| s.invite_live(i, now))
+        .count();
     metrics::Metrics::set(&m.invites_pending, pending as u64);
 }
 
@@ -788,8 +835,14 @@ fn drop_session_at(sh: &Shared, addr: SocketAddr) {
     let mut out = Outbox::new();
     {
         let mut s = sh.state.write().unwrap();
-        let Some(ses) = s.remove_session(&addr) else { return };
-        sh.log(format!("offline: {} ({}) — TCP закрыт", ses.name, short(&ses.ed_pub)));
+        let Some(ses) = s.remove_session(&addr) else {
+            return;
+        };
+        sh.log(format!(
+            "offline: {} ({}) — TCP закрыт",
+            ses.name,
+            short(&ses.ed_pub)
+        ));
         if !s.online(&ses.ed_pub) {
             member_changed(&mut s, &ses.ed_pub, &mut out);
         }
@@ -838,12 +891,21 @@ impl Shared {
         let (rate, burst) = (self.limits.hello_rate, self.limits.hello_burst);
         let key = ip_key(ip);
         let shard = self.ip_hash.hash_one(key) as usize % IP_SHARDS;
-        ip_take(&mut self.per_ip[shard].lock().unwrap(), key, rate, burst, IP_SHARD_MAX)
+        ip_take(
+            &mut self.per_ip[shard].lock().unwrap(),
+            key,
+            rate,
+            burst,
+            IP_SHARD_MAX,
+        )
     }
 
     /// Жетон общего бюджета открытых ответов.
     fn allow_plain(&self) -> bool {
-        self.plain.lock().unwrap().take(self.limits.plain_rate, self.limits.plain_burst)
+        self.plain
+            .lock()
+            .unwrap()
+            .take(self.limits.plain_rate, self.limits.plain_burst)
     }
 
     /// Попросить housekeeping сохранить состояние сейчас (не дожидаясь
@@ -975,7 +1037,11 @@ fn load_state(store: &persist::Store) -> Result<Loaded> {
             groups: HashMap::new(),
         });
     };
-    let links = p.rotations.iter().map(|l| parse_link(l)).collect::<Result<Vec<_>>>()?;
+    let links = p
+        .rotations
+        .iter()
+        .map(|l| parse_link(l))
+        .collect::<Result<Vec<_>>>()?;
     let now = unix_ms();
     let mut groups = HashMap::new();
     for g in p.groups {
@@ -1021,7 +1087,11 @@ fn load_state(store: &persist::Store) -> Result<Loaded> {
                     pk,
                     Member {
                         ip,
-                        name: g.member_names.get(&k).cloned().unwrap_or_else(|| "…".into()),
+                        name: g
+                            .member_names
+                            .get(&k)
+                            .cloned()
+                            .unwrap_or_else(|| "…".into()),
                         status: g.member_status.get(&k).cloned().unwrap_or_default(),
                     },
                 );
@@ -1030,7 +1100,12 @@ fn load_state(store: &persist::Store) -> Result<Loaded> {
         // Старый сервер не снимал приглашение при входе в публичную группу и
         // не отказывал в INVITE участнику: такие записи после кика/выхода
         // всплыли бы окном приглашения (и пустили бы обратно в приватную).
-        let Group { members, banned, invites, .. } = &mut group;
+        let Group {
+            members,
+            banned,
+            invites,
+            ..
+        } = &mut group;
         invites.retain(|pk, _| !members.contains_key(pk) && !banned.contains_key(pk));
         groups.insert(g.id, group);
     }
@@ -1046,7 +1121,11 @@ fn load_state(store: &persist::Store) -> Result<Loaded> {
     })
 }
 
-fn snapshot(sh_identity: &proto::Identity, links: &[RotationLink], s: &State) -> persist::Persisted {
+fn snapshot(
+    sh_identity: &proto::Identity,
+    links: &[RotationLink],
+    s: &State,
+) -> persist::Persisted {
     persist::Persisted {
         ed_seed: sh_identity.ed_seed,
         x_seed: sh_identity.x_seed,
@@ -1067,7 +1146,11 @@ fn snapshot(sh_identity: &proto::Identity, links: &[RotationLink], s: &State) ->
                 epoch: g.epoch,
                 rev: g.rev,
                 revoke_prev: g.revoke_prev,
-                member_names: g.members.iter().map(|(k, m)| (hex(k), m.name.clone())).collect(),
+                member_names: g
+                    .members
+                    .iter()
+                    .map(|(k, m)| (hex(k), m.name.clone()))
+                    .collect(),
                 member_status: g
                     .members
                     .iter()
@@ -1080,7 +1163,11 @@ fn snapshot(sh_identity: &proto::Identity, links: &[RotationLink], s: &State) ->
                     .filter(|(_, n)| !n.is_empty())
                     .map(|(k, n)| (hex(k), n.clone()))
                     .collect(),
-                invite_times: g.invites.iter().map(|(k, i)| (hex(k), i.created_ms)).collect(),
+                invite_times: g
+                    .invites
+                    .iter()
+                    .map(|(k, i)| (hex(k), i.created_ms))
+                    .collect(),
                 invite_names: g
                     .invites
                     .iter()
@@ -1135,13 +1222,16 @@ fn keep_rotated_key(sh: &Shared, snap: &mut persist::Persisted) {
     }
     // Сравнение — с уже принятым ключом: повторный rotate-key продолжает его.
     let stamp = sh.store.stamp();
-    if stamp.is_some() && stamp != *sh.written.lock().unwrap()
+    if stamp.is_some()
+        && stamp != *sh.written.lock().unwrap()
         && let Some(k) = sh.store.load_key()
         && k.ed_seed != snap.ed_seed
         && k.rotations.len() > snap.rotations.len()
         && k.rotations.starts_with(&snap.rotations)
     {
-        eprintln!("[server] ключ сервера сменён rotate-key: новый ключ вступит в силу после перезапуска");
+        eprintln!(
+            "[server] ключ сервера сменён rotate-key: новый ключ вступит в силу после перезапуска"
+        );
         apply(snap, &k);
         *rotated = Some(k);
     }
@@ -1190,7 +1280,10 @@ fn housekeeping(sh: Arc<Shared>) {
         // сбрасывать запас исчерпавшим его, даже при медленном `hello_rate`).
         let (rate, burst, now) = (sh.limits.hello_rate, sh.limits.hello_burst, Instant::now());
         for shard in &sh.per_ip {
-            shard.lock().unwrap().retain(|_, b| !b.refilled(rate, burst, now));
+            shard
+                .lock()
+                .unwrap()
+                .retain(|_, b| !b.refilled(rate, burst, now));
         }
         if last_save.elapsed() >= SAVE_EVERY {
             last_save = Instant::now();
@@ -1218,11 +1311,17 @@ fn housekeeping(sh: Arc<Shared>) {
 /// дельта kind 1.
 fn expire_sessions(sh: &Shared) {
     let timeout = duration_ms(sh.limits.session_timeout);
-    let is_dead = |ses: &Session, now: u64| now.saturating_sub(ses.last_seen.load(Ordering::Relaxed)) > timeout;
+    let is_dead = |ses: &Session, now: u64| {
+        now.saturating_sub(ses.last_seen.load(Ordering::Relaxed)) > timeout
+    };
     let dead: Vec<SocketAddr> = {
         let s = sh.state.read().unwrap();
         let now = sh.now_ms();
-        s.sessions.iter().filter(|(_, x)| is_dead(x, now)).map(|(a, _)| *a).collect()
+        s.sessions
+            .iter()
+            .filter(|(_, x)| is_dead(x, now))
+            .map(|(a, _)| *a)
+            .collect()
     };
     if dead.is_empty() {
         return;
@@ -1255,7 +1354,9 @@ fn expire_invites(sh: &Shared) {
     let now = unix_ms();
     let any = {
         let s = sh.state.read().unwrap();
-        s.groups.values().any(|g| g.invites.values().any(|i| !s.invite_live(i, now)))
+        s.groups
+            .values()
+            .any(|g| g.invites.values().any(|i| !s.invite_live(i, now)))
     };
     if !any {
         return;
@@ -1366,7 +1467,9 @@ fn relay_group(sh: &Shared, src: SocketAddr, datagram: &[u8]) {
             return;
         };
         ses.last_seen.store(sh.now_ms(), Ordering::Relaxed);
-        let Some(g) = s.groups.get(&h.gid) else { return };
+        let Some(g) = s.groups.get(&h.gid) else {
+            return;
+        };
         // Отправитель — участник группы и пишет от своего IP.
         match g.members.get(&ses.ed_pub) {
             Some(m) if m.ip == h.src => {}
@@ -1375,9 +1478,18 @@ fn relay_group(sh: &Shared, src: SocketAddr, datagram: &[u8]) {
                 return;
             }
         }
-        let Some(dst_pk) = g.by_ip.get(&h.dst) else { return };
-        let Some(addr) = s.by_pub.get(dst_pk).copied() else { return };
-        if !ses.relay.lock().unwrap().take(sh.limits.relay_rate, sh.limits.relay_burst) {
+        let Some(dst_pk) = g.by_ip.get(&h.dst) else {
+            return;
+        };
+        let Some(addr) = s.by_pub.get(dst_pk).copied() else {
+            return;
+        };
+        if !ses
+            .relay
+            .lock()
+            .unwrap()
+            .take(sh.limits.relay_rate, sh.limits.relay_burst)
+        {
             sh.drop_frame();
             return;
         }
@@ -1405,7 +1517,11 @@ fn push_ctrl(out: &mut Outbox, addr: SocketAddr, ses: &Session, typ: u8, payload
     let msg_id = ses.msg_id.fetch_add(1, Ordering::Relaxed);
     // Больше FRAG_MAX_PAYLOAD сервер не строит (списки обрезаются заранее,
     // худший GROUP_STATE влезает) — такое сообщение просто не уходит.
-    debug_assert!(payload.len() <= proto::FRAG_MAX_PAYLOAD, "{typ:#04x}: {} байт", payload.len());
+    debug_assert!(
+        payload.len() <= proto::FRAG_MAX_PAYLOAD,
+        "{typ:#04x}: {} байт",
+        payload.len()
+    );
     if let Ok(Some(chunks)) = proto::frag::split_frag(msg_id, typ, payload) {
         for c in chunks {
             seal(ctrl::FRAG, &c);
@@ -1422,7 +1538,9 @@ fn push_error(out: &mut Outbox, addr: SocketAddr, ses: &Session, text: &str) {
 /// MemberInfo участника `pk` глазами `viewer`: invisible-участник для
 /// остальных офлайн, без endpoint и кандидатов (релей для него работает).
 fn member_info(s: &State, pk: &[u8; 32], m: &Member, viewer: &[u8; 32]) -> MemberInfo {
-    let live = s.session_of(pk).filter(|(_, x)| !x.invisible || pk == viewer);
+    let live = s
+        .session_of(pk)
+        .filter(|(_, x)| !x.invisible || pk == viewer);
     MemberInfo {
         pubkey: *pk,
         name: m.name.clone(),
@@ -1490,12 +1608,21 @@ enum Change {
 
 /// Дельта `base_rev → g.rev` (с текущим ключом) всем онлайн-участникам,
 /// кроме `skip` (тот получил GROUP_STATE целиком).
-fn push_update(s: &State, g: &Group, base_rev: u32, change: &Change, skip: Option<&[u8; 32]>, out: &mut Outbox) {
+fn push_update(
+    s: &State,
+    g: &Group,
+    base_rev: u32,
+    change: &Change,
+    skip: Option<&[u8; 32]>,
+    out: &mut Outbox,
+) {
     for pk in g.members.keys() {
         if skip == Some(pk) {
             continue;
         }
-        let Some((addr, ses)) = s.session_of(pk) else { continue };
+        let Some((addr, ses)) = s.session_of(pk) else {
+            continue;
+        };
         let delta = match change {
             Change::Member(who) => match g.members.get(who) {
                 Some(m) => GroupDelta::Member(member_info(s, who, m, pk)),
@@ -1517,7 +1644,13 @@ fn push_update(s: &State, g: &Group, base_rev: u32, change: &Change, skip: Optio
             key: g.key,
             delta,
         };
-        push_ctrl(out, addr, ses, ctrl::GROUP_UPDATE, &pl::enc_group_update(&u));
+        push_ctrl(
+            out,
+            addr,
+            ses,
+            ctrl::GROUP_UPDATE,
+            &pl::enc_group_update(&u),
+        );
     }
 }
 
@@ -1526,7 +1659,9 @@ fn push_update(s: &State, g: &Group, base_rev: u32, change: &Change, skip: Optio
 /// тоже — иначе его ревизия отстала бы и он сделал бы лишний GET_GROUP.
 fn member_changed(s: &mut State, pk: &[u8; 32], out: &mut Outbox) {
     for gid in s.groups_of(pk) {
-        let Some(g) = s.groups.get_mut(&gid) else { continue };
+        let Some(g) = s.groups.get_mut(&gid) else {
+            continue;
+        };
         let base = g.bump();
         push_update(s, &s.groups[&gid], base, &Change::Member(*pk), None, out);
     }
@@ -1539,7 +1674,11 @@ fn visible_counts(s: &State) -> Vec<(&Group, u32)> {
         .groups
         .values()
         .map(|g| {
-            let n = g.members.keys().filter(|pk| s.session_of(pk).is_some_and(|(_, x)| !x.invisible)).count();
+            let n = g
+                .members
+                .keys()
+                .filter(|pk| s.session_of(pk).is_some_and(|(_, x)| !x.invisible))
+                .count();
             (g, n as u32)
         })
         .collect();
@@ -1633,21 +1772,40 @@ fn push_invite_list(s: &State, addr: SocketAddr, ses: &Session, out: &mut Outbox
         .collect();
     let complete = items.len() <= INVITES_PER_LIST;
     items.truncate(INVITES_PER_LIST);
-    let list = pl::InviteList { from, items, complete };
-    push_ctrl(out, addr, ses, ctrl::INVITE_LIST, &pl::enc_invite_list(&list));
+    let list = pl::InviteList {
+        from,
+        items,
+        complete,
+    };
+    push_ctrl(
+        out,
+        addr,
+        ses,
+        ctrl::INVITE_LIST,
+        &pl::enc_invite_list(&list),
+    );
 }
 
 /// Начало окна INVITE_LIST, которое покрывает `gid`: с начала, если до него
 /// меньше [`INVITES_PER_LIST`] неотвеченных (первое окно — то, что клиент
 /// видит после HELLO3), иначе с самого `gid`.
 fn invite_window(s: &State, pk: &[u8; 32], gid: u32) -> u32 {
-    let below = pending_invites(s, pk).iter().filter(|i| i.gid < gid).count();
+    let below = pending_invites(s, pk)
+        .iter()
+        .filter(|i| i.gid < gid)
+        .count();
     if below < INVITES_PER_LIST { 0 } else { gid }
 }
 
 fn push_group_list(s: &State, addr: SocketAddr, ses: &Session, out: &mut Outbox) {
     let items = group_summaries_for(s, &ses.ed_pub);
-    push_ctrl(out, addr, ses, ctrl::GROUP_LIST, &pl::enc_group_list(&items));
+    push_ctrl(
+        out,
+        addr,
+        ses,
+        ctrl::GROUP_LIST,
+        &pl::enc_group_list(&items),
+    );
 }
 
 /// GROUP_LIST всем сессиям — из housekeeping по `list_dirty`, под
@@ -1660,7 +1818,13 @@ fn broadcast_group_list(sh: &Shared) {
         let counts = visible_counts(&s);
         for (a, ses) in &s.sessions {
             let items = summaries(&counts, &ses.ed_pub, ses.invisible);
-            push_ctrl(&mut out, *a, ses, ctrl::GROUP_LIST, &pl::enc_group_list(&items));
+            push_ctrl(
+                &mut out,
+                *a,
+                ses,
+                ctrl::GROUP_LIST,
+                &pl::enc_group_list(&items),
+            );
         }
     }
     sh.flush(out);
@@ -1676,11 +1840,17 @@ fn admin_info(s: &State, g: &Group) -> AdminInfo {
     let mut bans: Vec<BanEntry> = g
         .banned
         .iter()
-        .map(|(pk, n)| BanEntry { pubkey: *pk, name: pick(pk, n) })
+        .map(|(pk, n)| BanEntry {
+            pubkey: *pk,
+            name: pick(pk, n),
+        })
         .collect();
     bans.sort_by(|a, b| a.name.cmp(&b.name).then(a.pubkey.cmp(&b.pubkey)));
-    let mut live: Vec<(&[u8; 32], &Invite)> =
-        g.invites.iter().filter(|(_, i)| s.invite_live(i, now)).collect();
+    let mut live: Vec<(&[u8; 32], &Invite)> = g
+        .invites
+        .iter()
+        .filter(|(_, i)| s.invite_live(i, now))
+        .collect();
     live.sort_by(|a, b| a.1.created_ms.cmp(&b.1.created_ms).then(a.0.cmp(b.0)));
     let invites = live
         .into_iter()
@@ -1690,7 +1860,11 @@ fn admin_info(s: &State, g: &Group) -> AdminInfo {
             expires_in: s.expires_in(i, now),
         })
         .collect();
-    AdminInfo { gid: g.id, bans, invites }
+    AdminInfo {
+        gid: g.id,
+        bans,
+        invites,
+    }
 }
 
 // ---------- HELLO3 ----------
@@ -1720,10 +1894,17 @@ fn handle_hello3(sh: &Shared, src: SocketAddr, body: &[u8]) {
     // Cookie (один keyed blake3) — раньше подписи: без подтверждённого
     // адреса сервер не тратит на HELLO3 ничего дорогого.
     let now = hs::unix_now();
-    let cookie_ok = h.cookie.as_ref().is_some_and(|c| sh.cookies.verify(src, &h.eph_pub, c, now));
+    let cookie_ok = h
+        .cookie
+        .as_ref()
+        .is_some_and(|c| sh.cookies.verify(src, &h.eph_pub, c, now));
     if !cookie_ok {
         metrics::Metrics::inc(&sh.metrics.challenge_total, 1);
-        sh.send_plain(src, ctrl::CHALLENGE, &hs::enc_challenge(&sh.cookies.make(src, &h.eph_pub, now)));
+        sh.send_plain(
+            src,
+            ctrl::CHALLENGE,
+            &hs::enc_challenge(&sh.cookies.make(src, &h.eph_pub, now)),
+        );
         return;
     }
     if h.verify().is_err() {
@@ -1759,13 +1940,25 @@ fn handle_hello3(sh: &Shared, src: SocketAddr, body: &[u8]) {
     // DH и подпись WELCOME — без блокировки состояния. Эфемерный секрет
     // сервера стирается при выходе из функции (прямая секретность).
     let eph = proto::EphemeralKey::generate();
-    let Ok(keys) = proto::session_keys(proto::Role::Server, &sh.identity, &eph, &h.x_pub, &h.eph_pub) else {
+    let Ok(keys) = proto::session_keys(
+        proto::Role::Server,
+        &sh.identity,
+        &eph,
+        &h.x_pub,
+        &h.eph_pub,
+    ) else {
         sh.drop_frame();
         return;
     };
     let welcome = proto::plain_frame(
         ctrl::WELCOME,
-        &Welcome::encode(&sh.identity, &eph.public(), &sh.links, &h.ed_pub, &h.eph_pub),
+        &Welcome::encode(
+            &sh.identity,
+            &eph.public(),
+            &sh.links,
+            &h.ed_pub,
+            &h.eph_pub,
+        ),
     );
     drop(eph);
     {
@@ -1797,7 +1990,10 @@ fn push_hello_replay(sh: &Shared, src: SocketAddr, ses: &Session, out: &mut Outb
     let gap = WELCOME_RESEND_GAP.as_millis() as u64;
     let last = ses.welcome_at.load(Ordering::Relaxed);
     if now.saturating_sub(last) < gap
-        || ses.welcome_at.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err()
+        || ses
+            .welcome_at
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
     {
         sh.drop_frame();
         return;
@@ -1831,7 +2027,11 @@ fn install_session(
         if other.ed_pub == ed {
             status = Some(other.status);
         } else if !s.online(&other.ed_pub) {
-            sh.log(format!("offline: {} ({}) — адрес занят", other.name, short(&other.ed_pub)));
+            sh.log(format!(
+                "offline: {} ({}) — адрес занят",
+                other.name,
+                short(&other.ed_pub)
+            ));
             member_changed(s, &other.ed_pub, out);
         }
     }
@@ -1975,7 +2175,12 @@ fn handle_ctrl_frame(sh: &Shared, src: SocketAddr, typ: u8, body: &[u8]) {
             return;
         }
         ses.last_seen.store(sh.now_ms(), Ordering::Relaxed);
-        if !ses.ctrl.lock().unwrap().take(sh.limits.ctrl_rate, sh.limits.ctrl_burst) {
+        if !ses
+            .ctrl
+            .lock()
+            .unwrap()
+            .take(sh.limits.ctrl_rate, sh.limits.ctrl_burst)
+        {
             sh.drop_frame();
             return;
         }
@@ -2048,7 +2253,13 @@ fn handle_query(
             }
             groups.sort_by_key(|g| g.gid);
             let resp = pl::FriendGroups { target, groups };
-            push_ctrl(out, src, ses, ctrl::FRIEND_GROUPS_RESP, &pl::enc_friend_groups(&resp));
+            push_ctrl(
+                out,
+                src,
+                ses,
+                ctrl::FRIEND_GROUPS_RESP,
+                &pl::enc_friend_groups(&resp),
+            );
         }
         ctrl::GET_GROUP => {
             // Только запросившему: участнику — состояние, на несуществующую
@@ -2057,14 +2268,26 @@ fn handle_query(
             match s.groups.get(&gid) {
                 Some(g) if g.members.contains_key(me) => push_group_state(s, g, src, ses, out),
                 Some(_) => anyhow::bail!("вы не участник группы {gid}"),
-                None => push_ctrl(out, src, ses, ctrl::GROUP_STATE, &pl::enc_group_state(&deleted_state(gid))),
+                None => push_ctrl(
+                    out,
+                    src,
+                    ses,
+                    ctrl::GROUP_STATE,
+                    &pl::enc_group_state(&deleted_state(gid)),
+                ),
             }
         }
         ctrl::GROUP_ADMIN => {
             let gid = pl::dec_gid(payload)?;
             let g = s.groups.get(&gid).context("группа не найдена")?;
             anyhow::ensure!(g.owner == *me, "может только владелец");
-            push_ctrl(out, src, ses, ctrl::ADMIN_INFO, &pl::enc_admin_info(&admin_info(s, g)));
+            push_ctrl(
+                out,
+                src,
+                ses,
+                ctrl::ADMIN_INFO,
+                &pl::enc_admin_info(&admin_info(s, g)),
+            );
         }
         _ => {}
     }
@@ -2101,7 +2324,9 @@ fn handle_mutation(
         }
         ctrl::CANDIDATES => {
             // n > 4 — фрейм отбрасывается молча (раздел 4).
-            let Ok(list) = pl::dec_candidates(payload) else { return Ok(()) };
+            let Ok(list) = pl::dec_candidates(payload) else {
+                return Ok(());
+            };
             let list: Vec<SocketAddr> = list.into_iter().filter(usable_candidate).collect();
             let ses = s.sessions.get_mut(&src).unwrap();
             // Повтор того же списка — не изменение, ревизия не растёт.
@@ -2120,7 +2345,13 @@ fn handle_mutation(
             }
             // Подтверждение — всегда, и на повтор: клиент повторяет PRESENCE,
             // пока не получит его (потерянный PRESENCE оставлял бы видимым).
-            push_ctrl(out, src, &s.sessions[&src], ctrl::PRESENCE_ACK, &pl::enc_presence(invisible));
+            push_ctrl(
+                out,
+                src,
+                &s.sessions[&src],
+                ctrl::PRESENCE_ACK,
+                &pl::enc_presence(invisible),
+            );
         }
         ctrl::CREATE_GROUP => {
             let (name, private) = pl::dec_create_group(payload)?;
@@ -2128,7 +2359,10 @@ fn handle_mutation(
             anyhow::ensure!(!name.is_empty(), "пустое имя группы");
             let owned = s.owned_by(&me);
             let max = sh.limits.max_owned_groups;
-            anyhow::ensure!(owned < max, "лимит групп: во владении уже {owned} (максимум {max})");
+            anyhow::ensure!(
+                owned < max,
+                "лимит групп: во владении уже {owned} (максимум {max})"
+            );
             let gid = s
                 .alloc_gid()
                 .context("нет свободных подсетей (все 254 группы заняты)")?;
@@ -2148,7 +2382,7 @@ fn handle_mutation(
                 banned: HashMap::new(),
                 invites: HashMap::new(),
                 joins: Bucket::full(),
-            left: HashMap::new(),
+                left: HashMap::new(),
             };
             g.insert_member(
                 me,
@@ -2203,7 +2437,9 @@ fn handle_mutation(
             // Вход по приглашению владельца — без паузы.
             if g.owner != me
                 && !g.invites.contains_key(&me)
-                && g.left.get(&me).is_some_and(|t| t.elapsed() < REJOIN_COOLDOWN)
+                && g.left
+                    .get(&me)
+                    .is_some_and(|t| t.elapsed() < REJOIN_COOLDOWN)
             {
                 anyhow::bail!("недавно вышли из группы — повторите вход позже");
             }
@@ -2230,7 +2466,10 @@ fn handle_mutation(
             // до входа); прошлый ключ остаётся в grace.
             g.rotate(false);
             let base = g.bump();
-            sh.log(format!("join: {uname} → {gid} \"{gname}\" as {}", ip_str(ip)));
+            sh.log(format!(
+                "join: {uname} → {gid} \"{gname}\" as {}",
+                ip_str(ip)
+            ));
             let g = &s.groups[&gid];
             push_group_state(s, g, src, &s.sessions[&src], out);
             push_update(s, g, base, &Change::Member(me), Some(&me), out);
@@ -2274,14 +2513,21 @@ fn handle_mutation(
             let (gid, target) = pl::dec_gid_target(payload)?;
             let tname = known_name(s, &target);
             let ttl_secs = s.invite_ttl_ms.div_ceil(1000).min(u32::MAX as u64) as u32;
-            let (max_group, max_target) = (sh.limits.max_invites_per_group, sh.limits.max_invites_per_target);
+            let (max_group, max_target) = (
+                sh.limits.max_invites_per_group,
+                sh.limits.max_invites_per_target,
+            );
             // Живые приглашения цели в других группах (продление своего — не новое).
             let now = unix_ms();
             let target_pending = s
                 .groups
                 .values()
                 .filter(|g| g.id != gid)
-                .filter(|g| g.invites.get(&target).is_some_and(|i| s.invite_live(i, now)))
+                .filter(|g| {
+                    g.invites
+                        .get(&target)
+                        .is_some_and(|i| s.invite_live(i, now))
+                })
                 .count();
             let g = s.groups.get_mut(&gid).context("группа не найдена")?;
             anyhow::ensure!(g.owner == me, "приглашать может только владелец");
@@ -2297,7 +2543,13 @@ fn handle_mutation(
                 "лимит приглашений у цели ({max_target}): у неё слишком много неотвеченных приглашений"
             );
             // Повторное приглашение продлевает срок.
-            g.invites.insert(target, Invite { created_ms: unix_ms(), name: tname });
+            g.invites.insert(
+                target,
+                Invite {
+                    created_ms: unix_ms(),
+                    name: tname,
+                },
+            );
             let invite = pl::InviteInfo {
                 gid,
                 group_name: g.name.clone(),
@@ -2326,7 +2578,13 @@ fn handle_mutation(
                 let owner = g.owner;
                 sh.log(format!("decline: {uname} ✗ {gid} \"{}\"", note.group_name));
                 if let Some((addr, ses)) = s.session_of(&owner) {
-                    push_ctrl(out, addr, ses, ctrl::INVITE_DECLINED, &pl::enc_invite_declined(&note));
+                    push_ctrl(
+                        out,
+                        addr,
+                        ses,
+                        ctrl::INVITE_DECLINED,
+                        &pl::enc_invite_declined(&note),
+                    );
                 }
             }
             // Отказавшемуся — всегда свежее окно, покрывающее gid:
@@ -2362,13 +2620,29 @@ fn handle_mutation(
             });
             // Ревизия после кика — в KICKED: всё, что не новее, запоздало.
             let rev = g.rev;
-            let msg = if banned { "забанен в" } else { "кикнут из" };
+            let msg = if banned {
+                "забанен в"
+            } else {
+                "кикнут из"
+            };
             sh.log(format!("{msg} {gid}: {}", short(&target)));
             if let Some(base) = base {
-                push_update(s, &s.groups[&gid], base, &Change::Removed(target), None, out);
+                push_update(
+                    s,
+                    &s.groups[&gid],
+                    base,
+                    &Change::Removed(target),
+                    None,
+                    out,
+                );
             }
             if kicked && let Some((addr, ses)) = s.session_of(&target) {
-                let k = pl::Kicked { gid, group_name: gname, banned, rev };
+                let k = pl::Kicked {
+                    gid,
+                    group_name: gname,
+                    banned,
+                    rev,
+                };
                 push_ctrl(out, addr, ses, ctrl::KICKED, &pl::enc_kicked(&k));
             }
             // Приглашённому онлайн — свежее окно, покрывающее gid: клиент
@@ -2389,19 +2663,31 @@ fn handle_mutation(
                 sh.log(format!("unban {gid}: {}", short(&target)));
             }
             let info = admin_info(s, &s.groups[&gid]);
-            push_ctrl(out, src, &s.sessions[&src], ctrl::ADMIN_INFO, &pl::enc_admin_info(&info));
+            push_ctrl(
+                out,
+                src,
+                &s.sessions[&src],
+                ctrl::ADMIN_INFO,
+                &pl::enc_admin_info(&info),
+            );
         }
         ctrl::TRANSFER_OWNER => {
             let (gid, target) = pl::dec_gid_target(payload)?;
             let target_owned = s.owned_by(&target);
             let g = s.groups.get_mut(&gid).context("группа не найдена")?;
             anyhow::ensure!(g.owner == me, "передать группу может только владелец");
-            anyhow::ensure!(g.members.contains_key(&target), "новый владелец должен быть участником группы");
+            anyhow::ensure!(
+                g.members.contains_key(&target),
+                "новый владелец должен быть участником группы"
+            );
             if target == me {
                 return Ok(());
             }
             let max = sh.limits.max_owned_groups;
-            anyhow::ensure!(target_owned < max, "лимит групп у нового владельца (максимум {max})");
+            anyhow::ensure!(
+                target_owned < max,
+                "лимит групп у нового владельца (максимум {max})"
+            );
             g.owner = target;
             let base = g.bump();
             sh.log(format!("owner {gid}: {} → {}", short(&me), short(&target)));
@@ -2428,7 +2714,11 @@ fn handle_mutation(
             let frame = pl::enc_group_state(&deleted_state(gid));
             // Приглашённым онлайн — тоже: клиент закроет окно приглашения в
             // удалённую группу.
-            let notify: HashSet<&[u8; 32]> = removed.members.keys().chain(removed.invites.keys()).collect();
+            let notify: HashSet<&[u8; 32]> = removed
+                .members
+                .keys()
+                .chain(removed.invites.keys())
+                .collect();
             for pk in notify {
                 if let Some((addr, ses)) = s.session_of(pk) {
                     push_ctrl(out, addr, ses, ctrl::GROUP_STATE, &frame);
@@ -2522,8 +2812,12 @@ mod tests {
         let end = Instant::now() + wait;
         let mut buf = [0u8; 65_535];
         while Instant::now() < end {
-            let Ok((n, _)) = sock.recv_from(&mut buf) else { continue };
-            let Ok((typ, body)) = proto::split_frame(&buf[..n]) else { continue };
+            let Ok((n, _)) = sock.recv_from(&mut buf) else {
+                continue;
+            };
+            let Ok((typ, body)) = proto::split_frame(&buf[..n]) else {
+                continue;
+            };
             if typ == want {
                 return Some((body.to_vec(), buf[..n].to_vec()));
             }
@@ -2561,20 +2855,33 @@ mod tests {
         /// Полное рукопожатие: HELLO3 → CHALLENGE → HELLO3 с cookie → WELCOME.
         fn connect_with(srv: SocketAddr, name: &str, id: &proto::Identity, flags: u8) -> Raw {
             let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
-            sock.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+            sock.set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
             let eph = proto::EphemeralKey::generate();
-            let h1 = proto::plain_frame(ctrl::HELLO3, &Hello3::encode(id, &eph.public(), name, flags, None));
+            let h1 = proto::plain_frame(
+                ctrl::HELLO3,
+                &Hello3::encode(id, &eph.public(), name, flags, None),
+            );
             sock.send_to(&h1, srv).unwrap();
-            let (ch, _) = recv_plain(&sock, ctrl::CHALLENGE, Duration::from_secs(5)).expect("нет CHALLENGE");
+            let (ch, _) =
+                recv_plain(&sock, ctrl::CHALLENGE, Duration::from_secs(5)).expect("нет CHALLENGE");
             let cookie = hs::dec_challenge(&ch).unwrap();
-            let hello =
-                proto::plain_frame(ctrl::HELLO3, &Hello3::encode(id, &eph.public(), name, flags, Some(&cookie)));
+            let hello = proto::plain_frame(
+                ctrl::HELLO3,
+                &Hello3::encode(id, &eph.public(), name, flags, Some(&cookie)),
+            );
             sock.send_to(&hello, srv).unwrap();
             let (body, welcome_frame) =
                 recv_plain(&sock, ctrl::WELCOME, Duration::from_secs(5)).expect("нет WELCOME");
             let welcome = Welcome::decode(&body, &id.ed_pub(), &eph.public()).unwrap();
-            let keys =
-                proto::session_keys(proto::Role::Client, id, &eph, &welcome.server_x, &welcome.server_eph).unwrap();
+            let keys = proto::session_keys(
+                proto::Role::Client,
+                id,
+                &eph,
+                &welcome.server_x,
+                &welcome.server_eph,
+            )
+            .unwrap();
             Raw {
                 sock,
                 srv,
@@ -2602,13 +2909,22 @@ mod tests {
         fn next_ctrl(&self, end: Instant) -> Option<(u8, Vec<u8>)> {
             let mut buf = [0u8; 65_535];
             while Instant::now() < end {
-                let Ok((n, _)) = self.sock.recv_from(&mut buf) else { continue };
-                let Ok((typ, body)) = proto::split_frame(&buf[..n]) else { continue };
+                let Ok((n, _)) = self.sock.recv_from(&mut buf) else {
+                    continue;
+                };
+                let Ok((typ, body)) = proto::split_frame(&buf[..n]) else {
+                    continue;
+                };
                 if proto::grp::is_group(typ) || ctrl::is_plaintext(typ) {
                     continue;
                 }
-                let Ok((ctr, p)) = proto::open_ctrl(&self.keys.rx, typ, body) else { continue };
-                assert!(self.rx.borrow_mut().commit(ctr), "сервер повторил счётчик {ctr}");
+                let Ok((ctr, p)) = proto::open_ctrl(&self.keys.rx, typ, body) else {
+                    continue;
+                };
+                assert!(
+                    self.rx.borrow_mut().commit(ctr),
+                    "сервер повторил счётчик {ctr}"
+                );
                 if typ != ctrl::FRAG {
                     return Some((typ, p));
                 }
@@ -2666,7 +2982,10 @@ mod tests {
         }
 
         fn create(&self, name: &str, private: bool) -> GroupState {
-            self.send(ctrl::CREATE_GROUP, &payloads::enc_create_group(name, private));
+            self.send(
+                ctrl::CREATE_GROUP,
+                &payloads::enc_create_group(name, private),
+            );
             self.state()
         }
 
@@ -2675,8 +2994,12 @@ mod tests {
             let end = Instant::now() + wait;
             let mut buf = [0u8; 65_535];
             while Instant::now() < end {
-                let Ok((n, _)) = self.sock.recv_from(&mut buf) else { continue };
-                let Ok((typ, _)) = proto::split_frame(&buf[..n]) else { continue };
+                let Ok((n, _)) = self.sock.recv_from(&mut buf) else {
+                    continue;
+                };
+                let Ok((typ, _)) = proto::split_frame(&buf[..n]) else {
+                    continue;
+                };
                 if proto::grp::is_group(typ) {
                     return Some(buf[..n].to_vec());
                 }
@@ -2720,7 +3043,12 @@ mod tests {
     }
 
     fn frame_for(st: &GroupState, src: u32, dst: u32, payload: &[u8]) -> Vec<u8> {
-        let h = proto::GroupHeader { gid: st.gid, src, dst, epoch: st.epoch };
+        let h = proto::GroupHeader {
+            gid: st.gid,
+            src,
+            dst,
+            epoch: st.epoch,
+        };
         proto::seal_group(&st.key, proto::grp::DATA, &h, 0, payload)
     }
 
@@ -2749,16 +3077,23 @@ mod tests {
         // Свой src_ip — релеится.
         let ok = frame_for(&st_b, ip_a, ip_b, b"hi");
         a.sock.send_to(&ok, srv).unwrap();
-        let got = b.group_frame(Duration::from_secs(3)).expect("релей своего фрейма");
+        let got = b
+            .group_frame(Duration::from_secs(3))
+            .expect("релей своего фрейма");
         assert_eq!(got, ok);
 
         // Чужой src_ip (подмена) — отбрасывается.
         let spoof = frame_for(&st_b, ip_b, ip_b, b"spoof");
         a.sock.send_to(&spoof, srv).unwrap();
-        assert!(b.group_frame(Duration::from_millis(700)).is_none(), "подмена src_ip релеится");
+        assert!(
+            b.group_frame(Duration::from_millis(700)).is_none(),
+            "подмена src_ip релеится"
+        );
         // Фрейм от адреса без сессии — RESET, не релей.
         let stranger = UdpSocket::bind("127.0.0.1:0").unwrap();
-        stranger.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        stranger
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
         stranger.send_to(&ok, srv).unwrap();
         assert!(recv_plain(&stranger, ctrl::RESET, Duration::from_secs(3)).is_some());
 
@@ -2768,7 +3103,10 @@ mod tests {
         b.send(ctrl::LEAVE_GROUP, &payloads::enc_gid(gid));
         b.expect(ctrl::GROUP_LIST);
         a.sock.send_to(&ok, srv).unwrap();
-        assert!(b.group_frame(Duration::from_millis(700)).is_none(), "релей после выхода");
+        assert!(
+            b.group_frame(Duration::from_millis(700)).is_none(),
+            "релей после выхода"
+        );
 
         // Приглашение офлайн-identity — время и имя переживают рестарт.
         let x = proto::Identity::generate().ed_pub();
@@ -2796,11 +3134,21 @@ mod tests {
         {
             let s = again.shared.state.read().unwrap();
             let g = &s.groups[&gid];
-            assert_eq!(g.members[&a.pk].name, "alpha", "имя офлайн-участника, а не «…»");
+            assert_eq!(
+                g.members[&a.pk].name, "alpha",
+                "имя офлайн-участника, а не «…»"
+            );
             // С запасом: номера, выданные после последнего сохранения (если
             // бы сервер упал), не повторяются.
-            assert_eq!((g.rev, g.epoch), (rev + LOAD_MARGIN, epoch + LOAD_MARGIN), "ревизия и эпоха сохранились");
-            assert_eq!(g.invites[&x].created_ms, created, "срок приглашения не продлился");
+            assert_eq!(
+                (g.rev, g.epoch),
+                (rev + LOAD_MARGIN, epoch + LOAD_MARGIN),
+                "ревизия и эпоха сохранились"
+            );
+            assert_eq!(
+                g.invites[&x].created_ms, created,
+                "срок приглашения не продлился"
+            );
         }
         again.stop();
         let _ = std::fs::remove_dir_all(&dir);
@@ -2811,9 +3159,13 @@ mod tests {
         let (server, dir) = test_server("challenge");
         let id = proto::Identity::generate();
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
-        sock.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
         let eph = proto::EphemeralKey::generate();
-        let hello = proto::plain_frame(ctrl::HELLO3, &Hello3::encode(&id, &eph.public(), "alpha", 0, None));
+        let hello = proto::plain_frame(
+            ctrl::HELLO3,
+            &Hello3::encode(&id, &eph.public(), "alpha", 0, None),
+        );
         sock.send_to(&hello, server.addr).unwrap();
         let mut buf = [0u8; 65_535];
         let mut got = Vec::new();
@@ -2827,11 +3179,22 @@ mod tests {
         let (typ, body) = proto::split_frame(&got[0]).unwrap();
         assert_eq!(typ, ctrl::CHALLENGE);
         hs::dec_challenge(body).unwrap();
-        assert!(got[0].len() < hello.len(), "ответ {} ≥ запроса {}", got[0].len(), hello.len());
-        assert!(server.shared.state.read().unwrap().sessions.is_empty(), "сессия без cookie");
+        assert!(
+            got[0].len() < hello.len(),
+            "ответ {} ≥ запроса {}",
+            got[0].len(),
+            hello.len()
+        );
+        assert!(
+            server.shared.state.read().unwrap().sessions.is_empty(),
+            "сессия без cookie"
+        );
 
         // Неверный cookie — тоже только CHALLENGE.
-        let bad = proto::plain_frame(ctrl::HELLO3, &Hello3::encode(&id, &eph.public(), "alpha", 0, Some(&[7; 16])));
+        let bad = proto::plain_frame(
+            ctrl::HELLO3,
+            &Hello3::encode(&id, &eph.public(), "alpha", 0, Some(&[7; 16])),
+        );
         sock.send_to(&bad, server.addr).unwrap();
         assert!(recv_plain(&sock, ctrl::CHALLENGE, Duration::from_secs(3)).is_some());
         assert!(server.shared.state.read().unwrap().sessions.is_empty());
@@ -2845,7 +3208,8 @@ mod tests {
         let cookie = hs::dec_challenge(&ch).unwrap();
         let mut forged = Hello3::encode(&id, &eph.public(), "alpha", 0, Some(&cookie));
         *forged.last_mut().unwrap() ^= 1;
-        sock.send_to(&proto::plain_frame(ctrl::HELLO3, &forged), server.addr).unwrap();
+        sock.send_to(&proto::plain_frame(ctrl::HELLO3, &forged), server.addr)
+            .unwrap();
         assert!(recv_plain(&sock, ctrl::WELCOME, Duration::from_millis(600)).is_none());
         assert!(server.shared.state.read().unwrap().sessions.is_empty());
 
@@ -2863,7 +3227,8 @@ mod tests {
         // Перехваченный HELLO3 с cookie, повторённый с другого адреса:
         // cookie привязан к адресу — только CHALLENGE, сессия на месте.
         let evil = UdpSocket::bind("127.0.0.1:0").unwrap();
-        evil.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        evil.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
         evil.send_to(&a.hello, server.addr).unwrap();
         assert!(recv_plain(&evil, ctrl::CHALLENGE, Duration::from_secs(3)).is_some());
         assert!(recv_plain(&evil, ctrl::WELCOME, Duration::from_millis(500)).is_none());
@@ -2880,12 +3245,17 @@ mod tests {
         // `last_seen` повтор не обновляет.
         let gid = a.create("g", false).gid;
         a.sync();
-        server.shared.state.read().unwrap().sessions[&a_addr].last_seen.store(0, Ordering::Relaxed);
+        server.shared.state.read().unwrap().sessions[&a_addr]
+            .last_seen
+            .store(0, Ordering::Relaxed);
         a.sock.send_to(&a.hello, server.addr).unwrap();
-        let (_, again) = recv_plain(&a.sock, ctrl::WELCOME, Duration::from_secs(3)).expect("повтор WELCOME");
+        let (_, again) =
+            recv_plain(&a.sock, ctrl::WELCOME, Duration::from_secs(3)).expect("повтор WELCOME");
         assert_eq!(again, a.welcome_frame, "повтор — тот же WELCOME");
         assert_eq!(
-            server.shared.state.read().unwrap().sessions[&a_addr].last_seen.load(Ordering::Relaxed),
+            server.shared.state.read().unwrap().sessions[&a_addr]
+                .last_seen
+                .load(Ordering::Relaxed),
             0,
             "повтор HELLO3 держит сессию онлайн"
         );
@@ -2936,7 +3306,11 @@ mod tests {
         {
             let s = server.shared.state.read().unwrap();
             assert_eq!(s.sessions.len(), 1);
-            assert_eq!(s.by_pub[&id.ed_pub()], a2_addr, "старый HELLO3 пересоздал сессию");
+            assert_eq!(
+                s.by_pub[&id.ed_pub()],
+                a2_addr,
+                "старый HELLO3 пересоздал сессию"
+            );
         }
         assert!(a2.sync().is_empty(), "живой сессии что-то пришло");
         a2.send(ctrl::GET_GROUP, &payloads::enc_gid(gid));
@@ -2949,8 +3323,15 @@ mod tests {
             a2.sock.send_to(&a2.hello, server.addr).unwrap();
         }
         let got = raw_types(&a2.sock, Duration::from_millis(300));
-        assert_eq!(got.iter().filter(|&&t| t == ctrl::WELCOME).count(), 1, "WELCOME: {got:02x?}");
-        assert!(got.iter().all(|&t| t == ctrl::WELCOME), "за WELCOME пришло: {got:02x?}");
+        assert_eq!(
+            got.iter().filter(|&&t| t == ctrl::WELCOME).count(),
+            1,
+            "WELCOME: {got:02x?}"
+        );
+        assert!(
+            got.iter().all(|&t| t == ctrl::WELCOME),
+            "за WELCOME пришло: {got:02x?}"
+        );
 
         server.stop();
         let _ = std::fs::remove_dir_all(&dir);
@@ -2966,7 +3347,11 @@ mod tests {
         // Тот же фрейм ещё раз — без ответа.
         let replay = a.last_sent.borrow().clone();
         a.sock.send_to(&replay, server.addr).unwrap();
-        assert!(!a.drain(Duration::from_millis(600)).contains(&ctrl::CTRL_PONG), "повтор принят");
+        assert!(
+            !a.drain(Duration::from_millis(600))
+                .contains(&ctrl::CTRL_PONG),
+            "повтор принят"
+        );
         // Подделка с огромным счётчиком не сдвигает окно (сдвиг — только
         // после расшифровки): честный следующий фрейм проходит.
         let mut forged = proto::seal_ctrl(&[9; 32], 1 << 40, ctrl::CTRL_PING, &[]);
@@ -2981,14 +3366,23 @@ mod tests {
     #[test]
     fn ключ_лимитера_ipv6_по_64_и_unsupported_не_длиннее_запроса() {
         let k = |s: &str| ip_key(s.parse().unwrap());
-        assert_eq!(k("2001:db8:1:2:aaaa::1"), k("2001:db8:1:2:ffff:ffff:ffff:ffff"));
+        assert_eq!(
+            k("2001:db8:1:2:aaaa::1"),
+            k("2001:db8:1:2:ffff:ffff:ffff:ffff")
+        );
         assert_ne!(k("2001:db8:1:2::1"), k("2001:db8:1:3::1"));
         assert_eq!(k("::ffff:10.0.0.1"), k("10.0.0.1"), "v4-mapped — как IPv4");
         assert_ne!(k("10.0.0.1"), k("10.0.0.2"));
         let full = proto::HDR_LEN + hs::enc_unsupported(UNSUPPORTED_TEXT).len();
-        assert_eq!(unsupported_body(full).unwrap(), hs::enc_unsupported(UNSUPPORTED_TEXT));
+        assert_eq!(
+            unsupported_body(full).unwrap(),
+            hs::enc_unsupported(UNSUPPORTED_TEXT)
+        );
         assert_eq!(unsupported_body(full - 1).unwrap(), hs::enc_unsupported(""));
-        assert_eq!(unsupported_body(proto::HDR_LEN + 2).unwrap(), hs::enc_unsupported(""));
+        assert_eq!(
+            unsupported_body(proto::HDR_LEN + 2).unwrap(),
+            hs::enc_unsupported("")
+        );
         assert!(unsupported_body(proto::HDR_LEN + 1).is_none());
     }
 
@@ -3014,11 +3408,18 @@ mod tests {
 
     #[test]
     fn лимит_приглашений_на_одну_цель() {
-        let limits = Limits { max_invites_per_target: 2, ctrl_rate: 1e6, ctrl_burst: 1e6, ..Limits::default() };
+        let limits = Limits {
+            max_invites_per_target: 2,
+            ctrl_rate: 1e6,
+            ctrl_burst: 1e6,
+            ..Limits::default()
+        };
         let (server, dir) = test_server_with("target-cap", limits);
         let a = Raw::connect(server.addr, "alpha");
         let target = [0x77; 32];
-        let gids: Vec<u32> = (0..3).map(|i| a.create(&format!("g{i}"), false).gid).collect();
+        let gids: Vec<u32> = (0..3)
+            .map(|i| a.create(&format!("g{i}"), false).gid)
+            .collect();
         for &gid in &gids[..2] {
             a.send(ctrl::INVITE, &payloads::enc_gid_target(gid, &target));
         }
@@ -3029,13 +3430,20 @@ mod tests {
         a.send(ctrl::INVITE, &payloads::enc_gid_target(gids[0], &target));
         assert!(!a.sync().contains(&ctrl::ERROR));
         // Другой цели лимит не мешает.
-        a.send(ctrl::INVITE, &payloads::enc_gid_target(gids[2], &[0x78; 32]));
+        a.send(
+            ctrl::INVITE,
+            &payloads::enc_gid_target(gids[2], &[0x78; 32]),
+        );
         assert!(!a.sync().contains(&ctrl::ERROR));
         // Отзыв (KICK) освобождает место.
         a.send(ctrl::KICK, &payloads::enc_gid_target(gids[0], &target));
         a.send(ctrl::INVITE, &payloads::enc_gid_target(gids[2], &target));
         assert!(!a.sync().contains(&ctrl::ERROR));
-        assert!(server.shared.state.read().unwrap().groups[&gids[2]].invites.contains_key(&target));
+        assert!(
+            server.shared.state.read().unwrap().groups[&gids[2]]
+                .invites
+                .contains_key(&target)
+        );
         server.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3081,18 +3489,29 @@ mod tests {
         {
             let s = server.shared.state.read().unwrap();
             let g = &s.groups[&gid];
-            assert_eq!((g.invites.len(), g.banned.len()), (MAX_INVITES_PER_GROUP, MAX_BANS_PER_GROUP));
+            assert_eq!(
+                (g.invites.len(), g.banned.len()),
+                (MAX_INVITES_PER_GROUP, MAX_BANS_PER_GROUP)
+            );
         }
         // Входы не-участников: запас 2, дальше — отказ без ротации.
         let epoch = server.shared.state.read().unwrap().groups[&gid].epoch;
-        let (b, c, d) = (Raw::connect(server.addr, "b"), Raw::connect(server.addr, "c"), Raw::connect(server.addr, "d"));
+        let (b, c, d) = (
+            Raw::connect(server.addr, "b"),
+            Raw::connect(server.addr, "c"),
+            Raw::connect(server.addr, "d"),
+        );
         b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
         assert_eq!(b.state().epoch, epoch + 1);
         c.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
         assert_eq!(c.state().epoch, epoch + 2);
         d.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
         assert!(d.error().contains("слишком много входов"));
-        assert_eq!(server.shared.state.read().unwrap().groups[&gid].epoch, epoch + 2, "отказ ротировал ключ");
+        assert_eq!(
+            server.shared.state.read().unwrap().groups[&gid].epoch,
+            epoch + 2,
+            "отказ ротировал ключ"
+        );
         // Повторный JOIN участника — не вход, лимит не тратит.
         b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
         assert_eq!(b.state().epoch, epoch + 2);
@@ -3102,7 +3521,11 @@ mod tests {
 
     #[test]
     fn чехарда_leave_join_одной_identity_не_крутит_ключ() {
-        let limits = Limits { ctrl_rate: 1e6, ctrl_burst: 1e6, ..Limits::default() };
+        let limits = Limits {
+            ctrl_rate: 1e6,
+            ctrl_burst: 1e6,
+            ..Limits::default()
+        };
         let (server, dir) = test_server_with("churn", limits);
         let a = Raw::connect(server.addr, "alpha");
         let gid = a.create("g", false).gid;
@@ -3113,7 +3536,9 @@ mod tests {
         b.sync();
         let epoch = server.shared.state.read().unwrap().groups[&gid].epoch;
         // Сразу назад — отказ без ротации и без траты общего лимита входов.
-        let joins = server.shared.state.read().unwrap().groups[&gid].joins.tokens;
+        let joins = server.shared.state.read().unwrap().groups[&gid]
+            .joins
+            .tokens;
         for _ in 0..20 {
             b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
             assert!(b.error().contains("недавно вышли"));
@@ -3122,7 +3547,10 @@ mod tests {
             let s = server.shared.state.read().unwrap();
             let g = &s.groups[&gid];
             assert_eq!(g.epoch, epoch, "отказ ротировал ключ");
-            assert!(g.joins.tokens >= joins, "отказ потратил лимит входов группы");
+            assert!(
+                g.joins.tokens >= joins,
+                "отказ потратил лимит входов группы"
+            );
         }
         // Другим identity пауза не мешает.
         let c = Raw::connect(server.addr, "charlie");
@@ -3153,11 +3581,21 @@ mod tests {
         a.expect(ctrl::GROUP_LIST);
         b.sync();
         for i in 0..20 {
-            a.send(ctrl::RENAME_GROUP, &payloads::enc_rename(gid, &format!("g{i}")));
+            a.send(
+                ctrl::RENAME_GROUP,
+                &payloads::enc_rename(gid, &format!("g{i}")),
+            );
         }
         a.sync();
-        let lists = b.drain(Duration::from_millis(2500)).iter().filter(|t| **t == ctrl::GROUP_LIST).count();
-        assert!((1..=2).contains(&lists), "GROUP_LIST у B: {lists} на 20 команд");
+        let lists = b
+            .drain(Duration::from_millis(2500))
+            .iter()
+            .filter(|t| **t == ctrl::GROUP_LIST)
+            .count();
+        assert!(
+            (1..=2).contains(&lists),
+            "GROUP_LIST у B: {lists} на 20 команд"
+        );
 
         // Тот же статус — без ревизии и дельты.
         b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
@@ -3167,7 +3605,10 @@ mod tests {
         a.update();
         b.send(ctrl::STATUS, &payloads::enc_status("afk"));
         b.sync();
-        assert!(!a.sync().contains(&ctrl::GROUP_UPDATE), "повтор статуса — дельта");
+        assert!(
+            !a.sync().contains(&ctrl::GROUP_UPDATE),
+            "повтор статуса — дельта"
+        );
         server.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3182,7 +3623,13 @@ mod tests {
         b.state();
         let store = persist::Store::new(&dir);
         let on_disk = |pk: &[u8; 32]| {
-            store.load().unwrap().unwrap().groups.iter().any(|g| g.id == gid && g.members.iter().any(|(k, _)| *k == hex(pk)))
+            store
+                .load()
+                .unwrap()
+                .unwrap()
+                .groups
+                .iter()
+                .any(|g| g.id == gid && g.members.iter().any(|(k, _)| *k == hex(pk)))
         };
         wait_until_srv(Duration::from_secs(5), || on_disk(&b.pk));
         a.send(ctrl::KICK, &payloads::enc_gid_target(gid, &b.pk));
@@ -3190,7 +3637,11 @@ mod tests {
         // Не через SAVE_EVERY (3 с), а сразу (≤ URGENT_SAVE_GAP + запас).
         let t0 = Instant::now();
         wait_until_srv(Duration::from_secs(5), || !on_disk(&b.pk));
-        assert!(t0.elapsed() < Duration::from_millis(1500), "кик сохранён за {:?}", t0.elapsed());
+        assert!(
+            t0.elapsed() < Duration::from_millis(1500),
+            "кик сохранён за {:?}",
+            t0.elapsed()
+        );
         server.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3215,24 +3666,46 @@ mod tests {
             let _ = std::fs::remove_dir_all(&c);
             l
         };
-        let banned_on_disk =
-            |pk: &[u8; 32]| store.load().unwrap().unwrap().groups.iter().any(|g| g.id == gid && g.banned.contains(&hex(pk)));
+        let banned_on_disk = |pk: &[u8; 32]| {
+            store
+                .load()
+                .unwrap()
+                .unwrap()
+                .groups
+                .iter()
+                .any(|g| g.id == gid && g.banned.contains(&hex(pk)))
+        };
         a.send(ctrl::BAN, &payloads::enc_gid_target(gid, &b.pk));
         b.expect(ctrl::KICKED);
         let t0 = Instant::now();
         wait_until_srv(Duration::from_secs(5), || banned_on_disk(&b.pk));
-        assert!(t0.elapsed() < Duration::from_millis(1500), "бан сохранён за {:?}", t0.elapsed());
+        assert!(
+            t0.elapsed() < Duration::from_millis(1500),
+            "бан сохранён за {:?}",
+            t0.elapsed()
+        );
         let issued = server.shared.state.read().unwrap().groups[&gid].epoch;
         let l = crashed();
         let g = &l.groups[&gid];
-        assert!(g.banned.contains_key(&b.pk) && !g.members.contains_key(&b.pk), "забаненный вернулся");
-        assert!(g.epoch > issued, "эпоха {} повторяет выданную {issued}", g.epoch);
+        assert!(
+            g.banned.contains_key(&b.pk) && !g.members.contains_key(&b.pk),
+            "забаненный вернулся"
+        );
+        assert!(
+            g.epoch > issued,
+            "эпоха {} повторяет выданную {issued}",
+            g.epoch
+        );
         // UNBAN — тоже сразу.
         a.send(ctrl::UNBAN, &payloads::enc_gid_target(gid, &b.pk));
         a.expect(ctrl::ADMIN_INFO);
         let t0 = Instant::now();
         wait_until_srv(Duration::from_secs(5), || !banned_on_disk(&b.pk));
-        assert!(t0.elapsed() < Duration::from_millis(1500), "разбан сохранён за {:?}", t0.elapsed());
+        assert!(
+            t0.elapsed() < Duration::from_millis(1500),
+            "разбан сохранён за {:?}",
+            t0.elapsed()
+        );
         server.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3261,7 +3734,14 @@ mod tests {
         let r = t.join().unwrap();
         save_now(&server.shared);
         let k = persist::Store::new(&dir).load_key().unwrap();
-        assert_eq!(proto::Identity { ed_seed: k.ed_seed, x_seed: k.x_seed }.ed_pub(), r.pubkey);
+        assert_eq!(
+            proto::Identity {
+                ed_seed: k.ed_seed,
+                x_seed: k.x_seed
+            }
+            .ed_pub(),
+            r.pubkey
+        );
         server.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3270,11 +3750,13 @@ mod tests {
     fn hello_v2_и_чужая_версия_получают_unsupported() {
         let (server, dir) = test_server("unsupported");
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
-        sock.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
         // HELLO v2 настоящего размера (ключи, имя, подпись) — с текстом.
         let v2 = proto::plain_frame(ctrl::HELLO, &[0x55; 140]);
         sock.send_to(&v2, server.addr).unwrap();
-        let (body, frame) = recv_plain(&sock, ctrl::UNSUPPORTED, Duration::from_secs(3)).expect("UNSUPPORTED на v2");
+        let (body, frame) = recv_plain(&sock, ctrl::UNSUPPORTED, Duration::from_secs(3))
+            .expect("UNSUPPORTED на v2");
         let (ver, text) = hs::dec_unsupported(&body).unwrap();
         assert_eq!(ver, proto::PROTOCOL_VERSION);
         assert!(!text.is_empty());
@@ -3283,19 +3765,29 @@ mod tests {
         // пустой HELLO (7 байт) — без ответа: усиления нет.
         let short = proto::plain_frame(ctrl::HELLO, b"v2 hello body");
         sock.send_to(&short, server.addr).unwrap();
-        let (body, frame) = recv_plain(&sock, ctrl::UNSUPPORTED, Duration::from_secs(3)).expect("короткий UNSUPPORTED");
-        assert_eq!(hs::dec_unsupported(&body).unwrap(), (proto::PROTOCOL_VERSION, String::new()));
+        let (body, frame) = recv_plain(&sock, ctrl::UNSUPPORTED, Duration::from_secs(3))
+            .expect("короткий UNSUPPORTED");
+        assert_eq!(
+            hs::dec_unsupported(&body).unwrap(),
+            (proto::PROTOCOL_VERSION, String::new())
+        );
         assert!(frame.len() <= short.len());
-        sock.send_to(&proto::plain_frame(ctrl::HELLO, b""), server.addr).unwrap();
-        assert!(recv_plain(&sock, ctrl::UNSUPPORTED, Duration::from_millis(500)).is_none(), "ответ на 7 байт");
+        sock.send_to(&proto::plain_frame(ctrl::HELLO, b""), server.addr)
+            .unwrap();
+        assert!(
+            recv_plain(&sock, ctrl::UNSUPPORTED, Duration::from_millis(500)).is_none(),
+            "ответ на 7 байт"
+        );
         // HELLO3 с версией 4 — с текстом; HELLO3 из одного байта версии — без ответа.
         let id = proto::Identity::generate();
         let mut h = Hello3::encode(&id, &[5; 32], "x", 0, None);
         h[0] = 4;
-        sock.send_to(&proto::plain_frame(ctrl::HELLO3, &h), server.addr).unwrap();
+        sock.send_to(&proto::plain_frame(ctrl::HELLO3, &h), server.addr)
+            .unwrap();
         let (body, _) = recv_plain(&sock, ctrl::UNSUPPORTED, Duration::from_secs(3)).unwrap();
         assert!(!hs::dec_unsupported(&body).unwrap().1.is_empty());
-        sock.send_to(&proto::plain_frame(ctrl::HELLO3, &[4]), server.addr).unwrap();
+        sock.send_to(&proto::plain_frame(ctrl::HELLO3, &[4]), server.addr)
+            .unwrap();
         assert!(recv_plain(&sock, ctrl::UNSUPPORTED, Duration::from_millis(500)).is_none());
         server.stop();
         let _ = std::fs::remove_dir_all(&dir);
@@ -3321,7 +3813,10 @@ mod tests {
         for i in 0..8 {
             assert!(ip_take(&mut m, ip(i), rate, burst, 8));
         }
-        assert!(ip_take(&mut m, ip(100), rate, burst, 8), "восполнившиеся — вытеснить");
+        assert!(
+            ip_take(&mut m, ip(100), rate, burst, 8),
+            "восполнившиеся — вытеснить"
+        );
         assert!(m.len() <= 8);
         // IPv6 из одного /64 — одна запись.
         let mut m = HashMap::new();
@@ -3334,15 +3829,25 @@ mod tests {
 
     #[test]
     fn лимит_hello_по_ip_покрывает_ответы() {
-        let limits = Limits { hello_rate: 0.001, hello_burst: 3.0, ..Limits::default() };
+        let limits = Limits {
+            hello_rate: 0.001,
+            hello_burst: 3.0,
+            ..Limits::default()
+        };
         let (server, dir) = test_server_with("hello-limit", limits);
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
-        sock.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
         for _ in 0..10 {
-            sock.send_to(&proto::plain_frame(ctrl::HELLO, &[0; 100]), server.addr).unwrap();
+            sock.send_to(&proto::plain_frame(ctrl::HELLO, &[0; 100]), server.addr)
+                .unwrap();
         }
         // ctrl от адреса без сессии — RESET, тоже из того же лимита.
-        sock.send_to(&proto::seal_ctrl(&[1; 32], 0, ctrl::CTRL_PING, &[]), server.addr).unwrap();
+        sock.send_to(
+            &proto::seal_ctrl(&[1; 32], 0, ctrl::CTRL_PING, &[]),
+            server.addr,
+        )
+        .unwrap();
         let mut n = 0;
         let mut buf = [0u8; 2048];
         let end = Instant::now() + Duration::from_millis(800);
@@ -3369,9 +3874,14 @@ mod tests {
         let sb = b.state();
         // Вход — ротация без отзыва, rev и epoch +1.
         let u = a.update();
-        assert_eq!((u.gid, u.base_rev, u.rev, u.epoch, u.revoke_prev), (gid, st.rev, st.rev + 1, st.epoch + 1, false));
+        assert_eq!(
+            (u.gid, u.base_rev, u.rev, u.epoch, u.revoke_prev),
+            (gid, st.rev, st.rev + 1, st.epoch + 1, false)
+        );
         assert_ne!(u.key, st.key);
-        assert!(matches!(&u.delta, GroupDelta::Member(m) if m.pubkey == b.pk && m.name == "bravo" && m.online));
+        assert!(
+            matches!(&u.delta, GroupDelta::Member(m) if m.pubkey == b.pk && m.name == "bravo" && m.online)
+        );
         assert_eq!((sb.rev, sb.epoch, sb.key), (u.rev, u.epoch, u.key));
         assert_eq!(sb.members.len(), 2);
 
@@ -3384,9 +3894,15 @@ mod tests {
         // KICK: удалённому — KICKED, остальным — kind 2 + ротация с отзывом.
         a.send(ctrl::KICK, &payloads::enc_gid_target(gid, &b.pk));
         let k = payloads::dec_kicked(&b.expect(ctrl::KICKED)).unwrap();
-        assert_eq!((k.gid, k.group_name.as_str(), k.banned), (gid, "game", false));
+        assert_eq!(
+            (k.gid, k.group_name.as_str(), k.banned),
+            (gid, "game", false)
+        );
         let u = c.update();
-        assert_eq!((u.base_rev, u.rev, u.epoch, u.revoke_prev), (sc.rev, sc.rev + 1, sc.epoch + 1, true));
+        assert_eq!(
+            (u.base_rev, u.rev, u.epoch, u.revoke_prev),
+            (sc.rev, sc.rev + 1, sc.epoch + 1, true)
+        );
         assert_eq!(k.rev, u.rev, "KICKED несёт ревизию после кика");
         assert_ne!(u.key, sc.key);
         assert_eq!(u.delta, GroupDelta::Removed(b.pk));
@@ -3397,7 +3913,10 @@ mod tests {
         let k = payloads::dec_kicked(&c.expect(ctrl::KICKED)).unwrap();
         assert!(k.banned);
         let u2 = a.update();
-        assert_eq!((u2.rev, u2.epoch, u2.revoke_prev), (u.rev + 1, u.epoch + 1, true));
+        assert_eq!(
+            (u2.rev, u2.epoch, u2.revoke_prev),
+            (u.rev + 1, u.epoch + 1, true)
+        );
         assert_eq!(u2.delta, GroupDelta::Removed(c.pk));
         c.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
         assert!(c.error().contains("забанены"));
@@ -3431,7 +3950,10 @@ mod tests {
         let s2 = b2.state();
         assert_eq!((s2.rev, s2.epoch), (sb.rev + 1, sb.epoch + 1));
         let u = a.update();
-        assert_eq!((u.rev, u.epoch, u.key, u.revoke_prev), (s2.rev, s2.epoch, s2.key, false));
+        assert_eq!(
+            (u.rev, u.epoch, u.key, u.revoke_prev),
+            (s2.rev, s2.epoch, s2.key, false)
+        );
         match &u.delta {
             GroupDelta::Member(m) => {
                 assert_eq!(m.name, "bravo2");
@@ -3452,18 +3974,27 @@ mod tests {
         let srv = server.addr;
         let a = Raw::connect(srv, "alpha");
         let st = a.create("game", false);
-        let b = Raw::connect_with(srv, "bravo", &proto::Identity::generate(), hs::HELLO_FLAG_INVISIBLE);
+        let b = Raw::connect_with(
+            srv,
+            "bravo",
+            &proto::Identity::generate(),
+            hs::HELLO_FLAG_INVISIBLE,
+        );
         b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(st.gid));
         let sb = b.state();
         // Себе invisible виден онлайн, другим — офлайн без адресов.
         let me = sb.members.iter().find(|m| m.pubkey == b.pk).unwrap();
         assert!(me.online && me.endpoint.is_some());
-        let GroupDelta::Member(m) = a.update().delta else { panic!() };
+        let GroupDelta::Member(m) = a.update().delta else {
+            panic!()
+        };
         assert!(!m.online && m.endpoint.is_none() && m.candidates.is_empty());
 
         let cand: SocketAddr = "10.0.0.5:4000".parse().unwrap();
         b.send(ctrl::CANDIDATES, &payloads::enc_candidates(&[cand]));
-        let GroupDelta::Member(m) = a.update().delta else { panic!() };
+        let GroupDelta::Member(m) = a.update().delta else {
+            panic!()
+        };
         assert!(m.candidates.is_empty(), "кандидаты invisible видны");
         // Сам B тоже получает дельту — его ревизия не отстаёт.
         let ub = b.update();
@@ -3472,10 +4003,15 @@ mod tests {
         // Повтор того же значения — без дельты, но с подтверждением.
         b.send(ctrl::PRESENCE, &payloads::enc_presence(true));
         assert!(payloads::dec_presence(&b.expect(ctrl::PRESENCE_ACK)).unwrap());
-        assert!(!a.sync().contains(&ctrl::GROUP_UPDATE), "повтор PRESENCE — не изменение");
+        assert!(
+            !a.sync().contains(&ctrl::GROUP_UPDATE),
+            "повтор PRESENCE — не изменение"
+        );
         b.send(ctrl::PRESENCE, &payloads::enc_presence(false));
         assert!(!payloads::dec_presence(&b.expect(ctrl::PRESENCE_ACK)).unwrap());
-        let GroupDelta::Member(m) = a.update().delta else { panic!() };
+        let GroupDelta::Member(m) = a.update().delta else {
+            panic!()
+        };
         assert!(m.online);
         assert_eq!(m.endpoint, Some(b.sock.local_addr().unwrap()));
         assert_eq!(m.candidates, vec![cand]);
@@ -3487,7 +4023,10 @@ mod tests {
         }
         a.send(ctrl::CANDIDATES, &five);
         let seen = a.sync();
-        assert!(!seen.contains(&ctrl::ERROR) && !seen.contains(&ctrl::GROUP_UPDATE), "{seen:02x?}");
+        assert!(
+            !seen.contains(&ctrl::ERROR) && !seen.contains(&ctrl::GROUP_UPDATE),
+            "{seen:02x?}"
+        );
         b.send(ctrl::CANDIDATES, &payloads::enc_candidates(&[cand]));
         b.sync();
         assert!(!a.sync().contains(&ctrl::GROUP_UPDATE));
@@ -3496,7 +4035,10 @@ mod tests {
         let list = payloads::dec_group_list(&a.expect(ctrl::GROUP_LIST)).unwrap();
         let g = list.iter().find(|g| g.gid == st.gid).unwrap();
         let s = server.shared.state.read().unwrap();
-        assert_eq!((g.rev, g.epoch, g.online, g.total), (s.groups[&st.gid].rev, s.groups[&st.gid].epoch, 2, 2));
+        assert_eq!(
+            (g.rev, g.epoch, g.online, g.total),
+            (s.groups[&st.gid].rev, s.groups[&st.gid].epoch, 2, 2)
+        );
         drop(s);
         server.stop();
         let _ = std::fs::remove_dir_all(&dir);
@@ -3512,7 +4054,11 @@ mod tests {
         let c = Raw::connect(srv, "charlie");
         a.send(ctrl::INVITE, &payloads::enc_gid_target(gid, &b.pk));
         let inv = payloads::dec_invite(&b.expect(ctrl::INVITE_RCVD)).unwrap();
-        assert!(inv.expires_in > 6 * 24 * 3600 && inv.expires_in <= 7 * 24 * 3600, "{}", inv.expires_in);
+        assert!(
+            inv.expires_in > 6 * 24 * 3600 && inv.expires_in <= 7 * 24 * 3600,
+            "{}",
+            inv.expires_in
+        );
         b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
         b.state();
         a.send(ctrl::INVITE, &payloads::enc_gid_target(gid, &c.pk));
@@ -3524,10 +4070,17 @@ mod tests {
         a.send(ctrl::GROUP_ADMIN, &payloads::enc_gid(gid));
         let info = payloads::dec_admin_info(&a.expect(ctrl::ADMIN_INFO)).unwrap();
         assert_eq!(info.gid, gid);
-        let bans: Vec<_> = info.bans.iter().map(|x| (x.pubkey, x.name.as_str())).collect();
+        let bans: Vec<_> = info
+            .bans
+            .iter()
+            .map(|x| (x.pubkey, x.name.as_str()))
+            .collect();
         assert_eq!(bans, vec![(d, ""), (b.pk, "bravo")]);
         assert_eq!(info.invites.len(), 1);
-        assert_eq!((info.invites[0].pubkey, info.invites[0].name.as_str()), (c.pk, "charlie"));
+        assert_eq!(
+            (info.invites[0].pubkey, info.invites[0].name.as_str()),
+            (c.pk, "charlie")
+        );
         assert!(info.invites[0].expires_in > 6 * 24 * 3600);
         // Не владельцу — ошибка.
         c.send(ctrl::GROUP_ADMIN, &payloads::enc_gid(gid));
@@ -3536,7 +4089,10 @@ mod tests {
         // UNBAN — идемпотентно, ответ — свежий ADMIN_INFO.
         a.send(ctrl::UNBAN, &payloads::enc_gid_target(gid, &b.pk));
         let info = payloads::dec_admin_info(&a.expect(ctrl::ADMIN_INFO)).unwrap();
-        assert_eq!(info.bans.iter().map(|x| x.pubkey).collect::<Vec<_>>(), vec![d]);
+        assert_eq!(
+            info.bans.iter().map(|x| x.pubkey).collect::<Vec<_>>(),
+            vec![d]
+        );
         a.send(ctrl::UNBAN, &payloads::enc_gid_target(gid, &b.pk));
         a.expect(ctrl::ADMIN_INFO);
         // Разбаненный снова входит по приглашению.
@@ -3553,7 +4109,14 @@ mod tests {
         a.send(ctrl::TRANSFER_OWNER, &payloads::enc_gid_target(gid, &b.pk));
         let u = b.update();
         assert_eq!(u.base_rev, sb.rev);
-        assert_eq!(u.delta, GroupDelta::Meta { name: "secret".into(), owner: b.pk, private: true });
+        assert_eq!(
+            u.delta,
+            GroupDelta::Meta {
+                name: "secret".into(),
+                owner: b.pk,
+                private: true
+            }
+        );
         a.send(ctrl::GROUP_ADMIN, &payloads::enc_gid(gid));
         assert!(a.error().contains("владелец"));
         b.send(ctrl::GROUP_ADMIN, &payloads::enc_gid(gid));
@@ -3561,7 +4124,10 @@ mod tests {
         // Приглашения теперь от нового владельца.
         c.send(ctrl::LIST_INVITES, &payloads::enc_u32(0));
         let l = payloads::dec_invite_list(&c.expect(ctrl::INVITE_LIST)).unwrap();
-        assert_eq!((l.items[0].from_pubkey, l.items[0].from_name.as_str()), (b.pk, "bravo"));
+        assert_eq!(
+            (l.items[0].from_pubkey, l.items[0].from_name.as_str()),
+            (b.pk, "bravo")
+        );
 
         server.stop();
         let _ = std::fs::remove_dir_all(&dir);
@@ -3569,12 +4135,18 @@ mod tests {
 
     #[test]
     fn лимит_групп_во_владении() {
-        let limits = Limits { max_owned_groups: 2, ..Limits::default() };
+        let limits = Limits {
+            max_owned_groups: 2,
+            ..Limits::default()
+        };
         let (server, dir) = test_server_with("owned", limits);
         let a = Raw::connect(server.addr, "alpha");
         let g1 = a.create("one", false).gid;
         a.create("two", false);
-        a.send(ctrl::CREATE_GROUP, &payloads::enc_create_group("three", false));
+        a.send(
+            ctrl::CREATE_GROUP,
+            &payloads::enc_create_group("three", false),
+        );
         assert!(a.error().contains("лимит групп"));
         // Передача тому, у кого лимит исчерпан, — тоже отказ.
         let b = Raw::connect(server.addr, "bravo");
@@ -3593,7 +4165,10 @@ mod tests {
 
     #[test]
     fn приглашение_истекает() {
-        let limits = Limits { invite_ttl: Duration::from_secs(1), ..Limits::default() };
+        let limits = Limits {
+            invite_ttl: Duration::from_secs(1),
+            ..Limits::default()
+        };
         let (server, dir) = test_server_with("invite-ttl", limits);
         let srv = server.addr;
         let a = Raw::connect(srv, "alpha");
@@ -3606,20 +4181,37 @@ mod tests {
         // Housekeeping снимает истёкшее и присылает приглашённому окно без него.
         let l = payloads::dec_invite_list(&b.expect(ctrl::INVITE_LIST)).unwrap();
         assert!(l.covers(gid) && l.items.is_empty(), "{l:?}");
-        assert!(server.shared.state.read().unwrap().groups[&gid].invites.is_empty());
+        assert!(
+            server.shared.state.read().unwrap().groups[&gid]
+                .invites
+                .is_empty()
+        );
         b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
         assert!(b.error().contains("приглашение"));
         a.send(ctrl::GROUP_ADMIN, &payloads::enc_gid(gid));
-        assert!(payloads::dec_admin_info(&a.expect(ctrl::ADMIN_INFO)).unwrap().invites.is_empty());
+        assert!(
+            payloads::dec_admin_info(&a.expect(ctrl::ADMIN_INFO))
+                .unwrap()
+                .invites
+                .is_empty()
+        );
 
         // Списки пропускают истёкшее и до housekeeping.
         {
             let mut s = server.shared.state.write().unwrap();
-            let inv = Invite { created_ms: unix_ms() - 5_000, name: String::new() };
+            let inv = Invite {
+                created_ms: unix_ms() - 5_000,
+                name: String::new(),
+            };
             s.groups.get_mut(&gid).unwrap().invites.insert(b.pk, inv);
         }
         b.send(ctrl::LIST_INVITES, &payloads::enc_u32(0));
-        assert!(payloads::dec_invite_list(&b.expect(ctrl::INVITE_LIST)).unwrap().items.is_empty());
+        assert!(
+            payloads::dec_invite_list(&b.expect(ctrl::INVITE_LIST))
+                .unwrap()
+                .items
+                .is_empty()
+        );
         server.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3647,12 +4239,21 @@ mod tests {
                 pk[..2].copy_from_slice(&i.to_be_bytes());
                 pk[31] = 0xEE;
                 let v6 = |j: u16| -> SocketAddr {
-                    format!("[2001:db8:ffff:ffff:ffff:ffff:{i:04x}:{j:04x}]:65535").parse().unwrap()
+                    format!("[2001:db8:ffff:ffff:ffff:ffff:{i:04x}:{j:04x}]:65535")
+                        .parse()
+                        .unwrap()
                 };
                 let addr = v6(0xffff);
                 let g = s.groups.get_mut(&gid).unwrap();
                 let ip = g.next_free_ip().unwrap();
-                g.insert_member(pk, Member { ip, name: long_text('n'), status: long_text('s') });
+                g.insert_member(
+                    pk,
+                    Member {
+                        ip,
+                        name: long_text('n'),
+                        status: long_text('s'),
+                    },
+                );
                 s.sessions.insert(
                     addr,
                     Session {
@@ -3660,7 +4261,10 @@ mod tests {
                         eph_pub: [0; 32],
                         name: long_text('n'),
                         status: long_text('s'),
-                        keys: proto::DirKeys { tx: [1; 32], rx: [2; 32] },
+                        keys: proto::DirKeys {
+                            tx: [1; 32],
+                            rx: [2; 32],
+                        },
                         welcome: Vec::new(),
                         welcome_at: AtomicU64::new(0),
                         tx: AtomicU64::new(0),
@@ -3679,7 +4283,11 @@ mod tests {
         }
         a.send(ctrl::GET_GROUP, &payloads::enc_gid(gid));
         let raw = a.expect(ctrl::GROUP_STATE);
-        assert!(raw.len() > 150 * proto::FRAG_THRESHOLD, "{} байт", raw.len());
+        assert!(
+            raw.len() > 150 * proto::FRAG_THRESHOLD,
+            "{} байт",
+            raw.len()
+        );
         assert!(raw.len() <= proto::FRAG_MAX_PAYLOAD);
         let expected = {
             let s = server.shared.state.read().unwrap();
@@ -3689,7 +4297,10 @@ mod tests {
         let got = payloads::dec_group_state(&raw).unwrap();
         assert_eq!(got.members.len(), 253);
         let fake = got.members.iter().find(|m| m.pubkey[31] == 0xEE).unwrap();
-        assert_eq!((fake.name.len(), fake.status.len(), fake.candidates.len()), (255, 255, 4));
+        assert_eq!(
+            (fake.name.len(), fake.status.len(), fake.candidates.len()),
+            (255, 255, 4)
+        );
         assert!(fake.endpoint.is_some_and(|e| e.is_ipv6()));
         // Не участнику — ошибка, несуществующая группа — «удалена».
         let b = Raw::connect(server.addr, "bravo");
@@ -3705,7 +4316,10 @@ mod tests {
     #[test]
     fn ротация_ключа_сервера_принимается_клиентом() {
         let dir = temp_dir("rotate");
-        assert!(rotate_key(&dir).is_err(), "без server.json ротировать нечего");
+        assert!(
+            rotate_key(&dir).is_err(),
+            "без server.json ротировать нечего"
+        );
         let server = start_in(&dir, Limits::default());
         let a = Raw::connect(server.addr, "alpha");
         let gid = a.create("keep", false).gid;
@@ -3720,16 +4334,36 @@ mod tests {
         let server = start_in(&dir, Limits::default());
         assert_eq!(server.pubkey, r2.pubkey);
         assert_eq!(server.code, r2.code);
-        assert!(server.shared.state.read().unwrap().groups.contains_key(&gid), "группы на месте");
+        assert!(
+            server
+                .shared
+                .state
+                .read()
+                .unwrap()
+                .groups
+                .contains_key(&gid),
+            "группы на месте"
+        );
 
         let b = Raw::connect(server.addr, "bravo");
         let w = &b.welcome;
         assert_eq!(w.server_ed, r2.pubkey);
         assert_eq!(w.links.len(), 2);
         let rotated = hs::PinResolution::Rotated { new_ed: r2.pubkey };
-        assert_eq!(proto::resolve_pin(&k0, w).unwrap(), rotated, "пин самого старого ключа");
-        assert_eq!(proto::resolve_pin(&r1.pubkey, w).unwrap(), rotated, "пин промежуточного");
-        assert_eq!(proto::resolve_pin(&r2.pubkey, w).unwrap(), hs::PinResolution::Same);
+        assert_eq!(
+            proto::resolve_pin(&k0, w).unwrap(),
+            rotated,
+            "пин самого старого ключа"
+        );
+        assert_eq!(
+            proto::resolve_pin(&r1.pubkey, w).unwrap(),
+            rotated,
+            "пин промежуточного"
+        );
+        assert_eq!(
+            proto::resolve_pin(&r2.pubkey, w).unwrap(),
+            hs::PinResolution::Same
+        );
         assert!(proto::resolve_pin(&proto::Identity::generate().ed_pub(), w).is_err());
         b.sync();
 
@@ -3741,7 +4375,10 @@ mod tests {
         let server = start_in(&dir, Limits::default());
         let c = Raw::connect(server.addr, "charlie");
         assert_eq!(c.welcome.links.len(), hs::MAX_LINKS);
-        assert!(proto::resolve_pin(&k0, &c.welcome).is_err(), "звено старого ключа уже не в WELCOME");
+        assert!(
+            proto::resolve_pin(&k0, &c.welcome).is_err(),
+            "звено старого ключа уже не в WELCOME"
+        );
         server.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3763,7 +4400,10 @@ mod tests {
         let r = rotate_key(&dir).unwrap();
         save_now(&server.shared);
         let on_disk = persist::Store::new(&dir).load_key().unwrap();
-        let disk_id = proto::Identity { ed_seed: on_disk.ed_seed, x_seed: on_disk.x_seed };
+        let disk_id = proto::Identity {
+            ed_seed: on_disk.ed_seed,
+            x_seed: on_disk.x_seed,
+        };
         assert_eq!(disk_id.ed_pub(), r.pubkey, "ротация затёрта сохранением");
         assert_eq!(on_disk.rotations.len(), 2);
         server.stop();
@@ -3771,7 +4411,10 @@ mod tests {
         assert_eq!(server.pubkey, r.pubkey, "после перезапуска — новый ключ");
         {
             let s = server.shared.state.read().unwrap();
-            assert!(s.groups.contains_key(&before) && s.groups.contains_key(&after), "группы потеряны");
+            assert!(
+                s.groups.contains_key(&before) && s.groups.contains_key(&after),
+                "группы потеряны"
+            );
         }
         let b = Raw::connect(server.addr, "bravo");
         assert_eq!(b.welcome.links.len(), 2);
@@ -3793,13 +4436,24 @@ mod tests {
         a.sync();
         server.stop();
         let k = persist::Store::new(&dir).load_key().unwrap();
-        assert_eq!(proto::Identity { ed_seed: k.ed_seed, x_seed: k.x_seed }.ed_pub(), r.pubkey, "ключ затёрт при остановке");
+        assert_eq!(
+            proto::Identity {
+                ed_seed: k.ed_seed,
+                x_seed: k.x_seed
+            }
+            .ed_pub(),
+            r.pubkey,
+            "ключ затёрт при остановке"
+        );
         assert_eq!(k.rotations.len(), 1);
         let server = start_in(&dir, Limits::default());
         assert_eq!(server.pubkey, r.pubkey);
         {
             let s = server.shared.state.read().unwrap();
-            assert!(s.groups.contains_key(&gid) && s.groups.contains_key(&gid2), "группы потеряны");
+            assert!(
+                s.groups.contains_key(&gid) && s.groups.contains_key(&gid2),
+                "группы потеряны"
+            );
         }
         server.stop();
         let _ = std::fs::remove_dir_all(&dir);
@@ -3808,7 +4462,11 @@ mod tests {
     #[test]
     fn релей_под_нагрузкой() {
         const N: usize = 20_000;
-        let limits = Limits { relay_rate: 1e7, relay_burst: 1e7, ..Limits::default() };
+        let limits = Limits {
+            relay_rate: 1e7,
+            relay_burst: 1e7,
+            ..Limits::default()
+        };
         let dir = temp_dir("load");
         let server = start_workers(&dir, limits, 4);
         let srv = server.addr;
@@ -3839,7 +4497,9 @@ mod tests {
         // Окно «в полёте» ≤ 1000 фреймов: проверяется пропускная способность
         // релея, а не размер буферов сокетов.
         for i in 0..N {
-            while i as u64 > got.load(Ordering::Relaxed) + 1000 && t0.elapsed() < Duration::from_secs(5) {
+            while i as u64 > got.load(Ordering::Relaxed) + 1000
+                && t0.elapsed() < Duration::from_secs(5)
+            {
                 thread::yield_now();
             }
             a.sock.send_to(&frame, srv).unwrap();
@@ -3853,7 +4513,10 @@ mod tests {
         let relayed = server.shared.relayed.load(Ordering::Relaxed) as usize;
         assert!(received >= N * 99 / 100, "дошло {received} из {N}");
         assert!(relayed >= received, "relayed {relayed} < {received}");
-        assert!(elapsed < Duration::from_secs(3), "{N} фреймов за {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "{N} фреймов за {elapsed:?}"
+        );
         // Сервер жив.
         a.sync();
         server.stop();
@@ -3864,7 +4527,10 @@ mod tests {
     fn server_json_v2_загружается() {
         let dir = temp_dir("v2json");
         std::fs::create_dir_all(&dir).unwrap();
-        let id = proto::Identity { ed_seed: [1; 32], x_seed: [2; 32] };
+        let id = proto::Identity {
+            ed_seed: [1; 32],
+            x_seed: [2; 32],
+        };
         let (owner, member, banned, invited) = ([9u8; 32], [1u8; 32], [2u8; 32], [3u8; 32]);
         let arr = |b: [u8; 32]| serde_json::to_string(&b).unwrap();
         let ip = gid_subnet_base(5) + HOST_MIN;
@@ -3890,7 +4556,10 @@ mod tests {
         assert!(l.links.is_empty());
         assert_eq!(l.identity.ed_pub(), id.ed_pub());
         let g = &l.groups[&5];
-        assert_eq!((g.epoch, g.rev, g.key, g.private), (1 + LOAD_MARGIN, 1 + LOAD_MARGIN, [7; 32], true));
+        assert_eq!(
+            (g.epoch, g.rev, g.key, g.private),
+            (1 + LOAD_MARGIN, 1 + LOAD_MARGIN, [7; 32], true)
+        );
         assert_eq!(g.members[&member].name, "…");
         assert_eq!(g.banned.keys().collect::<Vec<_>>(), vec![&banned]);
         // Приглашение участнику (данные старого сервера) — снято; срок
@@ -3921,16 +4590,28 @@ mod tests {
         let b = Raw::connect(srv, "bravo");
         a.send(ctrl::INVITE, &payloads::enc_gid_target(gid, &b.pk));
         let inv = payloads::dec_invite(&b.expect(ctrl::INVITE_RCVD)).unwrap();
-        assert_eq!((inv.gid, inv.from_pubkey, inv.from_name.as_str()), (gid, a.pk, "alpha"));
+        assert_eq!(
+            (inv.gid, inv.from_pubkey, inv.from_name.as_str()),
+            (gid, a.pk, "alpha")
+        );
 
         // Отказ: владелец получает уведомление, приглашение снято.
         b.send(ctrl::DECLINE_INVITE, &payloads::enc_gid(gid));
         let d = payloads::dec_invite_declined(&a.expect(ctrl::INVITE_DECLINED)).unwrap();
         assert_eq!(
-            (d.gid, d.group_name.as_str(), d.by_pubkey, d.by_name.as_str()),
+            (
+                d.gid,
+                d.group_name.as_str(),
+                d.by_pubkey,
+                d.by_name.as_str()
+            ),
             (gid, "secret", b.pk, "bravo")
         );
-        assert!(!server.shared.state.read().unwrap().groups[&gid].invites.contains_key(&b.pk));
+        assert!(
+            !server.shared.state.read().unwrap().groups[&gid]
+                .invites
+                .contains_key(&b.pk)
+        );
 
         // Войти в приватную группу после отказа нельзя.
         b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
@@ -3942,9 +4623,15 @@ mod tests {
         b.send(ctrl::DECLINE_INVITE, &payloads::enc_gid(gid));
         b.send(ctrl::DECLINE_INVITE, &payloads::enc_gid(250));
         let seen = b.sync();
-        assert!(!seen.contains(&ctrl::ERROR), "ошибка на повторный отказ: {seen:02x?}");
+        assert!(
+            !seen.contains(&ctrl::ERROR),
+            "ошибка на повторный отказ: {seen:02x?}"
+        );
         let seen = a.sync();
-        assert!(!seen.contains(&ctrl::INVITE_DECLINED), "повторное уведомление: {seen:02x?}");
+        assert!(
+            !seen.contains(&ctrl::INVITE_DECLINED),
+            "повторное уведомление: {seen:02x?}"
+        );
 
         server.stop();
         let _ = std::fs::remove_dir_all(&dir);
@@ -3966,8 +4653,11 @@ mod tests {
         // B подключается — получает приглашение сразу после HELLO3, одним
         // полным списком.
         let b = Raw::connect_as(srv, "bravo", &b_id);
-        let payloads::InviteList { items: list, complete, .. } =
-            payloads::dec_invite_list(&b.expect(ctrl::INVITE_LIST)).unwrap();
+        let payloads::InviteList {
+            items: list,
+            complete,
+            ..
+        } = payloads::dec_invite_list(&b.expect(ctrl::INVITE_LIST)).unwrap();
         assert!(complete);
         assert_eq!(list.len(), 1);
         let inv = &list[0];
@@ -3985,11 +4675,20 @@ mod tests {
         b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
         assert_eq!(b.state().gid, gid);
         let b = Raw::connect_as(srv, "bravo", &b_id);
-        let payloads::InviteList { items: list, complete, .. } =
-            payloads::dec_invite_list(&b.expect(ctrl::INVITE_LIST)).unwrap();
-        assert!(complete && list.is_empty(), "приглашение участнику: {list:?}");
+        let payloads::InviteList {
+            items: list,
+            complete,
+            ..
+        } = payloads::dec_invite_list(&b.expect(ctrl::INVITE_LIST)).unwrap();
+        assert!(
+            complete && list.is_empty(),
+            "приглашение участнику: {list:?}"
+        );
         let seen = b.sync();
-        assert!(!seen.contains(&ctrl::INVITE_RCVD), "приглашение участнику: {seen:02x?}");
+        assert!(
+            !seen.contains(&ctrl::INVITE_RCVD),
+            "приглашение участнику: {seen:02x?}"
+        );
 
         // Удаление группы — приглашённые онлайн узнают об этом.
         let gid2 = a.create("other", true).gid;
@@ -4020,18 +4719,28 @@ mod tests {
         }
         // BAN приглашённого (не участника): ему — полный список без gid.
         a.send(ctrl::BAN, &payloads::enc_gid_target(gid, &c.pk));
-        let payloads::InviteList { items: list, complete, .. } =
-            payloads::dec_invite_list(&c.expect(ctrl::INVITE_LIST)).unwrap();
+        let payloads::InviteList {
+            items: list,
+            complete,
+            ..
+        } = payloads::dec_invite_list(&c.expect(ctrl::INVITE_LIST)).unwrap();
         assert!(complete);
         assert_eq!(list.iter().map(|i| i.gid).collect::<Vec<_>>(), vec![gid2]);
         // Не участнику KICKED не приходит.
         assert!(!c.sync().contains(&ctrl::KICKED));
         // KICK приглашённого — отзыв приглашения, тоже с уведомлением.
         a.send(ctrl::KICK, &payloads::enc_gid_target(gid2, &c.pk));
-        let payloads::InviteList { items: list, complete, .. } =
-            payloads::dec_invite_list(&c.expect(ctrl::INVITE_LIST)).unwrap();
+        let payloads::InviteList {
+            items: list,
+            complete,
+            ..
+        } = payloads::dec_invite_list(&c.expect(ctrl::INVITE_LIST)).unwrap();
         assert!(complete && list.is_empty(), "{list:?}");
-        assert!(!server.shared.state.read().unwrap().groups[&gid2].invites.contains_key(&c.pk));
+        assert!(
+            !server.shared.state.read().unwrap().groups[&gid2]
+                .invites
+                .contains_key(&c.pk)
+        );
 
         server.stop();
         let _ = std::fs::remove_dir_all(&dir);
@@ -4061,7 +4770,13 @@ mod tests {
 
     /// Сервер, где одна identity может владеть многими группами.
     fn many_groups_server(tag: &str) -> (Server, PathBuf) {
-        test_server_with(tag, Limits { max_owned_groups: 64, ..Limits::default() })
+        test_server_with(
+            tag,
+            Limits {
+                max_owned_groups: 64,
+                ..Limits::default()
+            },
+        )
     }
 
     #[test]
@@ -4074,26 +4789,48 @@ mod tests {
 
         // После HELLO3 — первые 16 по gid, окно неполное.
         let b = Raw::connect_as(srv, "bravo", &b_id);
-        assert_eq!(window(b.expect(ctrl::INVITE_LIST)), (0, gids[..16].to_vec(), false));
+        assert_eq!(
+            window(b.expect(ctrl::INVITE_LIST)),
+            (0, gids[..16].to_vec(), false)
+        );
         // LIST_INVITES дочитывает следующее окно, ничего не меняя.
         let next = gids[15] + 1;
         b.send(ctrl::LIST_INVITES, &payloads::enc_u32(next));
-        assert_eq!(window(b.expect(ctrl::INVITE_LIST)), (next, gids[16..].to_vec(), true));
-        assert!(server.shared.state.read().unwrap().groups[&gids[16]].invites.contains_key(&b.pk));
+        assert_eq!(
+            window(b.expect(ctrl::INVITE_LIST)),
+            (next, gids[16..].to_vec(), true)
+        );
+        assert!(
+            server.shared.state.read().unwrap().groups[&gids[16]]
+                .invites
+                .contains_key(&b.pk)
+        );
         // Отказ — в ответ окно с начала, тоже не больше 16: видно 17-е.
         b.send(ctrl::DECLINE_INVITE, &payloads::enc_gid(gids[0]));
-        assert_eq!(window(b.expect(ctrl::INVITE_LIST)), (0, gids[1..17].to_vec(), false));
+        assert_eq!(
+            window(b.expect(ctrl::INVITE_LIST)),
+            (0, gids[1..17].to_vec(), false)
+        );
         // Вход по приглашению — тоже.
         b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gids[1]));
-        assert_eq!(window(b.expect(ctrl::INVITE_LIST)), (0, gids[2..18].to_vec(), false));
+        assert_eq!(
+            window(b.expect(ctrl::INVITE_LIST)),
+            (0, gids[2..18].to_vec(), false)
+        );
         // BAN по последнему gid: окно с него самого (первое его не покрыло
         // бы) — отозванное приглашение попадает в сверку клиента.
         a.send(ctrl::BAN, &payloads::enc_gid_target(gids[19], &b.pk));
-        assert_eq!(window(b.expect(ctrl::INVITE_LIST)), (gids[19], vec![], true));
+        assert_eq!(
+            window(b.expect(ctrl::INVITE_LIST)),
+            (gids[19], vec![], true)
+        );
         // Отказ от gid без приглашения дальше первого окна — окно с него:
         // CLI видит, что приглашения не было.
         b.send(ctrl::DECLINE_INVITE, &payloads::enc_gid(gids[19]));
-        assert_eq!(window(b.expect(ctrl::INVITE_LIST)), (gids[19], vec![], true));
+        assert_eq!(
+            window(b.expect(ctrl::INVITE_LIST)),
+            (gids[19], vec![], true)
+        );
 
         server.stop();
         let _ = std::fs::remove_dir_all(&dir);
@@ -4108,14 +4845,20 @@ mod tests {
         let gids = many_invites(&a, 17, &b_id.ed_pub());
 
         let b = Raw::connect_as(srv, "bravo", &b_id);
-        assert_eq!(window(b.expect(ctrl::INVITE_LIST)), (0, gids[..16].to_vec(), false));
+        assert_eq!(
+            window(b.expect(ctrl::INVITE_LIST)),
+            (0, gids[..16].to_vec(), false)
+        );
         // Группу из окна удалили: неотвеченных стало 16, списка не было.
         a.send(ctrl::DELETE_GROUP, &payloads::enc_gid(gids[1]));
         assert!(b.state().deleted);
         // Вход тратит приглашение — список приходит, хотя неотвеченных
         // меньше 16, и в нём 17-е.
         b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gids[0]));
-        assert_eq!(window(b.expect(ctrl::INVITE_LIST)), (0, gids[2..].to_vec(), true));
+        assert_eq!(
+            window(b.expect(ctrl::INVITE_LIST)),
+            (0, gids[2..].to_vec(), true)
+        );
         // Повторный JOIN участника приглашений не тратит — списка нет.
         b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gids[0]));
         let (seen, _) = b.until(ctrl::GROUP_STATE);
@@ -4168,12 +4911,22 @@ mod tests {
         g.owner = [9; 32];
         g.insert_member(
             member,
-            Member { ip: gid_subnet_base(5) + HOST_MIN, name: "b".into(), status: "st".into() },
+            Member {
+                ip: gid_subnet_base(5) + HOST_MIN,
+                name: "b".into(),
+                status: "st".into(),
+            },
         );
         g.banned.insert(banned, "zed".into());
         // Так оставлял старый сервер: приглашение участнику и забаненному.
         for pk in [member, banned, invited] {
-            g.invites.insert(pk, Invite { created_ms: 42, name: "who".into() });
+            g.invites.insert(
+                pk,
+                Invite {
+                    created_ms: 42,
+                    name: "who".into(),
+                },
+            );
         }
         let mut s = empty_state();
         s.groups.insert(5, g);
@@ -4184,8 +4937,20 @@ mod tests {
         let l = load_state(&store).unwrap();
         let g = &l.groups[&5];
         assert_eq!(g.invites.keys().collect::<Vec<_>>(), vec![&invited]);
-        assert_eq!((g.invites[&invited].created_ms, g.invites[&invited].name.as_str()), (42, "who"));
-        assert_eq!((g.members[&member].name.as_str(), g.members[&member].status.as_str()), ("b", "st"));
+        assert_eq!(
+            (
+                g.invites[&invited].created_ms,
+                g.invites[&invited].name.as_str()
+            ),
+            (42, "who")
+        );
+        assert_eq!(
+            (
+                g.members[&member].name.as_str(),
+                g.members[&member].status.as_str()
+            ),
+            ("b", "st")
+        );
         assert_eq!(g.banned[&banned], "zed");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4196,7 +4961,8 @@ mod tests {
         use std::io::{Read, Write};
         let mut s = std::net::TcpStream::connect(addr).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        s.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes()).unwrap();
+        s.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+            .unwrap();
         let mut out = String::new();
         s.read_to_string(&mut out).unwrap();
         out
@@ -4270,19 +5036,26 @@ mod tests {
         fn new(srv: SocketAddr) -> TcpBridge {
             use std::io::{Read, Write};
             let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
-            udp.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+            udp.set_read_timeout(Some(Duration::from_millis(50)))
+                .unwrap();
             let stream = std::net::TcpStream::connect(srv).unwrap();
             stream.set_nodelay(true).unwrap();
             let tcp_local = stream.local_addr().unwrap();
             let client: Arc<Mutex<Option<SocketAddr>>> = Arc::default();
             let stop = Arc::new(AtomicBool::new(false));
             {
-                let (udp, mut w, client, stop) =
-                    (udp.try_clone().unwrap(), stream.try_clone().unwrap(), client.clone(), stop.clone());
+                let (udp, mut w, client, stop) = (
+                    udp.try_clone().unwrap(),
+                    stream.try_clone().unwrap(),
+                    client.clone(),
+                    stop.clone(),
+                );
                 thread::spawn(move || {
                     let mut buf = [0u8; 65_535];
                     while !stop.load(Ordering::Relaxed) {
-                        let Ok((n, from)) = udp.recv_from(&mut buf) else { continue };
+                        let Ok((n, from)) = udp.recv_from(&mut buf) else {
+                            continue;
+                        };
                         *client.lock().unwrap() = Some(from);
                         if w.write_all(&tcp::encode_frame(&buf[..n])).is_err() {
                             break;
@@ -4308,7 +5081,12 @@ mod tests {
                     }
                 });
             }
-            TcpBridge { udp: udp.local_addr().unwrap(), tcp_local, stream, stop }
+            TcpBridge {
+                udp: udp.local_addr().unwrap(),
+                tcp_local,
+                stream,
+                stop,
+            }
         }
 
         fn close(&self) {
@@ -4321,7 +5099,11 @@ mod tests {
     fn tcp_клиент_и_udp_клиент_релеят_друг_другу() {
         let (server, dir) = test_server("tcp");
         let tcp_addr = server.tcp_addr.expect("TCP-фолбэк включён по умолчанию");
-        assert_eq!(tcp_addr.port(), server.addr.port(), "TCP на том же порту, что UDP");
+        assert_eq!(
+            tcp_addr.port(),
+            server.addr.port(),
+            "TCP на том же порту, что UDP"
+        );
         let bridge = TcpBridge::new(tcp_addr);
 
         // A — по TCP (рукопожатие v3 целиком через TCP), B — по UDP.
@@ -4329,7 +5111,14 @@ mod tests {
         a.expect(ctrl::GROUP_LIST);
         let st = a.create("game", false);
         assert_eq!(
-            server.shared.state.read().unwrap().by_pub.get(&a.pk).copied(),
+            server
+                .shared
+                .state
+                .read()
+                .unwrap()
+                .by_pub
+                .get(&a.pk)
+                .copied(),
             Some(bridge.tcp_local),
             "источник сессии — адрес TCP-соединения"
         );
@@ -4340,16 +5129,30 @@ mod tests {
         // TCP → UDP.
         let ab = frame_for(&st_b, st.my_ip, st_b.my_ip, b"over tcp");
         a.sock.send_to(&ab, a.srv).unwrap();
-        assert_eq!(b.group_frame(Duration::from_secs(3)).expect("релей TCP → UDP"), ab);
+        assert_eq!(
+            b.group_frame(Duration::from_secs(3))
+                .expect("релей TCP → UDP"),
+            ab
+        );
         // UDP → TCP: ответ идёт через реестр TCP, а не UDP-сокетом.
         let ba = frame_for(&st_b, st_b.my_ip, st.my_ip, b"over udp");
         b.sock.send_to(&ba, server.addr).unwrap();
-        assert_eq!(a.group_frame(Duration::from_secs(3)).expect("релей UDP → TCP"), ba);
+        assert_eq!(
+            a.group_frame(Duration::from_secs(3))
+                .expect("релей UDP → TCP"),
+            ba
+        );
 
         // Закрытие TCP — сессия снимается сразу, не по таймауту.
         bridge.close();
         wait_until_srv(Duration::from_secs(3), || {
-            !server.shared.state.read().unwrap().by_pub.contains_key(&a.pk)
+            !server
+                .shared
+                .state
+                .read()
+                .unwrap()
+                .by_pub
+                .contains_key(&a.pk)
         });
         server.stop();
         let _ = std::fs::remove_dir_all(&dir);

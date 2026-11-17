@@ -39,8 +39,10 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
 
 /// Адрес эндпоинта по умолчанию: только локальный интерфейс.
-pub const DEFAULT_ADDR: SocketAddr =
-    SocketAddr::V4(std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 9100));
+pub const DEFAULT_ADDR: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4::new(
+    std::net::Ipv4Addr::LOCALHOST,
+    9100,
+));
 
 /// Колбэк проверки здоровья.
 pub type HealthFn = Arc<dyn Fn() -> bool + Send + Sync>;
@@ -106,22 +108,68 @@ impl Metrics {
     #[inline]
     pub fn relayed(&self, bytes: usize) {
         self.relayed_frames.fetch_add(1, Ordering::Relaxed);
-        self.bytes_relayed.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.bytes_relayed
+            .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
     fn entries(&self) -> [(&'static str, &'static str, Kind, &AtomicU64); 10] {
         use Kind::*;
         [
-            ("voidlink_sessions", "Активные сессии клиентов", Gauge, &self.sessions),
+            (
+                "voidlink_sessions",
+                "Активные сессии клиентов",
+                Gauge,
+                &self.sessions,
+            ),
             ("voidlink_groups", "Количество групп", Gauge, &self.groups),
-            ("voidlink_members", "Участники во всех группах", Gauge, &self.members),
-            ("voidlink_invites_pending", "Неиспользованные инвайты", Gauge, &self.invites_pending),
-            ("voidlink_relayed_frames_total", "Релейнутые фреймы", Counter, &self.relayed_frames),
-            ("voidlink_dropped_frames_total", "Отброшенные фреймы", Counter, &self.dropped_frames),
-            ("voidlink_hello_total", "Принятые HELLO", Counter, &self.hello_total),
-            ("voidlink_challenge_total", "Отправленные CHALLENGE", Counter, &self.challenge_total),
-            ("voidlink_ctrl_frames_total", "Управляющие фреймы", Counter, &self.ctrl_frames),
-            ("voidlink_bytes_relayed_total", "Байты релея", Counter, &self.bytes_relayed),
+            (
+                "voidlink_members",
+                "Участники во всех группах",
+                Gauge,
+                &self.members,
+            ),
+            (
+                "voidlink_invites_pending",
+                "Неиспользованные инвайты",
+                Gauge,
+                &self.invites_pending,
+            ),
+            (
+                "voidlink_relayed_frames_total",
+                "Релейнутые фреймы",
+                Counter,
+                &self.relayed_frames,
+            ),
+            (
+                "voidlink_dropped_frames_total",
+                "Отброшенные фреймы",
+                Counter,
+                &self.dropped_frames,
+            ),
+            (
+                "voidlink_hello_total",
+                "Принятые HELLO",
+                Counter,
+                &self.hello_total,
+            ),
+            (
+                "voidlink_challenge_total",
+                "Отправленные CHALLENGE",
+                Counter,
+                &self.challenge_total,
+            ),
+            (
+                "voidlink_ctrl_frames_total",
+                "Управляющие фреймы",
+                Counter,
+                &self.ctrl_frames,
+            ),
+            (
+                "voidlink_bytes_relayed_total",
+                "Байты релея",
+                Counter,
+                &self.bytes_relayed,
+            ),
         ]
     }
 
@@ -163,8 +211,8 @@ impl MetricsServer {
         health: HealthFn,
         refresh: RefreshFn,
     ) -> Result<Self> {
-        let listener =
-            TcpListener::bind(addr).with_context(|| format!("метрики: не удалось занять {addr}"))?;
+        let listener = TcpListener::bind(addr)
+            .with_context(|| format!("метрики: не удалось занять {addr}"))?;
         listener.set_nonblocking(true)?;
         let addr = listener.local_addr()?;
         let stop = Arc::new(AtomicBool::new(false));
@@ -172,7 +220,11 @@ impl MetricsServer {
         let thread = thread::Builder::new()
             .name("metrics-http".into())
             .spawn(move || serve(listener, metrics, health, refresh, stop2))?;
-        Ok(Self { addr, stop, thread: Some(thread) })
+        Ok(Self {
+            addr,
+            stop,
+            thread: Some(thread),
+        })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -198,7 +250,13 @@ impl Drop for MetricsServer {
     }
 }
 
-fn serve(listener: TcpListener, metrics: Arc<Metrics>, health: HealthFn, refresh: RefreshFn, stop: Arc<AtomicBool>) {
+fn serve(
+    listener: TcpListener,
+    metrics: Arc<Metrics>,
+    health: HealthFn,
+    refresh: RefreshFn,
+    stop: Arc<AtomicBool>,
+) {
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => {
@@ -240,7 +298,12 @@ fn read_request(stream: &mut TcpStream) -> Option<Vec<u8>> {
     }
 }
 
-fn handle(mut stream: TcpStream, metrics: &Metrics, health: &HealthFn, refresh: &RefreshFn) -> std::io::Result<()> {
+fn handle(
+    mut stream: TcpStream,
+    metrics: &Metrics,
+    health: &HealthFn,
+    refresh: &RefreshFn,
+) -> std::io::Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     let Some(req) = read_request(&mut stream) else {
@@ -255,21 +318,37 @@ fn handle(mut stream: TcpStream, metrics: &Metrics, health: &HealthFn, refresh: 
     let path = target.split('?').next().unwrap_or("");
 
     let (status, ctype, body) = if method != "GET" && method != "HEAD" {
-        ("405 Method Not Allowed", "text/plain; charset=utf-8", "method not allowed\n".to_string())
+        (
+            "405 Method Not Allowed",
+            "text/plain; charset=utf-8",
+            "method not allowed\n".to_string(),
+        )
     } else {
         match path {
             "/metrics" => {
                 refresh();
-                ("200 OK", "text/plain; version=0.0.4; charset=utf-8", metrics.render())
+                (
+                    "200 OK",
+                    "text/plain; version=0.0.4; charset=utf-8",
+                    metrics.render(),
+                )
             }
             "/healthz" => {
                 if health() {
                     ("200 OK", "text/plain; charset=utf-8", "ok\n".to_string())
                 } else {
-                    ("503 Service Unavailable", "text/plain; charset=utf-8", "unavailable\n".to_string())
+                    (
+                        "503 Service Unavailable",
+                        "text/plain; charset=utf-8",
+                        "unavailable\n".to_string(),
+                    )
                 }
             }
-            _ => ("404 Not Found", "text/plain; charset=utf-8", "not found\n".to_string()),
+            _ => (
+                "404 Not Found",
+                "text/plain; charset=utf-8",
+                "not found\n".to_string(),
+            ),
         }
     };
     let head = format!(
@@ -376,7 +455,10 @@ mod tests {
     #[test]
     fn oversized_request_dropped() {
         let (s, _) = start(true);
-        let big = format!("GET /metrics HTTP/1.1\r\nX: {}\r\n\r\n", "a".repeat(MAX_REQUEST * 2));
+        let big = format!(
+            "GET /metrics HTTP/1.1\r\nX: {}\r\n\r\n",
+            "a".repeat(MAX_REQUEST * 2)
+        );
         let mut c = TcpStream::connect(s.local_addr()).unwrap();
         c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let _ = c.write_all(big.as_bytes());
@@ -394,13 +476,17 @@ mod tests {
         let mut slow = TcpStream::connect(s.local_addr()).unwrap();
         slow.write_all(b"GET /metrics HTTP/1.1\r\n").unwrap();
         let t0 = Instant::now();
-        slow.set_read_timeout(Some(READ_DEADLINE + Duration::from_secs(5))).unwrap();
+        slow.set_read_timeout(Some(READ_DEADLINE + Duration::from_secs(5)))
+            .unwrap();
         let mut out = Vec::new();
         // Сервер должен закрыть соединение сам по дедлайну.
         let _ = slow.read_to_end(&mut out);
         let took = t0.elapsed();
         assert!(out.is_empty());
-        assert!(took >= READ_DEADLINE - Duration::from_millis(200), "{took:?}");
+        assert!(
+            took >= READ_DEADLINE - Duration::from_millis(200),
+            "{took:?}"
+        );
         assert!(took < READ_DEADLINE + Duration::from_secs(3), "{took:?}");
         // После этого обычный клиент обслуживается.
         let r = get(s.local_addr(), "GET /healthz HTTP/1.1\r\n\r\n");

@@ -31,7 +31,8 @@ mod stub {
 
     use crate::{InstallOptions, InstallReport, ServiceEvent, UninstallOptions};
 
-    const NO_SCM: &str = "служба Windows недоступна на этой ОС (используйте `tunnel-daemon console`)";
+    const NO_SCM: &str =
+        "служба Windows недоступна на этой ОС (используйте `tunnel-daemon console`)";
 
     /// Заглушка: SCM есть только в Windows.
     pub fn run_as_service<F>(_name: &str, _body: F) -> Result<()>

@@ -7,9 +7,9 @@
 
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{Result, bail, ensure};
 
-use crate::{ctrl, Reader};
+use crate::{Reader, ctrl};
 
 /// Payload длиннее — режется; куски по столько же байт.
 pub const FRAG_THRESHOLD: usize = 1100;
@@ -90,14 +90,31 @@ pub fn dec_frag(p: &[u8]) -> Result<FragChunk<'_>> {
     let count = r.u16()?;
     let chunk = r.tail();
     ensure!(inner_typ != ctrl::FRAG, "FRAG внутри FRAG");
-    ensure!(count >= 1 && count as usize <= FRAG_MAX_COUNT, "FRAG: count {count}");
+    ensure!(
+        count >= 1 && count as usize <= FRAG_MAX_COUNT,
+        "FRAG: count {count}"
+    );
     ensure!(idx < count, "FRAG: idx {idx} ≥ count {count}");
     if idx + 1 < count {
-        ensure!(chunk.len() == FRAG_THRESHOLD, "FRAG: кусок {idx} длиной {}", chunk.len());
+        ensure!(
+            chunk.len() == FRAG_THRESHOLD,
+            "FRAG: кусок {idx} длиной {}",
+            chunk.len()
+        );
     } else {
-        ensure!((1..=FRAG_THRESHOLD).contains(&chunk.len()), "FRAG: последний кусок длиной {}", chunk.len());
+        ensure!(
+            (1..=FRAG_THRESHOLD).contains(&chunk.len()),
+            "FRAG: последний кусок длиной {}",
+            chunk.len()
+        );
     }
-    Ok(FragChunk { msg_id, inner_typ, idx, count, chunk })
+    Ok(FragChunk {
+        msg_id,
+        inner_typ,
+        idx,
+        count,
+        chunk,
+    })
 }
 
 struct Pending {
@@ -129,7 +146,8 @@ impl Reassembler {
 
     /// Выбрасывает сборки старше `FRAG_TIMEOUT`.
     pub fn expire(&mut self, now: Instant) {
-        self.pending.retain(|p| now.saturating_duration_since(p.started) < FRAG_TIMEOUT);
+        self.pending
+            .retain(|p| now.saturating_duration_since(p.started) < FRAG_TIMEOUT);
     }
 
     /// Принимает payload ctrl-фрейма FRAG. `Some((inner_typ, payload))` —
@@ -156,7 +174,10 @@ impl Reassembler {
                 let p = &self.pending[i];
                 if p.count != c.count || p.inner_typ != c.inner_typ {
                     self.pending.swap_remove(i);
-                    bail!("FRAG {}: count/inner_typ не совпадают с началом сборки", c.msg_id);
+                    bail!(
+                        "FRAG {}: count/inner_typ не совпадают с началом сборки",
+                        c.msg_id
+                    );
                 }
                 i
             }
@@ -165,7 +186,8 @@ impl Reassembler {
                     return Ok(Some((c.inner_typ, c.chunk.to_vec())));
                 }
                 if self.pending.len() >= FRAG_MAX_PENDING
-                    && let Some(oldest) = (0..self.pending.len()).min_by_key(|&i| self.pending[i].started)
+                    && let Some(oldest) =
+                        (0..self.pending.len()).min_by_key(|&i| self.pending[i].started)
                 {
                     self.pending.swap_remove(oldest);
                 }
@@ -209,23 +231,39 @@ mod tests {
 
     #[test]
     fn короткое_не_режется() {
-        assert_eq!(split_frag(1, ctrl::GROUP_STATE, &msg(FRAG_THRESHOLD)).unwrap(), None);
+        assert_eq!(
+            split_frag(1, ctrl::GROUP_STATE, &msg(FRAG_THRESHOLD)).unwrap(),
+            None
+        );
         let mut id = 5;
         let out = prepare(&mut id, ctrl::GROUP_STATE, &msg(10)).unwrap();
         assert_eq!(out, vec![(ctrl::GROUP_STATE, msg(10))]);
         assert_eq!(id, 5, "msg_id тратится только на длинные");
-        assert_eq!(prepare(&mut id, ctrl::ERROR, &[]).unwrap(), vec![(ctrl::ERROR, vec![])]);
+        assert_eq!(
+            prepare(&mut id, ctrl::ERROR, &[]).unwrap(),
+            vec![(ctrl::ERROR, vec![])]
+        );
     }
 
     #[test]
     fn нарезка_и_сборка() {
-        for n in [FRAG_THRESHOLD + 1, 2 * FRAG_THRESHOLD, 2 * FRAG_THRESHOLD + 1, 50_000, FRAG_MAX_PAYLOAD] {
+        for n in [
+            FRAG_THRESHOLD + 1,
+            2 * FRAG_THRESHOLD,
+            2 * FRAG_THRESHOLD + 1,
+            50_000,
+            FRAG_MAX_PAYLOAD,
+        ] {
             let m = msg(n);
             let mut id = u32::MAX;
             let parts = prepare(&mut id, ctrl::GROUP_STATE, &m).unwrap();
             assert_eq!(id, 0, "обёртка msg_id");
             assert_eq!(parts.len(), n.div_ceil(FRAG_THRESHOLD));
-            assert!(parts.iter().all(|(t, p)| *t == ctrl::FRAG && p.len() <= FRAG_HDR_LEN + FRAG_THRESHOLD));
+            assert!(
+                parts
+                    .iter()
+                    .all(|(t, p)| *t == ctrl::FRAG && p.len() <= FRAG_HDR_LEN + FRAG_THRESHOLD)
+            );
             let mut r = Reassembler::new();
             let now = Instant::now();
             let mut got = None;
@@ -268,11 +306,17 @@ mod tests {
 
     #[test]
     fn таймаут_по_явному_времени() {
-        let parts = split_frag(1, ctrl::GROUP_STATE, &msg(3000)).unwrap().unwrap();
+        let parts = split_frag(1, ctrl::GROUP_STATE, &msg(3000))
+            .unwrap()
+            .unwrap();
         let t0 = Instant::now();
         let mut r = Reassembler::new();
         assert!(r.push(&parts[0], t0).unwrap().is_none());
-        assert!(r.push(&parts[1], t0 + Duration::from_millis(4999)).unwrap().is_none());
+        assert!(
+            r.push(&parts[1], t0 + Duration::from_millis(4999))
+                .unwrap()
+                .is_none()
+        );
         // Сборка истекла (5 с от первого куска): последний кусок начинает новую.
         assert!(r.push(&parts[2], t0 + FRAG_TIMEOUT).unwrap().is_none());
         assert_eq!(r.pending(), 1);
@@ -282,9 +326,16 @@ mod tests {
     fn не_больше_8_сборок() {
         let t0 = Instant::now();
         let mut r = Reassembler::new();
-        let msgs: Vec<_> = (0..10u32).map(|id| split_frag(id, ctrl::GROUP_STATE, &msg(2500)).unwrap().unwrap()).collect();
+        let msgs: Vec<_> = (0..10u32)
+            .map(|id| {
+                split_frag(id, ctrl::GROUP_STATE, &msg(2500))
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
         for (i, parts) in msgs.iter().enumerate() {
-            r.push(&parts[0], t0 + Duration::from_millis(i as u64)).unwrap();
+            r.push(&parts[0], t0 + Duration::from_millis(i as u64))
+                .unwrap();
             assert!(r.pending() <= FRAG_MAX_PENDING);
         }
         assert_eq!(r.pending(), FRAG_MAX_PENDING);
@@ -297,9 +348,15 @@ mod tests {
 
     #[test]
     fn противоречивые_куски_отвергаются() {
-        let a = split_frag(4, ctrl::GROUP_STATE, &msg(3000)).unwrap().unwrap();
-        let b = split_frag(4, ctrl::GROUP_LIST, &msg(3000)).unwrap().unwrap();
-        let c = split_frag(4, ctrl::GROUP_STATE, &msg(5000)).unwrap().unwrap();
+        let a = split_frag(4, ctrl::GROUP_STATE, &msg(3000))
+            .unwrap()
+            .unwrap();
+        let b = split_frag(4, ctrl::GROUP_LIST, &msg(3000))
+            .unwrap()
+            .unwrap();
+        let c = split_frag(4, ctrl::GROUP_STATE, &msg(5000))
+            .unwrap()
+            .unwrap();
         let now = Instant::now();
         let mut r = Reassembler::new();
         r.push(&a[0], now).unwrap();
@@ -312,7 +369,9 @@ mod tests {
 
     #[test]
     fn кусок_неверной_длины_выбрасывает_сборку() {
-        let parts = split_frag(4, ctrl::GROUP_STATE, &msg(3000)).unwrap().unwrap();
+        let parts = split_frag(4, ctrl::GROUP_STATE, &msg(3000))
+            .unwrap()
+            .unwrap();
         let now = Instant::now();
         let mut r = Reassembler::new();
         r.push(&parts[0], now).unwrap();
@@ -325,7 +384,9 @@ mod tests {
         // Дочитка верным куском начинает сборку заново, а не завершает старую.
         assert!(r.push(&parts[1], now).unwrap().is_none());
         // Чужие сборки битый кусок не трогает.
-        let other = split_frag(5, ctrl::GROUP_STATE, &msg(3000)).unwrap().unwrap();
+        let other = split_frag(5, ctrl::GROUP_STATE, &msg(3000))
+            .unwrap()
+            .unwrap();
         r.push(&other[0], now).unwrap();
         assert!(r.push(&bad, now).is_err());
         assert_eq!(r.pending(), 1);
@@ -350,7 +411,10 @@ mod tests {
             v
         };
         let bad: Vec<(&str, Vec<u8>)> = vec![
-            ("не последний длиннее порога", with_len(1, FRAG_THRESHOLD + 1)),
+            (
+                "не последний длиннее порога",
+                with_len(1, FRAG_THRESHOLD + 1),
+            ),
             ("не последний короче порога", with_len(1, 300)),
             ("последний длиннее порога", with_len(2, FRAG_THRESHOLD + 1)),
             ("последний пустой", with_len(2, 0)),
@@ -373,7 +437,10 @@ mod tests {
             assert!(r.push(&b, now).is_err(), "{what}: должен быть отвергнут");
             assert_eq!(r.pending(), 0, "{what}: сборка не выброшена");
             // Верный последний кусок не завершает выброшенную сборку.
-            assert!(r.push(&parts[2], now).unwrap().is_none(), "{what}: собралось из остатков");
+            assert!(
+                r.push(&parts[2], now).unwrap().is_none(),
+                "{what}: собралось из остатков"
+            );
             assert_eq!(r.pending(), 1);
         }
         // Контроль: без битого куска сообщение собирается целиком.
@@ -381,7 +448,10 @@ mod tests {
         for p in &parts[..2] {
             assert!(r.push(p, now).unwrap().is_none());
         }
-        assert_eq!(r.push(&parts[2], now).unwrap(), Some((ctrl::GROUP_STATE, m)));
+        assert_eq!(
+            r.push(&parts[2], now).unwrap(),
+            Some((ctrl::GROUP_STATE, m))
+        );
     }
 
     #[test]
@@ -397,15 +467,28 @@ mod tests {
         let now = Instant::now();
         let mut r = Reassembler::new();
         assert!(r.push(&mk(0, 0, 10, 0x82), now).is_err(), "count 0");
-        assert!(r.push(&mk(0, FRAG_MAX_COUNT as u16 + 1, 1100, 0x82), now).is_err(), "count > max");
+        assert!(
+            r.push(&mk(0, FRAG_MAX_COUNT as u16 + 1, 1100, 0x82), now)
+                .is_err(),
+            "count > max"
+        );
         assert!(r.push(&mk(3, 3, 10, 0x82), now).is_err(), "idx ≥ count");
-        assert!(r.push(&mk(0, 3, 1099, 0x82), now).is_err(), "короткий не последний");
+        assert!(
+            r.push(&mk(0, 3, 1099, 0x82), now).is_err(),
+            "короткий не последний"
+        );
         assert!(r.push(&mk(0, 3, 1101, 0x82), now).is_err(), "длинный кусок");
         assert!(r.push(&mk(2, 3, 0, 0x82), now).is_err(), "пустой последний");
-        assert!(r.push(&mk(0, 2, 1100, ctrl::FRAG), now).is_err(), "FRAG в FRAG");
+        assert!(
+            r.push(&mk(0, 2, 1100, ctrl::FRAG), now).is_err(),
+            "FRAG в FRAG"
+        );
         assert!(r.push(&[0; FRAG_HDR_LEN - 1], now).is_err(), "обрезан");
         assert_eq!(r.pending(), 0);
         // count = 1 — сразу готово.
-        assert_eq!(r.push(&mk(0, 1, 5, 0x82), now).unwrap(), Some((0x82, vec![0; 5])));
+        assert_eq!(
+            r.push(&mk(0, 1, 5, 0x82), now).unwrap(),
+            Some((0x82, vec![0; 5]))
+        );
     }
 }

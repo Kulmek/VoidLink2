@@ -66,7 +66,11 @@ impl TcpLink {
     }
 
     /// Как `connect`, но со своим таймаутом тишины от сервера.
-    pub fn connect_with_read_timeout(addr: SocketAddr, timeout: Duration, read_timeout: Duration) -> io::Result<Self> {
+    pub fn connect_with_read_timeout(
+        addr: SocketAddr,
+        timeout: Duration,
+        read_timeout: Duration,
+    ) -> io::Result<Self> {
         let stream = TcpStream::connect_timeout(&addr, timeout)?;
         stream.set_nodelay(true)?;
         stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
@@ -76,10 +80,12 @@ impl TcpLink {
         let (tx, rx) = mpsc::channel();
         let reader = {
             let alive = alive.clone();
-            thread::Builder::new().name("tcp-link-rx".into()).spawn(move || {
-                reader_loop(read_half, tx);
-                alive.store(false, Ordering::SeqCst);
-            })?
+            thread::Builder::new()
+                .name("tcp-link-rx".into())
+                .spawn(move || {
+                    reader_loop(read_half, tx);
+                    alive.store(false, Ordering::SeqCst);
+                })?
         };
         Ok(TcpLink {
             peer: addr,
@@ -91,7 +97,11 @@ impl TcpLink {
     }
 
     /// Подключаться до `attempts` раз с паузами `reconnect_delay`.
-    pub fn connect_with_retry(addr: SocketAddr, timeout: Duration, attempts: u32) -> io::Result<Self> {
+    pub fn connect_with_retry(
+        addr: SocketAddr,
+        timeout: Duration,
+        attempts: u32,
+    ) -> io::Result<Self> {
         let mut last = io::Error::other("нет попыток подключения");
         for i in 0..attempts.max(1) {
             if i > 0 {
@@ -129,10 +139,16 @@ impl TcpLink {
     /// вызывающий поток (и мьютекс писателя) до `WRITE_TIMEOUT` (5 с).
     pub fn send(&self, frame: &[u8]) -> io::Result<()> {
         if frame.is_empty() || frame.len() > MAX_FRAME {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "недопустимая длина кадра"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "недопустимая длина кадра",
+            ));
         }
         if !self.is_alive() {
-            return Err(io::Error::new(io::ErrorKind::NotConnected, "соединение закрыто"));
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "соединение закрыто",
+            ));
         }
         let mut buf = Vec::with_capacity(2 + frame.len());
         buf.extend_from_slice(&(frame.len() as u16).to_le_bytes());
@@ -270,7 +286,12 @@ mod tests {
     #[test]
     fn tcp_link_silent_server_marks_dead() {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        let link = TcpLink::connect_with_read_timeout(l.local_addr().unwrap(), T, Duration::from_millis(300)).unwrap();
+        let link = TcpLink::connect_with_read_timeout(
+            l.local_addr().unwrap(),
+            T,
+            Duration::from_millis(300),
+        )
+        .unwrap();
         // Сервер держит соединение, но молчит — как при тихом обрыве.
         let (_srv, _) = l.accept().unwrap();
         assert_eq!(link.recv_timeout(T), Err(RecvTimeoutError::Disconnected));
@@ -280,7 +301,10 @@ mod tests {
     #[test]
     fn tcp_link_connect_refused_and_retry() {
         // Свободный порт: занимаем и сразу отпускаем.
-        let addr = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let addr = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
         assert!(TcpLink::connect(addr, Duration::from_millis(500)).is_err());
         assert!(TcpLink::connect_with_retry(addr, Duration::from_millis(200), 2).is_err());
     }

@@ -36,10 +36,22 @@ impl StubBackend {
             server_label: Some("демо-сервер".into()),
             my_code: Some("DEMO-CODE-0000".into()),
             groups: vec![
-                TrayGroup { gid: 1, name: "дом".into(), joined: true },
-                TrayGroup { gid: 2, name: "работа".into(), joined: false },
+                TrayGroup {
+                    gid: 1,
+                    name: "дом".into(),
+                    joined: true,
+                },
+                TrayGroup {
+                    gid: 2,
+                    name: "работа".into(),
+                    joined: false,
+                },
             ],
-            invites: vec![TrayInvite { gid: 3, group_name: "игры".into(), from: "друг".into() }],
+            invites: vec![TrayInvite {
+                gid: 3,
+                group_name: "игры".into(),
+                from: "друг".into(),
+            }],
             kicked: Vec::new(),
             errors: Vec::new(),
             tui_open: false,
@@ -63,7 +75,11 @@ impl TrayBackend for StubBackend {
             Action::AcceptInvite(gid) => {
                 if let Some(pos) = s.invites.iter().position(|i| i.gid == gid) {
                     let inv = s.invites.remove(pos);
-                    s.groups.push(TrayGroup { gid, name: inv.group_name, joined: true });
+                    s.groups.push(TrayGroup {
+                        gid,
+                        name: inv.group_name,
+                        joined: true,
+                    });
                 }
             }
             Action::DeclineInvite(gid) => s.invites.retain(|i| i.gid != gid),
@@ -85,7 +101,11 @@ mod tests {
         b.act(Action::AcceptInvite(3));
         let s = b.state();
         assert!(s.invites.is_empty());
-        assert!(s.groups.iter().any(|g| g.gid == 3 && g.joined && g.name == "игры"));
+        assert!(
+            s.groups
+                .iter()
+                .any(|g| g.gid == 3 && g.joined && g.name == "игры")
+        );
         let b = StubBackend::demo();
         b.act(Action::DeclineInvite(3));
         assert!(b.state().invites.is_empty());

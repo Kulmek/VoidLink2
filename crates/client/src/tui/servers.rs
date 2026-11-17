@@ -72,7 +72,11 @@ pub enum ServersAction {
     /// Переключиться на сервер с этим индексом.
     Switch(usize),
     /// Добавить сервер (адрес проверен синтаксически, ключ — из кода).
-    Add { addr: String, pubkey: [u8; 32], label: String },
+    Add {
+        addr: String,
+        pubkey: [u8; 32],
+        label: String,
+    },
     /// Удалить сервер (никогда не текущий).
     Delete(usize),
     /// Новое имя адаптера и путь к dll (пусто — по умолчанию).
@@ -115,7 +119,12 @@ pub struct ServersView {
 }
 
 impl ServersView {
-    pub fn new(servers: Vec<ServerEntry>, current: usize, adapter_name: &str, dll_path: &str) -> Self {
+    pub fn new(
+        servers: Vec<ServerEntry>,
+        current: usize,
+        adapter_name: &str,
+        dll_path: &str,
+    ) -> Self {
         let current = current.min(servers.len().saturating_sub(1));
         ServersView {
             servers,
@@ -209,7 +218,8 @@ impl ServersView {
                     return None;
                 }
                 if self.sel == self.current {
-                    self.notice = Some("текущий сервер удалить нельзя — сначала переключись".into());
+                    self.notice =
+                        Some("текущий сервер удалить нельзя — сначала переключись".into());
                 } else {
                     self.notice = None;
                     self.mode = Mode::ConfirmDelete(self.sel);
@@ -270,7 +280,11 @@ impl ServersView {
         if !valid_addr(addr) {
             return Err(format!("адрес {addr:?} — не ip:port и не host:port"));
         }
-        if self.servers.iter().any(|s| s.addr.eq_ignore_ascii_case(addr)) {
+        if self
+            .servers
+            .iter()
+            .any(|s| s.addr.eq_ignore_ascii_case(addr))
+        {
             return Err(format!("сервер {addr} уже в списке"));
         }
         let code = form.code.trim();
@@ -320,7 +334,8 @@ impl ServersView {
                     let i = hits.offset + (y - hits.rows.y) as usize;
                     if i < self.servers.len() {
                         if i == self.sel {
-                            return self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                            return self
+                                .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
                         }
                         self.sel = i;
                     }
@@ -359,15 +374,37 @@ impl ServersView {
                     ("код", form.code.as_str(), "friend code сервера (TUN-…)"),
                     ("подпись", form.label.as_str(), "необязательно"),
                 ];
-                draw_form(f, th, area, " Добавить сервер ", &fields, form.focus, &form.error, &mut hits);
+                draw_form(
+                    f,
+                    th,
+                    area,
+                    " Добавить сервер ",
+                    &fields,
+                    form.focus,
+                    &form.error,
+                    &mut hits,
+                );
             }
             Mode::EditAdapter(form) => {
                 hits.buttons.clear();
                 let fields = [
                     ("адаптер", form.name.as_str(), "имя Wintun-адаптера"),
-                    ("wintun.dll", form.dll.as_str(), "пусто — рядом с exe или из PATH"),
+                    (
+                        "wintun.dll",
+                        form.dll.as_str(),
+                        "пусто — рядом с exe или из PATH",
+                    ),
                 ];
-                draw_form(f, th, area, " Адаптер ", &fields, form.focus, &form.error, &mut hits);
+                draw_form(
+                    f,
+                    th,
+                    area,
+                    " Адаптер ",
+                    &fields,
+                    form.focus,
+                    &form.error,
+                    &mut hits,
+                );
             }
             Mode::ConfirmDelete(i) => {
                 hits.buttons.clear();
@@ -386,7 +423,11 @@ impl ServersView {
         let focused = matches!(self.mode, Mode::List);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(if focused { th.accent } else { th.unfocused_border })
+            .border_style(if focused {
+                th.accent
+            } else {
+                th.unfocused_border
+            })
             .title(Span::styled(" Серверы ", th.title))
             .title_bottom(Line::from(Span::styled(
                 " Enter — переключить · клик мимо — закрыть ",
@@ -407,7 +448,10 @@ impl ServersView {
 
         if self.servers.is_empty() {
             f.render_widget(
-                Paragraph::new(Line::from(Span::styled("серверов нет — a: добавить", th.dim))),
+                Paragraph::new(Line::from(Span::styled(
+                    "серверов нет — a: добавить",
+                    th.dim,
+                ))),
                 table_area,
             );
         } else {
@@ -417,12 +461,20 @@ impl ServersView {
                 .enumerate()
                 .map(|(i, s)| {
                     let cur = i == self.current;
-                    let mark = if cur { Span::styled("●", th.ok) } else { Span::styled(" ", th.dim) };
+                    let mark = if cur {
+                        Span::styled("●", th.ok)
+                    } else {
+                        Span::styled(" ", th.dim)
+                    };
                     let key = proto::hex_of(&s.pubkey);
                     Row::new(vec![
                         Cell::from(mark),
                         Cell::from(Span::styled(
-                            if s.label.is_empty() { "—".to_string() } else { s.label.clone() },
+                            if s.label.is_empty() {
+                                "—".to_string()
+                            } else {
+                                s.label.clone()
+                            },
                             if cur { th.ok } else { th.base },
                         )),
                         Cell::from(Span::styled(s.addr.clone(), th.base)),
@@ -444,7 +496,10 @@ impl ServersView {
             .highlight_symbol("▌");
             let mut state = TableState::default();
             state.select(Some(self.sel));
-            let table_rect = Rect { width: table_area.width.saturating_sub(1), ..table_area };
+            let table_rect = Rect {
+                width: table_area.width.saturating_sub(1),
+                ..table_area
+            };
             f.render_stateful_widget(table, table_rect, &mut state);
             hits.offset = state.offset();
             hits.rows = Rect {
@@ -463,7 +518,11 @@ impl ServersView {
             }
         }
 
-        let dll = if self.dll_path.is_empty() { "по умолчанию" } else { self.dll_path.as_str() };
+        let dll = if self.dll_path.is_empty() {
+            "по умолчанию"
+        } else {
+            self.dll_path.as_str()
+        };
         f.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled("адаптер ", th.dim),
@@ -502,12 +561,23 @@ fn key_adapter(form: &mut AdapterForm, key: KeyEvent) -> Option<ServersAction> {
             None
         }
         KeyCode::Backspace => {
-            if form.focus == 0 { form.name.pop() } else { form.dll.pop() };
+            if form.focus == 0 {
+                form.name.pop()
+            } else {
+                form.dll.pop()
+            };
             form.error = None;
             None
         }
         KeyCode::Char(c) if is_text_input(&key, c) => {
-            push_char(if form.focus == 0 { &mut form.name } else { &mut form.dll }, c);
+            push_char(
+                if form.focus == 0 {
+                    &mut form.name
+                } else {
+                    &mut form.dll
+                },
+                c,
+            );
             form.error = None;
             None
         }
@@ -517,7 +587,10 @@ fn key_adapter(form: &mut AdapterForm, key: KeyEvent) -> Option<ServersAction> {
                 form.error = Some("имя адаптера не задано".into());
                 return None;
             }
-            Some(ServersAction::SetAdapter { name: name.to_string(), dll: form.dll.trim().to_string() })
+            Some(ServersAction::SetAdapter {
+                name: name.to_string(),
+                dll: form.dll.trim().to_string(),
+            })
         }
         _ => None,
     }
@@ -555,7 +628,9 @@ pub fn valid_addr(addr: &str) -> bool {
     };
     let port_ok = port.parse::<u16>().is_ok_and(|p| p != 0);
     // Все метки из цифр — это кривой IPv4 (`999.1.1.1`), а не имя хоста.
-    let bad_ipv4 = host.split('.').all(|l| l.chars().all(|c| c.is_ascii_digit()));
+    let bad_ipv4 = host
+        .split('.')
+        .all(|l| l.chars().all(|c| c.is_ascii_digit()));
     let host_ok = !host.is_empty()
         && !bad_ipv4
         && host.len() <= 253
@@ -570,7 +645,11 @@ pub fn valid_addr(addr: &str) -> bool {
 }
 
 fn display_name(s: &ServerEntry) -> String {
-    if s.label.is_empty() { s.addr.clone() } else { format!("{} ({})", s.label, s.addr) }
+    if s.label.is_empty() {
+        s.addr.clone()
+    } else {
+        format!("{} ({})", s.label, s.addr)
+    }
 }
 
 fn key(code: KeyCode) -> KeyEvent {
@@ -737,7 +816,11 @@ mod tests {
     fn view(n: usize) -> ServersView {
         let servers = (0..n)
             .map(|i| ServerEntry {
-                label: if i == 1 { String::new() } else { format!("srv{i}") },
+                label: if i == 1 {
+                    String::new()
+                } else {
+                    format!("srv{i}")
+                },
                 addr: format!("10.0.0.{}:5555", i + 1),
                 pubkey: [i as u8; 32],
             })
@@ -828,8 +911,14 @@ mod tests {
         let mut v = view(40);
         v.sel = 39;
         let text = render(&v, ThemeKind::Dark, 100, 30);
-        assert!(text.contains("10.0.0.40:5555"), "выделенная строка не видна:\n{text}");
-        assert!(text.contains('█') || text.contains('║'), "нет скроллбара:\n{text}");
+        assert!(
+            text.contains("10.0.0.40:5555"),
+            "выделенная строка не видна:\n{text}"
+        );
+        assert!(
+            text.contains('█') || text.contains('║'),
+            "нет скроллбара:\n{text}"
+        );
     }
 
     #[test]
@@ -841,7 +930,10 @@ mod tests {
         v.handle_key(k(KeyCode::Down));
         v.handle_key(k(KeyCode::Down));
         assert_eq!(v.sel, 2);
-        assert_eq!(v.handle_key(k(KeyCode::Enter)), Some(ServersAction::Switch(2)));
+        assert_eq!(
+            v.handle_key(k(KeyCode::Enter)),
+            Some(ServersAction::Switch(2))
+        );
         v.handle_key(k(KeyCode::Home));
         assert_eq!(v.sel, 0);
         v.handle_key(k(KeyCode::End));
@@ -865,7 +957,10 @@ mod tests {
         assert_eq!(v.mode, Mode::List);
 
         v.handle_key(k(KeyCode::Char('d')));
-        assert_eq!(v.handle_key(k(KeyCode::Char('y'))), Some(ServersAction::Delete(1)));
+        assert_eq!(
+            v.handle_key(k(KeyCode::Char('y'))),
+            Some(ServersAction::Delete(1))
+        );
         assert_eq!(v.mode, Mode::List);
 
         v.set_servers(v.servers[..2].to_vec(), 0);
@@ -929,17 +1024,32 @@ mod tests {
         assert_eq!(v.mode, Mode::List);
 
         // тот же ключ под другим адресом — дубликат
-        v.servers.push(ServerEntry { label: String::new(), addr: "vpn.example.org:5555".into(), pubkey: id.ed_pub() });
-        v.mode = Mode::Add(AddForm { addr: "other.example.org:1".into(), code: code.clone(), ..Default::default() });
+        v.servers.push(ServerEntry {
+            label: String::new(),
+            addr: "vpn.example.org:5555".into(),
+            pubkey: id.ed_pub(),
+        });
+        v.mode = Mode::Add(AddForm {
+            addr: "other.example.org:1".into(),
+            code: code.clone(),
+            ..Default::default()
+        });
         v.handle_key(k(KeyCode::Enter));
         let Mode::Add(f) = &v.mode else { panic!() };
-        assert!(f.error.as_deref().unwrap().contains("кодом"), "{:?}", f.error);
+        assert!(
+            f.error.as_deref().unwrap().contains("кодом"),
+            "{:?}",
+            f.error
+        );
 
         // Ctrl/Alt + буква не печатают, AltGr (Ctrl+Alt) и Shift — печатают
         v.mode = Mode::Add(AddForm::default());
         v.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
         v.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT));
-        v.handle_key(KeyEvent::new(KeyCode::Char('@'), KeyModifiers::CONTROL | KeyModifiers::ALT));
+        v.handle_key(KeyEvent::new(
+            KeyCode::Char('@'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
         v.handle_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT));
         let Mode::Add(f) = &v.mode else { panic!() };
         assert_eq!(f.addr, "@A");
@@ -952,10 +1062,30 @@ mod tests {
 
     #[test]
     fn адреса() {
-        for ok in ["1.2.3.4:5555", "[::1]:5555", "localhost:1", "a-b.example.com:65535", "10.0.0.1x:5"] {
+        for ok in [
+            "1.2.3.4:5555",
+            "[::1]:5555",
+            "localhost:1",
+            "a-b.example.com:65535",
+            "10.0.0.1x:5",
+        ] {
             assert!(valid_addr(ok), "{ok}");
         }
-        for bad in ["", "1.2.3.4", "host:0", "host:70000", ":5555", "-a.com:1", "a..b:1", "::1:5555", "хост:1", "1.2.3.4:0", "[::1]:0", "999.1.1.1:5", "1.2.3:5"] {
+        for bad in [
+            "",
+            "1.2.3.4",
+            "host:0",
+            "host:70000",
+            ":5555",
+            "-a.com:1",
+            "a..b:1",
+            "::1:5555",
+            "хост:1",
+            "1.2.3.4:0",
+            "[::1]:0",
+            "999.1.1.1:5",
+            "1.2.3:5",
+        ] {
             assert!(!valid_addr(bad), "{bad}");
         }
     }
@@ -969,14 +1099,19 @@ mod tests {
             v.handle_key(k(KeyCode::Backspace));
         }
         assert_eq!(v.handle_key(k(KeyCode::Enter)), None);
-        let Mode::EditAdapter(f) = &v.mode else { panic!() };
+        let Mode::EditAdapter(f) = &v.mode else {
+            panic!()
+        };
         assert!(f.error.is_some());
         type_str(&mut v, "Tun2");
         v.handle_key(k(KeyCode::Tab));
         type_str(&mut v, "x");
         assert_eq!(
             v.handle_key(k(KeyCode::Enter)),
-            Some(ServersAction::SetAdapter { name: "Tun2".into(), dll: "old.dllx".into() })
+            Some(ServersAction::SetAdapter {
+                name: "Tun2".into(),
+                dll: "old.dllx".into()
+            })
         );
     }
 

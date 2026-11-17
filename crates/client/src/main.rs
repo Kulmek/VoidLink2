@@ -54,10 +54,10 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
-use tunnel_protocol as proto;
+use anyhow::{Context, Result, bail};
 use proto::ctrl;
 use proto::payloads;
+use tunnel_protocol as proto;
 
 use tunnel_client::remote::{Endpoint, IpcEngine, UiPrefs};
 use tunnel_client::remote_cli::{self, Route};
@@ -121,12 +121,18 @@ fn parse_globals(mut args: Vec<String>) -> Result<Globals> {
             g.dir = Some(args.get(i + 1).context("--dir требует значение")?.into());
             args.drain(i..=i + 1);
         } else if a == "--profile" {
-            let name = args.get(i + 1).context("--profile требует значение")?.clone();
+            let name = args
+                .get(i + 1)
+                .context("--profile требует значение")?
+                .clone();
             profile::validate_profile_name(&name)?;
             g.profile = Some(name);
             args.drain(i..=i + 1);
         } else if a == "--adapter" {
-            g.adapter = args.get(i + 1).context("--adapter требует значение")?.clone();
+            g.adapter = args
+                .get(i + 1)
+                .context("--adapter требует значение")?
+                .clone();
             g.adapter_set = true;
             args.drain(i..=i + 1);
         } else if a == "--dll" {
@@ -136,13 +142,21 @@ fn parse_globals(mut args: Vec<String>) -> Result<Globals> {
             g.dll = Some(args.get(i + 1).context("--dll требует значение")?.clone());
             args.drain(i..=i + 1);
         } else if a == "--server" {
-            g.server_sel = Some(args.get(i + 1).context("--server требует значение")?.clone());
+            g.server_sel = Some(
+                args.get(i + 1)
+                    .context("--server требует значение")?
+                    .clone(),
+            );
             args.drain(i..=i + 1);
         } else if a == "--debug" {
             g.debug = true;
             args.remove(i);
         } else if a == "--embedded" || a == "--remote" {
-            let m = if a == "--embedded" { UiMode::Embedded } else { UiMode::Remote };
+            let m = if a == "--embedded" {
+                UiMode::Embedded
+            } else {
+                UiMode::Remote
+            };
             if g.ui_mode.is_some_and(|x| x != m) {
                 bail!("--embedded и --remote взаимоисключающие");
             }
@@ -197,7 +211,12 @@ fn parse_identity_args(cmd: &str, rest: &[String]) -> Result<IdentityArgs> {
     if matches!(&passphrase, Some(p) if p.is_empty()) {
         bail!("пустая парольная фраза");
     }
-    Ok(IdentityArgs { file: file.with_context(usage)?, passphrase, passphrase_stdin, force })
+    Ok(IdentityArgs {
+        file: file.with_context(usage)?,
+        passphrase,
+        passphrase_stdin,
+        force,
+    })
 }
 
 impl IdentityArgs {
@@ -207,7 +226,9 @@ impl IdentityArgs {
             return Ok(self.passphrase.clone());
         }
         let mut line = String::new();
-        std::io::stdin().read_line(&mut line).context("чтение парольной фразы из stdin")?;
+        std::io::stdin()
+            .read_line(&mut line)
+            .context("чтение парольной фразы из stdin")?;
         let p = line.trim_end_matches(['\r', '\n']).to_string();
         anyhow::ensure!(!p.is_empty(), "пустая парольная фраза");
         Ok(Some(p))
@@ -224,7 +245,10 @@ fn parse_on_off(v: Option<&String>, usage: &str) -> Result<bool> {
 }
 
 fn parse_mtu(v: Option<&String>) -> Result<usize> {
-    let n: usize = v.context("usage: set-mtu <N>")?.parse().context("MTU должен быть числом")?;
+    let n: usize = v
+        .context("usage: set-mtu <N>")?
+        .parse()
+        .context("MTU должен быть числом")?;
     anyhow::ensure!(
         (store::MTU_MIN..=store::MTU_MAX).contains(&n),
         "MTU должен быть в пределах {}..={}",
@@ -235,9 +259,11 @@ fn parse_mtu(v: Option<&String>) -> Result<usize> {
 }
 
 fn parse_transport(v: Option<&String>) -> Result<store::TransportMode> {
-    let t = v.context("usage: set-transport auto|udp|tcp")?.to_ascii_lowercase();
-    let t: store::TransportMode =
-        serde_json::from_value(serde_json::Value::String(t)).map_err(|_| anyhow::anyhow!("usage: set-transport auto|udp|tcp"))?;
+    let t = v
+        .context("usage: set-transport auto|udp|tcp")?
+        .to_ascii_lowercase();
+    let t: store::TransportMode = serde_json::from_value(serde_json::Value::String(t))
+        .map_err(|_| anyhow::anyhow!("usage: set-transport auto|udp|tcp"))?;
     Ok(t)
 }
 
@@ -266,7 +292,11 @@ fn export_identity_cmd(id: &proto::Identity, a: &IdentityArgs) -> Result<()> {
         "identity {} выгружена в {}{}",
         id.friend_code(),
         a.file.display(),
-        if pass.is_some() { " (зашифрована)" } else { " (НЕ зашифрована — храните файл в секрете)" }
+        if pass.is_some() {
+            " (зашифрована)"
+        } else {
+            " (НЕ зашифрована — храните файл в секрете)"
+        }
     );
     Ok(())
 }
@@ -335,8 +365,22 @@ fn main() -> Result<()> {
             println!("friend code: {}", id.friend_code());
             println!("ed25519 pub: {}", proto::hex_of(&id.ed_pub()));
             println!("x25519 pub:  {}", proto::hex_of(&id.x_pub()));
-            println!("name:        {}", if cfg.name.is_empty() { "(не задано)" } else { &cfg.name });
-            println!("status:      {}", if cfg.status.is_empty() { "(не задано)" } else { &cfg.status });
+            println!(
+                "name:        {}",
+                if cfg.name.is_empty() {
+                    "(не задано)"
+                } else {
+                    &cfg.name
+                }
+            );
+            println!(
+                "status:      {}",
+                if cfg.status.is_empty() {
+                    "(не задано)"
+                } else {
+                    &cfg.status
+                }
+            );
         }
         "set-name" => {
             let name = rest.join(" ");
@@ -352,15 +396,24 @@ fn main() -> Result<()> {
             println!("статус установлен: {:?}", cfg.status);
         }
         "add-server" => {
-            let addr = rest.first().context("usage: add-server <addr> <code> [label]")?;
-            let code = rest.get(1).context("usage: add-server <addr> <code> [label]")?;
-            addr.parse::<SocketAddr>().context("addr должен быть ip:port")?;
+            let addr = rest
+                .first()
+                .context("usage: add-server <addr> <code> [label]")?;
+            let code = rest
+                .get(1)
+                .context("usage: add-server <addr> <code> [label]")?;
+            addr.parse::<SocketAddr>()
+                .context("addr должен быть ip:port")?;
             let pub_hex = proto::hex_of(&proto::Identity::parse_friend_code(code)?);
             let label = rest.get(2).cloned().unwrap_or_default();
             if cfg.servers.iter().any(|s| s.addr == *addr) {
                 bail!("сервер {addr} уже добавлен");
             }
-            cfg.servers.push(StoredServer { addr: addr.clone(), pubkey: pub_hex, label });
+            cfg.servers.push(StoredServer {
+                addr: addr.clone(),
+                pubkey: pub_hex,
+                label,
+            });
             save(&cfg)?;
             println!("сервер {addr} добавлен (pubkey закреплён)");
         }
@@ -369,14 +422,21 @@ fn main() -> Result<()> {
                 println!("(нет серверов; добавь: add-server <addr> <code> [label])");
             }
             for (n, s) in cfg.servers.iter().enumerate() {
-                println!("{}: {} {} [{}]", n, s.addr, if s.label.is_empty() { "-" } else { &s.label }, s.pubkey);
+                println!(
+                    "{}: {} {} [{}]",
+                    n,
+                    s.addr,
+                    if s.label.is_empty() { "-" } else { &s.label },
+                    s.pubkey
+                );
             }
         }
         "del-server" => {
             let tok = rest.first().context("usage: del-server <N|addr|label>")?;
             // Раньше числовой токен сравнивался сам с собой и
             // `del-server 1` удалял все серверы.
-            let idx = find_server(&cfg, tok).with_context(|| format!("сервер {tok:?} не найден"))?;
+            let idx =
+                find_server(&cfg, tok).with_context(|| format!("сервер {tok:?} не найден"))?;
             cfg.servers.remove(idx);
             save(&cfg)?;
             println!("удалено");
@@ -404,7 +464,12 @@ fn main() -> Result<()> {
         })?,
         "create" => {
             let private = rest.iter().any(|a| a == "--private");
-            let name: String = rest.iter().filter(|a| *a != "--private").cloned().collect::<Vec<_>>().join(" ");
+            let name: String = rest
+                .iter()
+                .filter(|a| *a != "--private")
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" ");
             bail_if_empty(&name, "usage: create <имя> [--private]");
             with_server(&cfg, server_sel.as_deref(), |server, pub_key, cfg2| {
                 let conn = connect(&store, cfg2, server, &pub_key, &identity)?;
@@ -412,9 +477,15 @@ fn main() -> Result<()> {
                 // созданная — та, которой нет среди своих в списке.
                 conn.send_ctrl(ctrl::LIST_GROUPS, &[]);
                 let p = conn.wait_for(ctrl::GROUP_LIST, std::time::Duration::from_secs(10))?;
-                let known: std::collections::HashSet<u32> =
-                    payloads::dec_group_list(&p)?.iter().filter(|g| g.mine).map(|g| g.gid).collect();
-                conn.send_ctrl(ctrl::CREATE_GROUP, &payloads::enc_create_group(&name, private));
+                let known: std::collections::HashSet<u32> = payloads::dec_group_list(&p)?
+                    .iter()
+                    .filter(|g| g.mine)
+                    .map(|g| g.gid)
+                    .collect();
+                conn.send_ctrl(
+                    ctrl::CREATE_GROUP,
+                    &payloads::enc_create_group(&name, private),
+                );
                 let st = loop {
                     let p = conn.wait_for(ctrl::GROUP_STATE, std::time::Duration::from_secs(10))?;
                     let st = payloads::dec_group_state(&p)?;
@@ -422,7 +493,12 @@ fn main() -> Result<()> {
                         break st;
                     }
                 };
-                println!("группа {} \"{}\" создана, мой IP {}", st.gid, st.name, proto::ip_str(st.my_ip));
+                println!(
+                    "группа {} \"{}\" создана, мой IP {}",
+                    st.gid,
+                    st.name,
+                    proto::ip_str(st.my_ip)
+                );
                 if autojoin_add(&store, server, st.gid)? {
                     println!("добавлена в autojoin");
                 }
@@ -445,7 +521,12 @@ fn main() -> Result<()> {
                 if st.deleted {
                     bail!("группа {gid} удалена");
                 }
-                println!("вошёл в {} \"{}\", мой IP {}", st.gid, st.name, proto::ip_str(st.my_ip));
+                println!(
+                    "вошёл в {} \"{}\", мой IP {}",
+                    st.gid,
+                    st.name,
+                    proto::ip_str(st.my_ip)
+                );
                 if autojoin_add(&store, server, gid)? {
                     println!("добавлена в autojoin");
                 }
@@ -490,7 +571,9 @@ fn main() -> Result<()> {
                 println!("(приглашений нет)");
             } else {
                 if !complete {
-                    println!("… показаны не все (остальные не получены — потеря пакетов), повторите");
+                    println!(
+                        "… показаны не все (остальные не получены — потеря пакетов), повторите"
+                    );
                 }
                 println!("принять: join <gid> · отклонить: decline <gid>");
             }
@@ -542,7 +625,8 @@ fn main() -> Result<()> {
             with_server(&cfg, server_sel.as_deref(), |server, pub_key, cfg2| {
                 let conn = connect(&store, cfg2, server, &pub_key, &identity)?;
                 conn.send_ctrl(ctrl::LEAVE_GROUP, &payloads::enc_gid(gid));
-                conn.wait_for(ctrl::CTRL_PING, std::time::Duration::from_secs(3)).ok(); // ждём ERROR
+                conn.wait_for(ctrl::CTRL_PING, std::time::Duration::from_secs(3))
+                    .ok(); // ждём ERROR
                 autojoin_remove(&store, server, gid)?;
                 println!("вышел из {gid} (autojoin снят)");
                 Ok(())
@@ -550,7 +634,9 @@ fn main() -> Result<()> {
         }
         "invite" | "kick" | "ban" | "unban" | "transfer" => {
             let gid = parse_gid(rest.first())?;
-            let peer = rest.get(1).context(format!("usage: {cmd} <gid> <peer (code|hex|alias)>"))?;
+            let peer = rest
+                .get(1)
+                .context(format!("usage: {cmd} <gid> <peer (code|hex|alias)>"))?;
             let target = store::resolve_peer(&cfg, peer)?;
             let typ = match cmd.as_str() {
                 "invite" => ctrl::INVITE,
@@ -564,9 +650,10 @@ fn main() -> Result<()> {
                 conn.send_ctrl(typ, &payloads::enc_gid_target(gid, &target));
                 let r = conn.wait_for(ctrl::CTRL_PING, std::time::Duration::from_secs(3));
                 if let Err(e) = r
-                    && e.to_string().contains("сервер:") {
-                        bail!("{e}");
-                    }
+                    && e.to_string().contains("сервер:")
+                {
+                    bail!("{e}");
+                }
                 println!("{}: ок", cmd);
                 Ok(())
             })?;
@@ -580,9 +667,10 @@ fn main() -> Result<()> {
                 conn.send_ctrl(ctrl::RENAME_GROUP, &payloads::enc_rename(gid, &name));
                 let r = conn.wait_for(ctrl::CTRL_PING, std::time::Duration::from_secs(3));
                 if let Err(e) = r
-                    && e.to_string().contains("сервер:") {
-                        bail!("{e}");
-                    }
+                    && e.to_string().contains("сервер:")
+                {
+                    bail!("{e}");
+                }
                 println!("переименовано");
                 Ok(())
             })?;
@@ -594,9 +682,10 @@ fn main() -> Result<()> {
                 conn.send_ctrl(ctrl::DELETE_GROUP, &payloads::enc_gid(gid));
                 let r = conn.wait_for(ctrl::CTRL_PING, std::time::Duration::from_secs(3));
                 if let Err(e) = r
-                    && e.to_string().contains("сервер:") {
-                        bail!("{e}");
-                    }
+                    && e.to_string().contains("сервер:")
+                {
+                    bail!("{e}");
+                }
                 autojoin_remove(&store, server, gid)?;
                 println!("группа {gid} удалена");
                 Ok(())
@@ -610,7 +699,8 @@ fn main() -> Result<()> {
                 conn.send_ctrl(ctrl::FRIEND_GROUPS, &payloads::enc_pubkey(&target));
                 // Ответ — о ком спрошено (target в ответе).
                 let items = loop {
-                    let p = conn.wait_for(ctrl::FRIEND_GROUPS_RESP, std::time::Duration::from_secs(10))?;
+                    let p = conn
+                        .wait_for(ctrl::FRIEND_GROUPS_RESP, std::time::Duration::from_secs(10))?;
                     let f = payloads::dec_friend_groups(&p)?;
                     if f.target == target {
                         break f.groups;
@@ -620,7 +710,13 @@ fn main() -> Result<()> {
                     println!("(у друга нет видимых групп)");
                 }
                 for g in items {
-                    println!("{:>4}  {:<20} {} {}", g.gid, g.name, if g.private { "[private]" } else { "[public] " }, if g.shared { "(общая)" } else { "" });
+                    println!(
+                        "{:>4}  {:<20} {} {}",
+                        g.gid,
+                        g.name,
+                        if g.private { "[private]" } else { "[public] " },
+                        if g.shared { "(общая)" } else { "" }
+                    );
                 }
                 Ok(())
             })?;
@@ -638,8 +734,18 @@ fn main() -> Result<()> {
                     }
                 };
                 let who = |pk: &[u8; 32], name: &str| {
-                    let alias = cfg2.friends.iter().find(|f| f.pubkey == proto::hex_of(pk)).map(|f| f.alias.clone());
-                    let shown = alias.unwrap_or_else(|| if name.is_empty() { "(без имени)".into() } else { name.to_string() });
+                    let alias = cfg2
+                        .friends
+                        .iter()
+                        .find(|f| f.pubkey == proto::hex_of(pk))
+                        .map(|f| f.alias.clone());
+                    let shown = alias.unwrap_or_else(|| {
+                        if name.is_empty() {
+                            "(без имени)".into()
+                        } else {
+                            name.to_string()
+                        }
+                    });
                     format!("{shown:<20} {}", proto::friend_code_of(pk))
                 };
                 println!("баны группы {gid}:");
@@ -654,7 +760,11 @@ fn main() -> Result<()> {
                     println!("  (нет)");
                 }
                 for i in &info.invites {
-                    println!("  {}  истекает через {}", who(&i.pubkey, &i.name), engine::fmt_secs(i.expires_in));
+                    println!(
+                        "  {}  истекает через {}",
+                        who(&i.pubkey, &i.name),
+                        engine::fmt_secs(i.expires_in)
+                    );
                 }
                 println!("снять бан: unban {gid} <peer> · отозвать приглашение: kick {gid} <peer>");
                 Ok(())
@@ -667,7 +777,11 @@ fn main() -> Result<()> {
             // Флаг уходит в HELLO3: на сервере он живёт, пока жива сессия.
             println!(
                 "невидимка {}: применится при следующем подключении (tui/run)",
-                if on { "включена" } else { "выключена" }
+                if on {
+                    "включена"
+                } else {
+                    "выключена"
+                }
             );
         }
         "add-friend" => {
@@ -677,7 +791,10 @@ fn main() -> Result<()> {
             if cfg.friends.iter().any(|f| f.pubkey == proto::hex_of(&pk)) {
                 bail!("друг уже добавлен");
             }
-            cfg.friends.push(StoredFriend { pubkey: proto::hex_of(&pk), alias: alias.clone() });
+            cfg.friends.push(StoredFriend {
+                pubkey: proto::hex_of(&pk),
+                alias: alias.clone(),
+            });
             save(&cfg)?;
             println!("друг добавлен: {} ({})", alias.clone(), proto::hex_of(&pk));
         }
@@ -697,7 +814,11 @@ fn main() -> Result<()> {
             let name = rest[1.min(rest.len())..].join(" ");
             bail_if_empty(&name, usage);
             let pk = proto::hex_of(&store::resolve_peer(&cfg, peer)?);
-            if cfg.friends.iter().any(|f| f.alias == name && f.pubkey != pk) {
+            if cfg
+                .friends
+                .iter()
+                .any(|f| f.alias == name && f.pubkey != pk)
+            {
                 bail!("имя {name:?} уже занято другим другом");
             }
             let f = cfg
@@ -716,7 +837,10 @@ fn main() -> Result<()> {
         "set-transport" => {
             cfg.transport = parse_transport(rest.first())?;
             save(&cfg)?;
-            println!("транспорт: {} (применится при следующем подключении)", format!("{:?}", cfg.transport).to_lowercase());
+            println!(
+                "транспорт: {} (применится при следующем подключении)",
+                format!("{:?}", cfg.transport).to_lowercase()
+            );
         }
         "set-mtu" => {
             cfg.mtu = parse_mtu(rest.first())?;
@@ -728,7 +852,11 @@ fn main() -> Result<()> {
             save(&cfg)?;
             println!(
                 "DNS для имён пиров {}: применится при следующем подключении",
-                if cfg.dns { "включён" } else { "выключен" }
+                if cfg.dns {
+                    "включён"
+                } else {
+                    "выключен"
+                }
             );
         }
         "friends" => {
@@ -748,11 +876,16 @@ fn main() -> Result<()> {
             // фолбэка (два движка с одной identity выбивают друг друга).
             if tui_mode && ui_mode != Some(UiMode::Embedded) {
                 let ep = Endpoint::for_data_dir(&dir);
-                let live = ep.open().with_context(|| format!("демон ({}) есть, но подключиться нельзя", ep.describe()))?;
+                let live = ep.open().with_context(|| {
+                    format!("демон ({}) есть, но подключиться нельзя", ep.describe())
+                })?;
                 match live {
                     Some(_probe) => return run_remote_tui(&ep, &dir, &cfg),
                     None if ui_mode == Some(UiMode::Remote) => {
-                        bail!("демон не запущен ({}); без --remote tui поднимет свой движок", ep.describe())
+                        bail!(
+                            "демон не запущен ({}); без --remote tui поднимет свой движок",
+                            ep.describe()
+                        )
                     }
                     None => {}
                 }
@@ -771,12 +904,16 @@ fn main() -> Result<()> {
             // движка. Консольному `run` достаточно CLI-подсказки.
             if tui_mode && (cfg.name.is_empty() || cfg.servers.is_empty()) {
                 if !tui::setup::run(&mut cfg, &mut adapter, &mut dll)? {
-                    bail!("настройка не завершена; запусти ещё раз или задай параметры командами CLI");
+                    bail!(
+                        "настройка не завершена; запусти ещё раз или задай параметры командами CLI"
+                    );
                 }
                 save(&cfg)?;
             }
             if cfg.name.is_empty() {
-                bail!("задай имя: set-name <имя> (или запусти `tunnel-client tui` — настройка там)");
+                bail!(
+                    "задай имя: set-name <имя> (или запусти `tunnel-client tui` — настройка там)"
+                );
             }
             let (server, pub_key) = pick_server(&cfg, server_sel.as_deref())?;
             save(&cfg)?;
@@ -790,15 +927,7 @@ fn main() -> Result<()> {
                 });
                 engine::run(cfg, server, pub_key, identity.clone(), &adapter, dll, save)?;
             } else {
-                tui::run(
-                    cfg,
-                    server,
-                    pub_key,
-                    identity.clone(),
-                    &adapter,
-                    dll,
-                    store,
-                )?;
+                tui::run(cfg, server, pub_key, identity.clone(), &adapter, dll, store)?;
             }
         }
         other => {
@@ -824,12 +953,20 @@ fn run_remote_tui(ep: &Endpoint, dir: &std::path::Path, local: &Config) -> Resul
         if c.name != snap.cfg.name {
             eng.send(engine::Cmd::SetName(c.name.clone()))?;
         }
-        for s in c.servers.iter().filter(|s| !snap.cfg.servers.iter().any(|x| x.addr == s.addr)) {
+        for s in c
+            .servers
+            .iter()
+            .filter(|s| !snap.cfg.servers.iter().any(|x| x.addr == s.addr))
+        {
             let pubkey: [u8; 32] = proto::hex_to_bytes(&s.pubkey)
                 .ok()
                 .and_then(|v| v.try_into().ok())
                 .with_context(|| format!("неверный ключ сервера {}", s.addr))?;
-            eng.send(engine::Cmd::AddServer { addr: s.addr.clone(), pubkey, label: s.label.clone() })?;
+            eng.send(engine::Cmd::AddServer {
+                addr: s.addr.clone(),
+                pubkey,
+                label: s.label.clone(),
+            })?;
         }
     }
     // Тема — локальная: ui.json (client.json при демоне — его).
@@ -905,7 +1042,11 @@ fn parse_gid(v: Option<&String>) -> Result<u32> {
 
 /// Индекс сервера по токену: номер из `servers` (с 0), адрес или метка.
 fn find_server(cfg: &Config, tok: &str) -> Option<usize> {
-    if let Some(i) = cfg.servers.iter().position(|s| s.addr == tok || (!s.label.is_empty() && s.label == tok)) {
+    if let Some(i) = cfg
+        .servers
+        .iter()
+        .position(|s| s.addr == tok || (!s.label.is_empty() && s.label == tok))
+    {
         return Some(i);
     }
     tok.parse::<usize>().ok().filter(|n| *n < cfg.servers.len())
@@ -914,13 +1055,17 @@ fn find_server(cfg: &Config, tok: &str) -> Option<usize> {
 /// Выбор сервера: --server <N|addr|label>, иначе последний использованный
 /// (`active_server`, его же автовход), иначе первый в списке.
 fn pick_server(cfg: &Config, sel: Option<&str>) -> Result<(SocketAddr, [u8; 32])> {
-    let active = cfg
-        .servers
-        .iter()
-        .find(|s| s.addr.parse::<SocketAddr>().is_ok_and(|a| a.to_string() == cfg.active_server));
+    let active = cfg.servers.iter().find(|s| {
+        s.addr
+            .parse::<SocketAddr>()
+            .is_ok_and(|a| a.to_string() == cfg.active_server)
+    });
     let entry = match sel {
         // Раньше `--server N` всегда выбирал первый сервер.
-        Some(tok) => &cfg.servers[find_server(cfg, tok).with_context(|| format!("сервер {tok:?} не найден"))?],
+        Some(tok) => {
+            &cfg.servers
+                [find_server(cfg, tok).with_context(|| format!("сервер {tok:?} не найден"))?]
+        }
         None => active
             .or(cfg.servers.first())
             .context("нет серверов; добавь: add-server <addr> <code>")?,
@@ -996,21 +1141,37 @@ mod tests {
     use super::*;
 
     fn srv(addr: &str, label: &str) -> StoredServer {
-        StoredServer { addr: addr.into(), pubkey: String::new(), label: label.into() }
+        StoredServer {
+            addr: addr.into(),
+            pubkey: String::new(),
+            label: label.into(),
+        }
     }
 
     #[test]
     fn сервер_по_номеру_адресу_метке() {
         let cfg = Config {
-            servers: vec![srv("1.1.1.1:5555", "home"), srv("2.2.2.2:5555", ""), srv("3.3.3.3:5555", "work")],
+            servers: vec![
+                srv("1.1.1.1:5555", "home"),
+                srv("2.2.2.2:5555", ""),
+                srv("3.3.3.3:5555", "work"),
+            ],
             ..Config::default()
         };
-        assert_eq!(find_server(&cfg, "1"), Some(1), "номер — индекс, а не «всегда первый»");
+        assert_eq!(
+            find_server(&cfg, "1"),
+            Some(1),
+            "номер — индекс, а не «всегда первый»"
+        );
         assert_eq!(find_server(&cfg, "2"), Some(2));
         assert_eq!(find_server(&cfg, "3"), None);
         assert_eq!(find_server(&cfg, "3.3.3.3:5555"), Some(2));
         assert_eq!(find_server(&cfg, "home"), Some(0));
-        assert_eq!(find_server(&cfg, ""), None, "пустая метка не совпадает с сервером без метки");
+        assert_eq!(
+            find_server(&cfg, ""),
+            None,
+            "пустая метка не совпадает с сервером без метки"
+        );
     }
 
     fn sv(v: &[&str]) -> Vec<String> {
@@ -1018,42 +1179,76 @@ mod tests {
     }
 
     fn tmp_dir(tag: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("vl-cli-{tag}-{}-{}", std::process::id(), rand::random::<u64>()));
+        let d = std::env::temp_dir().join(format!(
+            "vl-cli-{tag}-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
 
     #[test]
     fn глобальные_флаги_в_любом_месте() {
-        let g = parse_globals(sv(&["--debug", "join", "--server", "home", "5", "--profile", "work", "--dir", "/x"])).unwrap();
+        let g = parse_globals(sv(&[
+            "--debug",
+            "join",
+            "--server",
+            "home",
+            "5",
+            "--profile",
+            "work",
+            "--dir",
+            "/x",
+        ]))
+        .unwrap();
         assert!(g.debug);
         assert_eq!(g.server_sel.as_deref(), Some("home"));
         assert_eq!(g.profile.as_deref(), Some("work"));
         assert_eq!(g.args, sv(&["join", "5"]));
         assert_eq!(g.adapter, engine::DEFAULT_ADAPTER);
-        assert_eq!(g.data_dir().unwrap(), std::path::Path::new("/x").join("profiles").join("work"));
+        assert_eq!(
+            g.data_dir().unwrap(),
+            std::path::Path::new("/x").join("profiles").join("work")
+        );
 
         let g = parse_globals(sv(&["--dir", "/x", "id"])).unwrap();
         assert_eq!(g.data_dir().unwrap(), std::path::PathBuf::from("/x"));
-        assert!(parse_globals(sv(&["--profile", "../evil"])).is_err(), "имя профиля проверяется");
+        assert!(
+            parse_globals(sv(&["--profile", "../evil"])).is_err(),
+            "имя профиля проверяется"
+        );
         assert!(parse_globals(sv(&["id", "--profile"])).is_err());
         assert!(parse_globals(sv(&["--dir"])).is_err());
     }
 
     #[test]
     fn аргументы_identity() {
-        let a = parse_identity_args("export-identity", &sv(&["f.json", "--passphrase", "p w", "--force"])).unwrap();
+        let a = parse_identity_args(
+            "export-identity",
+            &sv(&["f.json", "--passphrase", "p w", "--force"]),
+        )
+        .unwrap();
         assert_eq!(
             a,
-            IdentityArgs { file: "f.json".into(), passphrase: Some("p w".into()), passphrase_stdin: false, force: true }
+            IdentityArgs {
+                file: "f.json".into(),
+                passphrase: Some("p w".into()),
+                passphrase_stdin: false,
+                force: true
+            }
         );
-        let a = parse_identity_args("import-identity", &sv(&["--passphrase-stdin", "f.json"])).unwrap();
+        let a =
+            parse_identity_args("import-identity", &sv(&["--passphrase-stdin", "f.json"])).unwrap();
         assert!(a.passphrase_stdin && a.passphrase.is_none() && !a.force);
         assert!(parse_identity_args("x", &sv(&[])).is_err(), "нужен файл");
         assert!(parse_identity_args("x", &sv(&["a", "b"])).is_err());
         assert!(parse_identity_args("x", &sv(&["a", "--passphrase"])).is_err());
         assert!(parse_identity_args("x", &sv(&["a", "--passphrase", ""])).is_err());
-        assert!(parse_identity_args("x", &sv(&["a", "--passphrase", "p", "--passphrase-stdin"])).is_err());
+        assert!(
+            parse_identity_args("x", &sv(&["a", "--passphrase", "p", "--passphrase-stdin"]))
+                .is_err()
+        );
         assert!(parse_identity_args("x", &sv(&["a", "--bogus"])).is_err());
     }
 
@@ -1064,14 +1259,24 @@ mod tests {
         assert!(parse_mtu(Some(&"9000".into())).is_err());
         assert!(parse_mtu(Some(&"abc".into())).is_err());
         assert!(parse_mtu(None).is_err());
-        assert_eq!(parse_transport(Some(&"TCP".into())).unwrap(), store::TransportMode::Tcp);
-        assert_eq!(parse_transport(Some(&"auto".into())).unwrap(), store::TransportMode::Auto);
+        assert_eq!(
+            parse_transport(Some(&"TCP".into())).unwrap(),
+            store::TransportMode::Tcp
+        );
+        assert_eq!(
+            parse_transport(Some(&"auto".into())).unwrap(),
+            store::TransportMode::Auto
+        );
         assert!(parse_transport(Some(&"quic".into())).is_err());
         assert!(parse_on_off(Some(&"on".into()), "u").unwrap());
         assert!(!parse_on_off(Some(&"off".into()), "u").unwrap());
         assert!(parse_on_off(Some(&"yes".into()), "u").is_err());
         let cfg: Config = serde_json::from_str("{}").unwrap();
-        assert_eq!(cfg.transport, store::TransportMode::Auto, "старый конфиг — транспорт auto");
+        assert_eq!(
+            cfg.transport,
+            store::TransportMode::Auto,
+            "старый конфиг — транспорт auto"
+        );
         assert!(cfg.dns, "старый конфиг — встроенный DNS включён");
     }
 
@@ -1084,15 +1289,34 @@ mod tests {
         src.save(&cfg).unwrap();
 
         let file = base.join("id.json");
-        let a = IdentityArgs { file: file.clone(), passphrase: None, passphrase_stdin: false, force: false };
+        let a = IdentityArgs {
+            file: file.clone(),
+            passphrase: None,
+            passphrase_stdin: false,
+            force: false,
+        };
         export_identity_cmd(&id, &a).unwrap();
-        assert!(export_identity_cmd(&id, &a).is_err(), "существующий файл без --force не затирается");
+        assert!(
+            export_identity_cmd(&id, &a).is_err(),
+            "существующий файл без --force не затирается"
+        );
         export_identity_cmd(&id, &IdentityArgs { force: true, ..a }).unwrap();
 
         // Свежий профиль: импорт без --force (identity ещё нет).
-        let g = parse_globals(sv(&["--dir", base.to_str().unwrap(), "--profile", "laptop"])).unwrap();
+        let g = parse_globals(sv(&[
+            "--dir",
+            base.to_str().unwrap(),
+            "--profile",
+            "laptop",
+        ]))
+        .unwrap();
         let dst = store::Store::new(&g.data_dir().unwrap());
-        let imp = IdentityArgs { file: file.clone(), passphrase: None, passphrase_stdin: false, force: false };
+        let imp = IdentityArgs {
+            file: file.clone(),
+            passphrase: None,
+            passphrase_stdin: false,
+            force: false,
+        };
         import_identity_cmd(&dst, &imp).unwrap();
         let got = store::ensure_identity(&mut dst.load().unwrap());
         assert_eq!(got.friend_code(), id.friend_code());
@@ -1103,12 +1327,27 @@ mod tests {
         let other = proto::Identity::generate();
         let file2 = base.join("other.json");
         profile::export_to_file(&file2, &other, None).unwrap();
-        let imp2 = IdentityArgs { file: file2, passphrase: None, passphrase_stdin: false, force: false };
+        let imp2 = IdentityArgs {
+            file: file2,
+            passphrase: None,
+            passphrase_stdin: false,
+            force: false,
+        };
         assert!(import_identity_cmd(&dst, &imp2).is_err());
-        import_identity_cmd(&dst, &IdentityArgs { force: true, ..imp2 }).unwrap();
+        import_identity_cmd(
+            &dst,
+            &IdentityArgs {
+                force: true,
+                ..imp2
+            },
+        )
+        .unwrap();
         let got = store::ensure_identity(&mut dst.load().unwrap());
         assert_eq!(got.friend_code(), other.friend_code());
-        assert_eq!(profile::list_profiles(&base).unwrap(), vec!["laptop".to_string()]);
+        assert_eq!(
+            profile::list_profiles(&base).unwrap(),
+            vec!["laptop".to_string()]
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }

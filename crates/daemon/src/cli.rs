@@ -21,10 +21,18 @@ tunnel-daemon — служба туннеля (владелец движка)
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
-    Console { debug: bool, fake: bool, data_dir: Option<PathBuf> },
-    Service { data_dir: Option<PathBuf> },
+    Console {
+        debug: bool,
+        fake: bool,
+        data_dir: Option<PathBuf>,
+    },
+    Service {
+        data_dir: Option<PathBuf>,
+    },
     Install,
-    Uninstall { purge: bool },
+    Uninstall {
+        purge: bool,
+    },
     Help,
 }
 
@@ -35,7 +43,9 @@ where
     S: Into<String>,
 {
     let mut it = args.into_iter().map(Into::into);
-    let Some(cmd) = it.next() else { return Ok(Mode::Help) };
+    let Some(cmd) = it.next() else {
+        return Ok(Mode::Help);
+    };
     let rest: Vec<String> = it.collect();
     let mut debug = false;
     let mut fake = false;
@@ -57,7 +67,11 @@ where
         i += 1;
     }
     Ok(match cmd.as_str() {
-        "console" => Mode::Console { debug, fake, data_dir },
+        "console" => Mode::Console {
+            debug,
+            fake,
+            data_dir,
+        },
         "service" => Mode::Service { data_dir },
         "install" => Mode::Install,
         "uninstall" => Mode::Uninstall { purge },
@@ -73,17 +87,38 @@ mod tests {
     #[test]
     fn modes() {
         assert_eq!(parse(Vec::<String>::new()), Ok(Mode::Help));
-        assert_eq!(parse(["console"]), Ok(Mode::Console { debug: false, fake: false, data_dir: None }));
+        assert_eq!(
+            parse(["console"]),
+            Ok(Mode::Console {
+                debug: false,
+                fake: false,
+                data_dir: None
+            })
+        );
         assert_eq!(
             parse(["console", "--debug", "--data-dir", "/x"]),
-            Ok(Mode::Console { debug: true, fake: false, data_dir: Some("/x".into()) })
+            Ok(Mode::Console {
+                debug: true,
+                fake: false,
+                data_dir: Some("/x".into())
+            })
         );
-        assert_eq!(parse(["console", "--fake"]), Ok(Mode::Console { debug: false, fake: true, data_dir: None }));
+        assert_eq!(
+            parse(["console", "--fake"]),
+            Ok(Mode::Console {
+                debug: false,
+                fake: true,
+                data_dir: None
+            })
+        );
         assert!(parse(["service", "--fake"]).is_err());
         assert_eq!(parse(["service"]), Ok(Mode::Service { data_dir: None }));
         assert_eq!(parse(["install"]), Ok(Mode::Install));
         assert_eq!(parse(["uninstall"]), Ok(Mode::Uninstall { purge: false }));
-        assert_eq!(parse(["uninstall", "--purge"]), Ok(Mode::Uninstall { purge: true }));
+        assert_eq!(
+            parse(["uninstall", "--purge"]),
+            Ok(Mode::Uninstall { purge: true })
+        );
         assert!(parse(["install", "--purge"]).is_err());
         assert!(parse(["console", "--data-dir"]).is_err());
         assert!(parse(["frobnicate"]).is_err());

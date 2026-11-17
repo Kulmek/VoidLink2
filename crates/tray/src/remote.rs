@@ -106,7 +106,12 @@ impl Default for IpcTransport {
 
 impl Transport for IpcTransport {
     fn open(&self) -> Result<Box<dyn Link>, OpenError> {
-        match IpcClient::connect(&self.name, ClientKind::Tray, env!("CARGO_PKG_VERSION"), HELLO_TIMEOUT) {
+        match IpcClient::connect(
+            &self.name,
+            ClientKind::Tray,
+            env!("CARGO_PKG_VERSION"),
+            HELLO_TIMEOUT,
+        ) {
             Ok(c) => Ok(Box::new(c)),
             Err(ClientError::Rejected(r)) => Err(OpenError::Rejected(r)),
             Err(e) => Err(OpenError::Down(e.to_string())),
@@ -135,10 +140,14 @@ pub fn default_endpoint() -> PathBuf {
 /// Принять приглашение — это `Join` (сервер сам снимает приглашение).
 pub fn action_cmd(a: Action) -> Option<Value> {
     Some(match a {
-        Action::ToggleGroup { gid, join: true } | Action::AcceptInvite(gid) => json!({ "Join": gid }),
+        Action::ToggleGroup { gid, join: true } | Action::AcceptInvite(gid) => {
+            json!({ "Join": gid })
+        }
         Action::ToggleGroup { gid, join: false } => json!({ "Leave": gid }),
         Action::DeclineInvite(gid) => json!({ "DeclineInvite": gid }),
-        Action::OpenTui | Action::CopyIp | Action::CopyCode | Action::StopTunnel | Action::Exit => return None,
+        Action::OpenTui | Action::CopyIp | Action::CopyCode | Action::StopTunnel | Action::Exit => {
+            return None;
+        }
     })
 }
 
@@ -158,17 +167,26 @@ fn str_of<'a>(v: &'a Value, key: &str) -> &'a str {
 }
 
 fn u32_of(v: &Value, key: &str) -> Option<u32> {
-    v.get(key).and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok())
+    v.get(key)
+        .and_then(Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
 }
 
 fn arr<'a>(v: &'a Value, key: &str) -> &'a [Value] {
-    v.get(key).and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[])
+    v.get(key)
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
 }
 
 /// `[u8; 32]` в JSON serde — массив чисел; в hex.
 fn hex_key(v: &Value) -> String {
     match v.as_array() {
-        Some(a) => a.iter().filter_map(Value::as_u64).map(|b| format!("{:02x}", b as u8)).collect(),
+        Some(a) => a
+            .iter()
+            .filter_map(Value::as_u64)
+            .map(|b| format!("{:02x}", b as u8))
+            .collect(),
         None => v.as_str().unwrap_or("").to_lowercase(),
     }
 }
@@ -180,13 +198,20 @@ fn inviter(inv: &Value, friends: &[Value]) -> String {
         return name.to_string();
     }
     let key = hex_key(inv.get("from_pubkey").unwrap_or(&Value::Null));
-    if let Some(f) = friends.iter().find(|f| !key.is_empty() && str_of(f, "pubkey").eq_ignore_ascii_case(&key)) {
+    if let Some(f) = friends
+        .iter()
+        .find(|f| !key.is_empty() && str_of(f, "pubkey").eq_ignore_ascii_case(&key))
+    {
         let alias = str_of(f, "alias");
         if !alias.is_empty() {
             return alias.to_string();
         }
     }
-    if key.is_empty() { "неизвестный".into() } else { key.chars().take(8).collect() }
+    if key.is_empty() {
+        "неизвестный".into()
+    } else {
+        key.chars().take(8).collect()
+    }
 }
 
 /// Снимок демона (`Snapshot` из `snapshot.rs`) → состояние трея. `kicked`,
@@ -195,7 +220,10 @@ pub fn map_snapshot(snap: &Value) -> TrayState {
     let meta = snap.get("meta").unwrap_or(&Value::Null);
     let cfg = snap.get("cfg").unwrap_or(&Value::Null);
 
-    let connected = meta.get("connected").and_then(Value::as_bool).unwrap_or(false);
+    let connected = meta
+        .get("connected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let has_server = !str_of(meta, "server").is_empty() || !arr(cfg, "servers").is_empty();
     let conn = if connected {
         Conn::Connected
@@ -208,8 +236,10 @@ pub fn map_snapshot(snap: &Value) -> TrayState {
     // Свои группы (`groups`) — с галочкой; остальное из списка сервера.
     let mut groups: Vec<TrayGroup> = Vec::new();
     let mut my_ips: Vec<String> = Vec::new();
-    let mut mine: Vec<(u32, &Value)> =
-        arr(snap, "groups").iter().filter_map(|g| Some((u32_of(g, "gid")?, g))).collect();
+    let mut mine: Vec<(u32, &Value)> = arr(snap, "groups")
+        .iter()
+        .filter_map(|g| Some((u32_of(g, "gid")?, g)))
+        .collect();
     mine.sort_by_key(|(gid, _)| *gid);
     for (gid, g) in mine {
         if let Some(ip) = u32_of(g, "my_ip").filter(|ip| *ip != 0) {
@@ -219,13 +249,23 @@ pub fn map_snapshot(snap: &Value) -> TrayState {
             }
         }
         if !groups.iter().any(|x| x.gid == gid) {
-            groups.push(TrayGroup { gid, name: str_of(g, "name").to_string(), joined: true });
+            groups.push(TrayGroup {
+                gid,
+                name: str_of(g, "name").to_string(),
+                joined: true,
+            });
         }
     }
     for g in arr(meta, "group_list") {
-        let Some(gid) = u32_of(g, "gid") else { continue };
+        let Some(gid) = u32_of(g, "gid") else {
+            continue;
+        };
         if !groups.iter().any(|x| x.gid == gid) {
-            groups.push(TrayGroup { gid, name: str_of(g, "name").to_string(), joined: false });
+            groups.push(TrayGroup {
+                gid,
+                name: str_of(g, "name").to_string(),
+                joined: false,
+            });
         }
     }
     groups.sort_by_key(|g| g.gid);
@@ -238,14 +278,20 @@ pub fn map_snapshot(snap: &Value) -> TrayState {
     let friends = arr(cfg, "friends");
     let mut invites: Vec<TrayInvite> = Vec::new();
     for i in arr(snap, "pending_invites") {
-        let Some(gid) = u32_of(i, "gid") else { continue };
+        let Some(gid) = u32_of(i, "gid") else {
+            continue;
+        };
         if invites.iter().any(|x| x.gid == gid) {
             continue;
         }
         let name = str_of(i, "group_name");
         invites.push(TrayInvite {
             gid,
-            group_name: if name.is_empty() { format!("группа {gid}") } else { name.to_string() },
+            group_name: if name.is_empty() {
+                format!("группа {gid}")
+            } else {
+                name.to_string()
+            },
             from: inviter(i, friends),
         });
     }
@@ -257,7 +303,15 @@ pub fn map_snapshot(snap: &Value) -> TrayState {
         Some(str_of(meta, "server").to_string()).filter(|s| !s.is_empty())
     };
 
-    TrayState { conn, my_ips, server_label, my_code: None, groups, invites, ..Default::default() }
+    TrayState {
+        conn,
+        my_ips,
+        server_label,
+        my_code: None,
+        groups,
+        invites,
+        ..Default::default()
+    }
 }
 
 /// Friend code из `Welcome.me` (`my_code`; `code` — как в тестовом бэкенде хаба).
@@ -286,7 +340,14 @@ pub fn event_kick(ev: &Value) -> Option<TrayKick> {
     }
     let gid = u32_of(body, "gid")?;
     let name = str_of(body, "name");
-    Some(TrayKick { gid, group_name: if name.is_empty() { format!("группа {gid}") } else { name.to_string() } })
+    Some(TrayKick {
+        gid,
+        group_name: if name.is_empty() {
+            format!("группа {gid}")
+        } else {
+            name.to_string()
+        },
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -328,7 +389,8 @@ impl Shared {
     fn on_reject(&self, reason: String) {
         let mut s = self.lock();
         if s.last_reject.as_deref() != Some(reason.as_str()) {
-            s.errors.push(format!("Служба Tunnel отказала в подключении: {reason}"));
+            s.errors
+                .push(format!("Служба Tunnel отказала в подключении: {reason}"));
             s.last_reject = Some(reason);
         }
     }
@@ -383,7 +445,11 @@ impl Shared {
     fn state(&self) -> TrayState {
         let mut s = self.lock();
         let mut st = s.view.clone().unwrap_or_default();
-        st.my_code = if s.view.is_some() { s.my_code.clone() } else { None };
+        st.my_code = if s.view.is_some() {
+            s.my_code.clone()
+        } else {
+            None
+        };
         st.kicked = std::mem::take(&mut s.kicked);
         st.errors = std::mem::take(&mut s.errors);
         // TODO(7.4): открыт ли TUI — демон пока не сообщает о своих клиентах.
@@ -463,7 +529,10 @@ impl IpcTrayBackend {
             .name("tray-ipc".into())
             .spawn(move || run_loop(&t, &sh, &rx, retry))
             .expect("поток IPC трея");
-        Self { shared, cmds: Mutex::new(tx) }
+        Self {
+            shared,
+            cmds: Mutex::new(tx),
+        }
     }
 }
 
@@ -536,23 +605,51 @@ mod tests {
     fn snapshot_maps_to_tray_state() {
         let s = map_snapshot(&fixture());
         assert_eq!(s.conn, Conn::Connected);
-        assert_eq!(s.my_ips, vec!["10.1.0.5".to_string(), "10.0.0.2".to_string()], "по возрастанию gid");
+        assert_eq!(
+            s.my_ips,
+            vec!["10.1.0.5".to_string(), "10.0.0.2".to_string()],
+            "по возрастанию gid"
+        );
         assert_eq!(s.server_label.as_deref(), Some("дом-сервер"));
         assert_eq!(s.my_code, None);
         assert_eq!(
             s.groups,
             vec![
-                TrayGroup { gid: 3, name: "дом".into(), joined: true },
-                TrayGroup { gid: 5, name: "работа".into(), joined: false },
-                TrayGroup { gid: 7, name: "игра".into(), joined: true },
+                TrayGroup {
+                    gid: 3,
+                    name: "дом".into(),
+                    joined: true
+                },
+                TrayGroup {
+                    gid: 5,
+                    name: "работа".into(),
+                    joined: false
+                },
+                TrayGroup {
+                    gid: 7,
+                    name: "игра".into(),
+                    joined: true
+                },
             ]
         );
         assert_eq!(
             s.invites,
             vec![
-                TrayInvite { gid: 11, group_name: "чат".into(), from: "charlie".into() },
-                TrayInvite { gid: 12, group_name: "группа 12".into(), from: "чарли".into() },
-                TrayInvite { gid: 13, group_name: "кино".into(), from: "abababab".into() },
+                TrayInvite {
+                    gid: 11,
+                    group_name: "чат".into(),
+                    from: "charlie".into()
+                },
+                TrayInvite {
+                    gid: 12,
+                    group_name: "группа 12".into(),
+                    from: "чарли".into()
+                },
+                TrayInvite {
+                    gid: 13,
+                    group_name: "кино".into(),
+                    from: "abababab".into()
+                },
             ]
         );
         assert!(s.kicked.is_empty() && s.errors.is_empty());
@@ -584,32 +681,68 @@ mod tests {
 
     #[test]
     fn actions_map_to_engine_cmds() {
-        assert_eq!(action_cmd(Action::ToggleGroup { gid: 3, join: true }), Some(json!({"Join": 3})));
-        assert_eq!(action_cmd(Action::ToggleGroup { gid: 3, join: false }), Some(json!({"Leave": 3})));
-        assert_eq!(action_cmd(Action::AcceptInvite(9)), Some(json!({"Join": 9})));
-        assert_eq!(action_cmd(Action::DeclineInvite(9)), Some(json!({"DeclineInvite": 9})));
-        for a in [Action::OpenTui, Action::CopyIp, Action::CopyCode, Action::StopTunnel, Action::Exit] {
+        assert_eq!(
+            action_cmd(Action::ToggleGroup { gid: 3, join: true }),
+            Some(json!({"Join": 3}))
+        );
+        assert_eq!(
+            action_cmd(Action::ToggleGroup {
+                gid: 3,
+                join: false
+            }),
+            Some(json!({"Leave": 3}))
+        );
+        assert_eq!(
+            action_cmd(Action::AcceptInvite(9)),
+            Some(json!({"Join": 9}))
+        );
+        assert_eq!(
+            action_cmd(Action::DeclineInvite(9)),
+            Some(json!({"DeclineInvite": 9}))
+        );
+        for a in [
+            Action::OpenTui,
+            Action::CopyIp,
+            Action::CopyCode,
+            Action::StopTunnel,
+            Action::Exit,
+        ] {
             assert!(a.is_local());
             assert_eq!(action_cmd(a), None);
         }
         // Ровно такой JSON даёт serde для `Cmd::Join(u32)` (newtype-вариант).
-        assert_eq!(serde_json::to_string(&action_cmd(Action::AcceptInvite(1)).unwrap()).unwrap(), r#"{"Join":1}"#);
+        assert_eq!(
+            serde_json::to_string(&action_cmd(Action::AcceptInvite(1)).unwrap()).unwrap(),
+            r#"{"Join":1}"#
+        );
     }
 
     #[test]
     fn events_and_me() {
         assert_eq!(
             event_kick(&json!({"Kicked": {"gid": 4, "name": "x"}})),
-            Some(TrayKick { gid: 4, group_name: "x".into() })
+            Some(TrayKick {
+                gid: 4,
+                group_name: "x".into()
+            })
         );
         assert_eq!(
             event_kick(&json!({"GroupDeleted": {"gid": 5, "name": ""}})),
-            Some(TrayKick { gid: 5, group_name: "группа 5".into() })
+            Some(TrayKick {
+                gid: 5,
+                group_name: "группа 5".into()
+            })
         );
-        assert_eq!(event_kick(&json!({"GroupLeft": {"gid": 4, "name": "x"}})), None);
+        assert_eq!(
+            event_kick(&json!({"GroupLeft": {"gid": 4, "name": "x"}})),
+            None
+        );
         assert_eq!(event_kick(&json!({"Connected": "1.2.3.4:5"})), None);
         assert_eq!(event_kick(&json!("Quit")), None);
-        assert_eq!(me_code(&json!({"my_pub": "aa", "my_code": "ABCD"})).as_deref(), Some("ABCD"));
+        assert_eq!(
+            me_code(&json!({"my_pub": "aa", "my_code": "ABCD"})).as_deref(),
+            Some("ABCD")
+        );
         assert_eq!(me_code(&json!({"code": "ME"})).as_deref(), Some("ME"));
         assert_eq!(me_code(&json!({})), None);
     }
@@ -642,7 +775,9 @@ mod tests {
         }
         fn send_req(&mut self, cmd: Value) -> Result<u64, String> {
             self.next_id += 1;
-            self.tx.send(Sent::Req(self.next_id, cmd)).map_err(|e| e.to_string())?;
+            self.tx
+                .send(Sent::Req(self.next_id, cmd))
+                .map_err(|e| e.to_string())?;
             Ok(self.next_id)
         }
         fn recv(&mut self, t: Duration) -> Result<Option<DaemonMsg>, String> {
@@ -691,22 +826,36 @@ mod tests {
             self.tx.send(m).unwrap();
         }
         fn recv(&self) -> Sent {
-            self.rx.recv_timeout(Duration::from_secs(5)).expect("сообщение от трея")
+            self.rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("сообщение от трея")
         }
     }
 
     fn link(code: &str) -> (Next, DaemonEnd) {
         let (dtx, drx) = mpsc::channel();
         let (stx, srx) = mpsc::channel();
-        let l = FakeLink { me: json!({"my_pub": "aa", "my_code": code}), rx: drx, tx: stx, next_id: 0 };
+        let l = FakeLink {
+            me: json!({"my_pub": "aa", "my_code": code}),
+            rx: drx,
+            tx: stx,
+            next_id: 0,
+        };
         (Next::Link(l), DaemonEnd { tx: dtx, rx: srx })
     }
 
     fn fake(retry_ms: u64) -> (IpcTrayBackend, Sender<Next>, Arc<Mutex<u32>>) {
         let (tx, rx) = mpsc::channel();
         let attempts = Arc::new(Mutex::new(0));
-        let t = FakeTransport { attempts: attempts.clone(), next: Mutex::new(rx) };
-        (IpcTrayBackend::with_transport(t, Duration::from_millis(retry_ms)), tx, attempts)
+        let t = FakeTransport {
+            attempts: attempts.clone(),
+            next: Mutex::new(rx),
+        };
+        (
+            IpcTrayBackend::with_transport(t, Duration::from_millis(retry_ms)),
+            tx,
+            attempts,
+        )
     }
 
     fn wait(b: &IpcTrayBackend, what: &str, pred: impl Fn(&TrayState) -> bool) -> TrayState {
@@ -716,7 +865,10 @@ mod tests {
             if pred(&s) {
                 return s;
             }
-            assert!(Instant::now() < deadline, "не дождались: {what}; состояние {s:?}");
+            assert!(
+                Instant::now() < deadline,
+                "не дождались: {what}; состояние {s:?}"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -744,49 +896,92 @@ mod tests {
         let (l, d) = link("ABCD");
         next.send(l).unwrap();
         assert_eq!(d.recv(), Sent::Subscribe(SNAPSHOTS_MS));
-        assert_eq!(b.state().conn, Conn::DaemonDown, "до снимка — ещё не на связи");
+        assert_eq!(
+            b.state().conn,
+            Conn::DaemonDown,
+            "до снимка — ещё не на связи"
+        );
         // История кольца до снимка — не уведомляем.
-        d.send(DaemonMsg::Event { seq: 4, ev: json!({"Kicked": {"gid": 1, "name": "старое"}}) });
-        d.send(DaemonMsg::Snapshot { seq: 5, snap: fixture() });
+        d.send(DaemonMsg::Event {
+            seq: 4,
+            ev: json!({"Kicked": {"gid": 1, "name": "старое"}}),
+        });
+        d.send(DaemonMsg::Snapshot {
+            seq: 5,
+            snap: fixture(),
+        });
         let s = wait(&b, "снимок", |s| s.conn == Conn::Connected);
         assert_eq!(s.my_code.as_deref(), Some("ABCD"));
         assert_eq!(s.invites.len(), 3);
         assert!(s.kicked.is_empty());
 
         // Живое событие → kicked, один раз; seq ≤ снимка — история.
-        d.send(DaemonMsg::Event { seq: 5, ev: json!({"Kicked": {"gid": 2, "name": "повтор"}}) });
-        d.send(DaemonMsg::Event { seq: 6, ev: json!({"GroupDeleted": {"gid": 7, "name": "игра"}}) });
+        d.send(DaemonMsg::Event {
+            seq: 5,
+            ev: json!({"Kicked": {"gid": 2, "name": "повтор"}}),
+        });
+        d.send(DaemonMsg::Event {
+            seq: 6,
+            ev: json!({"GroupDeleted": {"gid": 7, "name": "игра"}}),
+        });
         let s = wait(&b, "kicked", |s| !s.kicked.is_empty());
-        assert_eq!(s.kicked, vec![TrayKick { gid: 7, group_name: "игра".into() }]);
+        assert_eq!(
+            s.kicked,
+            vec![TrayKick {
+                gid: 7,
+                group_name: "игра".into()
+            }]
+        );
         assert!(b.state().kicked.is_empty(), "отдаётся один раз");
 
         // Действие → Req с командой движка; Ack Err → уведомление.
         b.act(Action::DeclineInvite(11));
-        let Sent::Req(id, cmd) = d.recv() else { panic!("ожидался Req") };
+        let Sent::Req(id, cmd) = d.recv() else {
+            panic!("ожидался Req")
+        };
         assert_eq!(cmd, json!({"DeclineInvite": 11}));
         b.act(Action::ToggleGroup { gid: 5, join: true });
-        let Sent::Req(id2, cmd) = d.recv() else { panic!("ожидался Req") };
+        let Sent::Req(id2, cmd) = d.recv() else {
+            panic!("ожидался Req")
+        };
         assert_eq!(cmd, json!({"Join": 5}));
-        d.send(DaemonMsg::Ack { id, result: AckResult::Ok });
-        d.send(DaemonMsg::Ack { id: id2, result: AckResult::Err("нет сервера".into()) });
+        d.send(DaemonMsg::Ack {
+            id,
+            result: AckResult::Ok,
+        });
+        d.send(DaemonMsg::Ack {
+            id: id2,
+            result: AckResult::Err("нет сервера".into()),
+        });
         let s = wait(&b, "ошибка Ack", |s| !s.errors.is_empty());
-        assert_eq!(s.errors, vec!["Не удалось войти в группу: нет сервера".to_string()]);
+        assert_eq!(
+            s.errors,
+            vec!["Не удалось войти в группу: нет сервера".to_string()]
+        );
 
         // Обрыв → DaemonDown, затем переподключение к новому «демону».
         drop(d);
-        wait(&b, "DaemonDown после обрыва", |s| s.conn == Conn::DaemonDown && s.my_code.is_none());
+        wait(&b, "DaemonDown после обрыва", |s| {
+            s.conn == Conn::DaemonDown && s.my_code.is_none()
+        });
         let (l, d) = link("NEW");
         next.send(l).unwrap();
         assert_eq!(d.recv(), Sent::Subscribe(SNAPSHOTS_MS));
         let mut f = fixture();
         f["meta"]["connected"] = json!(false);
         d.send(DaemonMsg::Snapshot { seq: 1, snap: f });
-        let s = wait(&b, "второй снимок", |s| s.conn == Conn::Reconnecting);
+        let s = wait(&b, "второй снимок", |s| {
+            s.conn == Conn::Reconnecting
+        });
         assert_eq!(s.my_code.as_deref(), Some("NEW"));
 
         // Shutdown демона — тоже DaemonDown.
-        d.send(DaemonMsg::Shutdown { reason: "стоп".into() });
-        wait(&b, "DaemonDown после Shutdown", |s| s.conn == Conn::DaemonDown);
+        d.send(DaemonMsg::Shutdown {
+            reason: "стоп".into(),
+        });
+        wait(&b, "DaemonDown после Shutdown", |s| {
+            s.conn == Conn::DaemonDown
+        });
 
         // Остановка бэкенда — `Bye` демону.
         let (l, d) = link("X");
@@ -829,25 +1024,62 @@ mod tests {
         let daemon = std::thread::spawn(move || {
             let mut c = l.accept().unwrap();
             let hello: ClientMsg = read_msg(&mut c).unwrap();
-            assert!(matches!(hello, ClientMsg::Hello { kind: ClientKind::Tray, .. }));
-            write_msg(&mut c, &DaemonMsg::Welcome { proto: 1, daemon_ver: "t".into(), me: json!({"my_code": "SOCK"}) })
-                .unwrap();
+            assert!(matches!(
+                hello,
+                ClientMsg::Hello {
+                    kind: ClientKind::Tray,
+                    ..
+                }
+            ));
+            write_msg(
+                &mut c,
+                &DaemonMsg::Welcome {
+                    proto: 1,
+                    daemon_ver: "t".into(),
+                    me: json!({"my_code": "SOCK"}),
+                },
+            )
+            .unwrap();
             let sub: ClientMsg = read_msg(&mut c).unwrap();
             assert!(matches!(sub, ClientMsg::Subscribe { .. }));
-            write_msg(&mut c, &DaemonMsg::Snapshot { seq: 1, snap: fixture() }).unwrap();
+            write_msg(
+                &mut c,
+                &DaemonMsg::Snapshot {
+                    seq: 1,
+                    snap: fixture(),
+                },
+            )
+            .unwrap();
             let req: ClientMsg = read_msg(&mut c).unwrap();
-            let ClientMsg::Req { id, cmd } = req else { panic!("ожидался Req: {req:?}") };
+            let ClientMsg::Req { id, cmd } = req else {
+                panic!("ожидался Req: {req:?}")
+            };
             assert_eq!(cmd, json!({"Leave": 3}));
-            write_msg(&mut c, &DaemonMsg::Ack { id, result: AckResult::Err("занято".into()) }).unwrap();
+            write_msg(
+                &mut c,
+                &DaemonMsg::Ack {
+                    id,
+                    result: AckResult::Err("занято".into()),
+                },
+            )
+            .unwrap();
             // Держим соединение, пока трей не закроется.
             let _ = read_msg::<_, ClientMsg>(&mut c);
         });
         let b = IpcTrayBackend::with_transport(IpcTransport::new(&path), Duration::from_millis(20));
-        let s = wait(&b, "снимок по сокету", |s| s.conn == Conn::Connected);
+        let s = wait(&b, "снимок по сокету", |s| {
+            s.conn == Conn::Connected
+        });
         assert_eq!(s.my_code.as_deref(), Some("SOCK"));
-        b.act(Action::ToggleGroup { gid: 3, join: false });
+        b.act(Action::ToggleGroup {
+            gid: 3,
+            join: false,
+        });
         let s = wait(&b, "Ack по сокету", |s| !s.errors.is_empty());
-        assert_eq!(s.errors, vec!["Не удалось выйти из группы: занято".to_string()]);
+        assert_eq!(
+            s.errors,
+            vec!["Не удалось выйти из группы: занято".to_string()]
+        );
         drop(b);
         daemon.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);

@@ -123,7 +123,12 @@ impl InstanceLock {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
         match file.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => return Err(LockError::Busy),
@@ -131,7 +136,8 @@ impl InstanceLock {
         }
         // PID — только для людей (кто держит замок); ошибки записи не важны.
         let _ = file.set_len(0);
-        let _ = std::io::Write::write_all(&mut &file, format!("{}\n", std::process::id()).as_bytes());
+        let _ =
+            std::io::Write::write_all(&mut &file, format!("{}\n", std::process::id()).as_bytes());
         Ok(Self { _file: file })
     }
 
@@ -139,9 +145,12 @@ impl InstanceLock {
     #[cfg(windows)]
     pub fn acquire_named(name: &str) -> Result<Self, LockError> {
         use windows_sys::Win32::Foundation::{
-            CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, GetLastError,
+            CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND,
+            GetLastError,
         };
-        use windows_sys::Win32::System::Threading::{CreateMutexW, OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
+        use windows_sys::Win32::System::Threading::{
+            CreateMutexW, OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE,
+        };
         let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
         // SAFETY: строка нуль-терминирована, атрибуты безопасности по умолчанию.
         let handle = unsafe { CreateMutexW(std::ptr::null(), 0, wide.as_ptr()) };
@@ -215,7 +224,10 @@ mod tests {
         let name = format!(r"Local\TunnelEngineTest{}", std::process::id());
         assert!(!InstanceLock::is_held_named(&name));
         let a = InstanceLock::acquire_named(&name).expect("первый замок");
-        assert!(matches!(InstanceLock::acquire_named(&name), Err(LockError::Busy)));
+        assert!(matches!(
+            InstanceLock::acquire_named(&name),
+            Err(LockError::Busy)
+        ));
         assert!(InstanceLock::is_held_named(&name));
         drop(a);
         let b = InstanceLock::acquire_named(&name).expect("замок после освобождения");

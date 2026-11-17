@@ -10,7 +10,9 @@ use windows_service::service::{
     PowerEventParam, ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState,
     ServiceStatus, ServiceType,
 };
-use windows_service::service_control_handler::{self, ServiceControlHandlerResult, ServiceStatusHandle};
+use windows_service::service_control_handler::{
+    self, ServiceControlHandlerResult, ServiceStatusHandle,
+};
 use windows_service::{define_windows_service, service_dispatcher};
 
 use crate::ServiceEvent;
@@ -56,7 +58,9 @@ where
 
 fn status(state: ServiceState, exit: ServiceExitCode, wait: Duration) -> ServiceStatus {
     let controls_accepted = if state == ServiceState::Running {
-        ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN | ServiceControlAccept::POWER_EVENT
+        ServiceControlAccept::STOP
+            | ServiceControlAccept::SHUTDOWN
+            | ServiceControlAccept::POWER_EVENT
     } else {
         ServiceControlAccept::empty()
     };
@@ -115,7 +119,11 @@ fn run_body() -> Result<()> {
         .context("RegisterServiceCtrlHandlerEx")?;
     *handle_slot.lock().unwrap() = Some(handle);
     handle
-        .set_service_status(status(ServiceState::Running, ServiceExitCode::Win32(0), Duration::ZERO))
+        .set_service_status(status(
+            ServiceState::Running,
+            ServiceExitCode::Win32(0),
+            Duration::ZERO,
+        ))
         .context("SetServiceStatus(Running)")?;
 
     let res = body(rx);

@@ -20,7 +20,7 @@ pub mod proto;
 pub mod transport;
 
 pub use client::{ClientError, IpcClient};
-pub use lock::{InstanceLock, LockError};
 pub use codec::{CodecError, MAX_FRAME, read_msg, write_msg};
+pub use lock::{InstanceLock, LockError};
 pub use proto::{AckResult, ClientKind, ClientMsg, DaemonMsg, PROTO_VERSION, check_hello};
 pub use transport::{Conn, Listener, connect};

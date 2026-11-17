@@ -48,7 +48,10 @@ pub enum IpcMode {
     Unix,
     /// Named pipe службы: имя и SID владельца (из `owner.sid`).
     #[cfg(windows)]
-    Pipe { name: String, owner_sid: Option<String> },
+    Pipe {
+        name: String,
+        owner_sid: Option<String>,
+    },
 }
 
 impl IpcMode {
@@ -123,10 +126,17 @@ pub fn run_daemon<B: Backend + 'static>(
 ) -> Result<(), String> {
     let data_dir = opts.data_dir.as_path();
     let _lock = InstanceLock::acquire(data_dir).map_err(|e| e.to_string())?;
-    let level = if opts.debug { Level::Debug } else { Level::Info };
+    let level = if opts.debug {
+        Level::Debug
+    } else {
+        Level::Info
+    };
     let log = Logger::open(&crate::log_dir(data_dir), level, opts.console_log)
         .map_err(|e| format!("лог {}: {e}", crate::log_dir(data_dir).display()))?;
-    log.log(Level::Info, &format!("демон запущен, данные: {}", data_dir.display()));
+    log.log(
+        Level::Info,
+        &format!("демон запущен, данные: {}", data_dir.display()),
+    );
     let hub = Arc::new(Hub::with_log(make_backend(log.callback()), log.callback()));
     let server = match &opts.ipc {
         IpcMode::None => {
@@ -134,13 +144,21 @@ pub fn run_daemon<B: Backend + 'static>(
             None
         }
         #[cfg(unix)]
-        IpcMode::Unix => Some(IpcServer::start_unix(hub.clone(), data_dir, Some(log.callback())).map_err(|e| {
-            log.log(Level::Error, &format!("IPC: {e}"));
-            format!("IPC: {e}")
-        })?),
+        IpcMode::Unix => Some(
+            IpcServer::start_unix(hub.clone(), data_dir, Some(log.callback())).map_err(|e| {
+                log.log(Level::Error, &format!("IPC: {e}"));
+                format!("IPC: {e}")
+            })?,
+        ),
         #[cfg(windows)]
         IpcMode::Pipe { name, owner_sid } => Some(
-            IpcServer::start_pipe(hub.clone(), name, owner_sid.as_deref(), Some(log.callback())).map_err(|e| {
+            IpcServer::start_pipe(
+                hub.clone(),
+                name,
+                owner_sid.as_deref(),
+                Some(log.callback()),
+            )
+            .map_err(|e| {
                 log.log(Level::Error, &format!("IPC: пайп {name}: {e}"));
                 format!("IPC: пайп {name}: {e}")
             })?,
@@ -231,7 +249,13 @@ pub const ONLY_WINDOWS: &str =
 /// Тело службы (без SCM, тестируется на любой ОС): ядро демона в отдельном
 /// потоке; Stop/Shutdown (или закрытый канал) — остановка, Resume — подсказка
 /// бэкенду. Если ядро завершилось само (ошибка замка/пайпа) — его результат.
-#[cfg_attr(not(windows), allow(dead_code, reason = "вызывается только из службы SCM (Windows); на других ОС — в тестах"))]
+#[cfg_attr(
+    not(windows),
+    allow(
+        dead_code,
+        reason = "вызывается только из службы SCM (Windows); на других ОС — в тестах"
+    )
+)]
 pub(crate) fn service_body<B, F>(
     opts: RunOpts,
     make_backend: F,
@@ -265,7 +289,12 @@ where
                                 None
                             }
                         };
-                        make_backend(ServiceEnv { data_dir, log, wintun_dll: dll, resume })
+                        make_backend(ServiceEnv {
+                            data_dir,
+                            log,
+                            wintun_dll: dll,
+                            resume,
+                        })
                     },
                     stop,
                 )
@@ -277,7 +306,8 @@ where
             break;
         }
         match events.recv_timeout(Duration::from_millis(200)) {
-            Ok(ServiceEvent::Stop | ServiceEvent::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
+            Ok(ServiceEvent::Stop | ServiceEvent::Shutdown)
+            | Err(RecvTimeoutError::Disconnected) => {
                 stop.store(true, Ordering::Relaxed);
                 break;
             }
@@ -285,7 +315,8 @@ where
             Err(RecvTimeoutError::Timeout) => {}
         }
     }
-    core.join().map_err(|_| "поток демона упал (panic)".to_string())?
+    core.join()
+        .map_err(|_| "поток демона упал (panic)".to_string())?
 }
 
 /// `tunnel-daemon service`: точка входа SCM. Данные — `data_dir` или
@@ -298,16 +329,23 @@ where
 {
     #[cfg(windows)]
     {
-        let dir = data_dir.map(Path::to_path_buf).unwrap_or_else(tunnel_winsvc::data_dir);
+        let dir = data_dir
+            .map(Path::to_path_buf)
+            .unwrap_or_else(tunnel_winsvc::data_dir);
         let mut warnings = Vec::new();
         let owner_sid = match tunnel_winsvc::read_owner_sid(&dir) {
             Ok(sid) => Some(sid),
             Err(e) => {
-                warnings.push(format!("{e:#}; пайп доступен только SYSTEM и администраторам"));
+                warnings.push(format!(
+                    "{e:#}; пайп доступен только SYSTEM и администраторам"
+                ));
                 None
             }
         };
-        let ipc = IpcMode::Pipe { name: tunnel_ipc::transport::DEFAULT_PIPE_NAME.into(), owner_sid };
+        let ipc = IpcMode::Pipe {
+            name: tunnel_ipc::transport::DEFAULT_PIPE_NAME.into(),
+            owner_sid,
+        };
         let opts = RunOpts::service(&dir, ipc);
         tunnel_winsvc::run_as_service(tunnel_winsvc::SERVICE_NAME, move |rx| {
             service_body(
@@ -330,7 +368,13 @@ where
 
 /// Параметры установки: служба — этот exe, трей — `tunnel-tray.exe` рядом
 /// (нет файла — без Run-ключа и ярлыка, с предупреждением).
-#[cfg_attr(not(windows), allow(dead_code, reason = "вызывается только из службы SCM (Windows); на других ОС — в тестах"))]
+#[cfg_attr(
+    not(windows),
+    allow(
+        dead_code,
+        reason = "вызывается только из службы SCM (Windows); на других ОС — в тестах"
+    )
+)]
 pub(crate) fn install_options(
     exe: &Path,
     appdata: Option<&Path>,
@@ -345,7 +389,10 @@ pub(crate) fn install_options(
     if let Some(tray) = &o.tray_exe
         && !tray.is_file()
     {
-        warnings.push(format!("нет {} — трей не будет автозапускаться", tray.display()));
+        warnings.push(format!(
+            "нет {} — трей не будет автозапускаться",
+            tray.display()
+        ));
         o.tray_exe = None;
         o.shortcut = None;
     }
@@ -364,10 +411,18 @@ pub fn install() -> Result<(), String> {
         println!(
             "служба {} {}; данные: {}; владелец: {}{}",
             opts.service_name,
-            if r.service_updated { "обновлена" } else { "установлена" },
+            if r.service_updated {
+                "обновлена"
+            } else {
+                "установлена"
+            },
             r.data_dir.display(),
             r.owner_sid,
-            if r.config_imported { "; client.json импортирован" } else { "" },
+            if r.config_imported {
+                "; client.json импортирован"
+            } else {
+                ""
+            },
         );
         for w in warnings {
             eprintln!("предупреждение: {w}");
@@ -382,14 +437,25 @@ pub fn install() -> Result<(), String> {
 
 /// `tunnel-daemon uninstall [--purge]`. `remove_adapter` — удаление
 /// Wintun-адаптера (его знает движок), вызывается после остановки службы.
-pub fn uninstall(purge: bool, remove_adapter: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+pub fn uninstall(
+    purge: bool,
+    remove_adapter: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
     #[cfg(windows)]
     {
         let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
         let opts = tunnel_winsvc::UninstallOptions::standard(purge, appdata.as_deref());
         tunnel_winsvc::uninstall(&opts, || remove_adapter().map_err(anyhow::Error::msg))
             .map_err(|e| format!("{e:#}"))?;
-        println!("служба {} удалена{}", opts.service_name, if purge { " вместе с данными" } else { "" });
+        println!(
+            "служба {} удалена{}",
+            opts.service_name,
+            if purge {
+                " вместе с данными"
+            } else {
+                ""
+            }
+        );
         Ok(())
     }
     #[cfg(not(windows))]
@@ -466,29 +532,51 @@ mod service_tests {
         let (tx, rx) = mpsc::channel();
         let opts = RunOpts::service(&dir, IpcMode::Unix);
         let body = std::thread::spawn(move || {
-            service_body(opts, crate::DaemonBackend::service, rx, || Err("нет".into()), Vec::new())
+            service_body(
+                opts,
+                crate::DaemonBackend::service,
+                rx,
+                || Err("нет".into()),
+                Vec::new(),
+            )
         });
         let t = Duration::from_secs(10);
         let t0 = Instant::now();
         let mut c = loop {
-            if let Ok(c) = IpcClient::connect(crate::server::socket_path(&dir), ClientKind::Cli, "test", t) {
+            if let Ok(c) =
+                IpcClient::connect(crate::server::socket_path(&dir), ClientKind::Cli, "test", t)
+            {
                 break c;
             }
-            assert!(t0.elapsed() < t && !body.is_finished(), "служба не подняла IPC");
+            assert!(
+                t0.elapsed() < t && !body.is_finished(),
+                "служба не подняла IPC"
+            );
             std::thread::sleep(Duration::from_millis(20));
         };
-        assert!(c.me()["my_code"].as_str().is_some_and(|s| !s.is_empty()), "identity создана");
+        assert!(
+            c.me()["my_code"].as_str().is_some_and(|s| !s.is_empty()),
+            "identity создана"
+        );
         let cfg = std::fs::read_to_string(dir.join("client.json")).unwrap();
         assert!(cfg.contains("ed_seed"));
         match c.request(serde_json::json!("RefreshList"), t).unwrap() {
             AckResult::Err(e) => assert_eq!(e, crate::engine_backend::NO_SERVER),
             r => panic!("ждали Err, пришло {r:?}"),
         }
-        assert_eq!(c.request(serde_json::json!({ "SetName": "svc" }), t).unwrap(), AckResult::Ok);
+        assert_eq!(
+            c.request(serde_json::json!({ "SetName": "svc" }), t)
+                .unwrap(),
+            AckResult::Ok
+        );
         tx.send(ServiceEvent::Resume).unwrap();
         tx.send(ServiceEvent::Stop).unwrap();
         assert_eq!(body.join().unwrap(), Ok(()));
-        assert!(std::fs::read_to_string(dir.join("client.json")).unwrap().contains("svc"));
+        assert!(
+            std::fs::read_to_string(dir.join("client.json"))
+                .unwrap()
+                .contains("svc")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -534,6 +622,9 @@ mod service_tests {
     fn windows_only_modes() {
         assert_eq!(install(), Err(ONLY_WINDOWS.into()));
         assert_eq!(uninstall(true, || Ok(())), Err(ONLY_WINDOWS.into()));
-        assert_eq!(run_service(None, |_e: ServiceEnv| NullBackend), Err(ONLY_WINDOWS.into()));
+        assert_eq!(
+            run_service(None, |_e: ServiceEnv| NullBackend),
+            Err(ONLY_WINDOWS.into())
+        );
     }
 }

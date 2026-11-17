@@ -410,8 +410,18 @@ pub fn windows_nrpt_remove() -> String {
 /// Linux (systemd-resolved): команды (argv) для интерфейса `ifname`.
 pub fn linux_resolvectl_setup(ifname: &str) -> Vec<Vec<String>> {
     vec![
-        vec!["resolvectl".into(), "dns".into(), ifname.into(), DNS_ADDR.to_string()],
-        vec!["resolvectl".into(), "domain".into(), ifname.into(), format!("~{DNS_SUFFIX}")],
+        vec![
+            "resolvectl".into(),
+            "dns".into(),
+            ifname.into(),
+            DNS_ADDR.to_string(),
+        ],
+        vec![
+            "resolvectl".into(),
+            "domain".into(),
+            ifname.into(),
+            format!("~{DNS_SUFFIX}"),
+        ],
     ]
 }
 
@@ -490,7 +500,9 @@ mod tests {
         acc += 17 + (p.len() - 20) as u32;
         acc = sum16(acc, &p[20..]);
         assert_eq!(fold(acc), 0, "UDP checksum");
-        Parsed { dns: p[28..].to_vec() }
+        Parsed {
+            dns: p[28..].to_vec(),
+        }
     }
 
     impl Parsed {
@@ -555,7 +567,10 @@ mod tests {
         assert_eq!(r.rcode(), RCODE_NOERROR);
         assert_eq!(r.answers(), vec![(TYPE_A, 30, vec![100, 66, 1, 2])]);
         // вопрос эхом в исходном регистре
-        assert_eq!(&r.dns[12..12 + qname("ALPHA.Work.VL").len()], &qname("ALPHA.Work.VL")[..]);
+        assert_eq!(
+            &r.dns[12..12 + qname("ALPHA.Work.VL").len()],
+            &qname("ALPHA.Work.VL")[..]
+        );
     }
 
     #[test]
@@ -595,7 +610,12 @@ mod tests {
 
     #[test]
     fn unknown_names_nxdomain() {
-        for name in ["alpha.other.vl", "alpha.com", "a.b.c.vl", "alpha.vl.example"] {
+        for name in [
+            "alpha.other.vl",
+            "alpha.com",
+            "a.b.c.vl",
+            "alpha.vl.example",
+        ] {
             let r = ask(name, TYPE_A);
             assert_eq!(r.rcode(), RCODE_NXDOMAIN, "{name}");
             assert_eq!(r.qd(), 1);
@@ -746,7 +766,10 @@ mod tests {
         let l = linux_resolvectl_setup("voidlink0");
         assert_eq!(l[0], ["resolvectl", "dns", "voidlink0", "100.66.0.53"]);
         assert_eq!(l[1], ["resolvectl", "domain", "voidlink0", "~vl"]);
-        assert_eq!(linux_resolvectl_revert("voidlink0"), ["resolvectl", "revert", "voidlink0"]);
+        assert_eq!(
+            linux_resolvectl_revert("voidlink0"),
+            ["resolvectl", "revert", "voidlink0"]
+        );
         assert!(macos_resolver_content().contains("nameserver 100.66.0.53\n"));
         assert_eq!(MACOS_RESOLVER_PATH, "/etc/resolver/vl");
     }

@@ -7,12 +7,14 @@ use std::ptr::null_mut;
 use std::time::Instant;
 
 use tauri_winrt_notification::Toast;
-use tray_icon::menu::{CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
+use tray_icon::menu::{
+    CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu,
+};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, KillTimer, MB_ICONERROR, MB_OK, MSG, MessageBoxW, PostQuitMessage,
-    SW_HIDE, SetTimer, TranslateMessage, WM_TIMER,
+    DispatchMessageW, GetMessageW, KillTimer, MB_ICONERROR, MB_OK, MSG, MessageBoxW,
+    PostQuitMessage, SW_HIDE, SetTimer, TranslateMessage, WM_TIMER,
 };
 
 use crate::backend::TrayBackend;
@@ -141,7 +143,9 @@ impl<'a> Ui<'a> {
         let mut any = false;
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
             any = true;
-            let Some(a) = Action::from_id(ev.id().as_ref()) else { continue };
+            let Some(a) = Action::from_id(ev.id().as_ref()) else {
+                continue;
+            };
             self.notifier.on_action(a);
             if matches!(a, Action::ToggleGroup { .. }) {
                 // muda сам переключил галочку CheckMenuItem по клику; если демон
@@ -183,7 +187,8 @@ impl<'a> Ui<'a> {
 }
 
 fn make_icon(c: IconColor) -> Result<Icon, String> {
-    Icon::from_rgba(model::icon_rgba(c), model::ICON_SIZE, model::ICON_SIZE).map_err(|e| format!("иконка: {e}"))
+    Icon::from_rgba(model::icon_rgba(c), model::ICON_SIZE, model::ICON_SIZE)
+        .map_err(|e| format!("иконка: {e}"))
 }
 
 /// `&` в Win32-меню — мнемоника; в именах групп экранируем.
@@ -196,15 +201,35 @@ fn build_items(entries: &[MenuEntry]) -> Vec<Box<dyn IsMenuItem>> {
         .iter()
         .map(|e| -> Box<dyn IsMenuItem> {
             match e {
-                MenuEntry::Item { action, label, enabled } => {
-                    Box::new(MenuItem::with_id(action.to_id(), esc(label), *enabled, None))
-                }
-                MenuEntry::Check { action, label, checked, enabled } => {
-                    Box::new(CheckMenuItem::with_id(action.to_id(), esc(label), *enabled, *checked, None))
-                }
+                MenuEntry::Item {
+                    action,
+                    label,
+                    enabled,
+                } => Box::new(MenuItem::with_id(
+                    action.to_id(),
+                    esc(label),
+                    *enabled,
+                    None,
+                )),
+                MenuEntry::Check {
+                    action,
+                    label,
+                    checked,
+                    enabled,
+                } => Box::new(CheckMenuItem::with_id(
+                    action.to_id(),
+                    esc(label),
+                    *enabled,
+                    *checked,
+                    None,
+                )),
                 MenuEntry::Label(text) => Box::new(MenuItem::new(esc(text), false, None)),
                 MenuEntry::Separator => Box::new(PredefinedMenuItem::separator()),
-                MenuEntry::Submenu { label, enabled, items } => {
+                MenuEntry::Submenu {
+                    label,
+                    enabled,
+                    items,
+                } => {
                     let sub = Submenu::new(esc(label), *enabled);
                     for it in build_items(items) {
                         let _ = sub.append(it.as_ref());
@@ -249,14 +274,31 @@ fn open_tui() -> std::io::Result<()> {
     let exe = client_exe();
     match Command::new("wt.exe").arg(&exe).arg("tui").spawn() {
         Ok(_) => Ok(()),
-        Err(_) => Command::new("conhost.exe").arg(&exe).arg("tui").spawn().map(|_| ()),
+        Err(_) => Command::new("conhost.exe")
+            .arg(&exe)
+            .arg("tui")
+            .spawn()
+            .map(|_| ()),
     }
 }
 
 /// «Остановить туннель»: `sc stop` от администратора через UAC.
 fn stop_service() {
-    let (verb, file, args) = (wide("runas"), wide("sc.exe"), wide(&format!("stop {SERVICE_NAME}")));
-    let r = unsafe { ShellExecuteW(null_mut(), verb.as_ptr(), file.as_ptr(), args.as_ptr(), std::ptr::null(), SW_HIDE) };
+    let (verb, file, args) = (
+        wide("runas"),
+        wide("sc.exe"),
+        wide(&format!("stop {SERVICE_NAME}")),
+    );
+    let r = unsafe {
+        ShellExecuteW(
+            null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            args.as_ptr(),
+            std::ptr::null(),
+            SW_HIDE,
+        )
+    };
     // ShellExecuteW: значение <= 32 — ошибка (в т.ч. отказ в UAC).
     if (r as isize) <= 32 {
         error_box("Не удалось остановить службу (нужны права администратора)");

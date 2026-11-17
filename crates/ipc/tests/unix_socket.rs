@@ -59,9 +59,19 @@ fn hello_req_ack_roundtrip() {
             panic!("ждали Req");
         };
         assert_eq!(cmd, json!({"SetName": "вася"}));
-        write_msg(&mut w, &DaemonMsg::Ack { id, result: AckResult::Ok }).unwrap();
+        write_msg(
+            &mut w,
+            &DaemonMsg::Ack {
+                id,
+                result: AckResult::Ok,
+            },
+        )
+        .unwrap();
         assert_eq!(read_msg::<_, ClientMsg>(&mut c).unwrap(), ClientMsg::Bye);
-        assert!(matches!(read_msg::<_, ClientMsg>(&mut c), Err(CodecError::Closed)));
+        assert!(matches!(
+            read_msg::<_, ClientMsg>(&mut c),
+            Err(CodecError::Closed)
+        ));
         l
     });
 
@@ -71,10 +81,20 @@ fn hello_req_ack_roundtrip() {
         panic!("ждали Welcome");
     };
     assert_eq!(me["my_code"], "ABC");
-    write_msg(&mut c, &ClientMsg::Req { id: 42, cmd: json!({"SetName": "вася"}) }).unwrap();
+    write_msg(
+        &mut c,
+        &ClientMsg::Req {
+            id: 42,
+            cmd: json!({"SetName": "вася"}),
+        },
+    )
+    .unwrap();
     assert_eq!(
         read_msg::<_, DaemonMsg>(&mut c).unwrap(),
-        DaemonMsg::Ack { id: 42, result: AckResult::Ok }
+        DaemonMsg::Ack {
+            id: 42,
+            result: AckResult::Ok
+        }
     );
     write_msg(&mut c, &ClientMsg::Bye).unwrap();
     drop(c);
@@ -101,7 +121,10 @@ fn server_reads(raw: Vec<u8>) -> Result<ClientMsg, CodecError> {
 
 #[test]
 fn bad_length_zero() {
-    assert!(matches!(server_reads(vec![0, 0, 0, 0]), Err(CodecError::BadLength)));
+    assert!(matches!(
+        server_reads(vec![0, 0, 0, 0]),
+        Err(CodecError::BadLength)
+    ));
 }
 
 #[test]
@@ -156,7 +179,12 @@ fn stale_socket_cleanup() {
     {
         let _ul = std::os::unix::net::UnixListener::bind(&stale).unwrap();
     }
-    assert!(std::fs::symlink_metadata(&stale).unwrap().file_type().is_socket());
+    assert!(
+        std::fs::symlink_metadata(&stale)
+            .unwrap()
+            .file_type()
+            .is_socket()
+    );
     assert!(cleanup_stale(&stale).unwrap());
     assert!(!stale.exists());
     assert!(!cleanup_stale(&stale).unwrap());

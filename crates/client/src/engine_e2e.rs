@@ -73,7 +73,14 @@ impl Node {
         save: Arc<dyn Fn(&Config) + Send + Sync>,
     ) -> anyhow::Result<Node> {
         let tun = Arc::new(TestTun::default());
-        let eng = engine::start_with_tun(Arc::new(Mutex::new(cfg)), addr, server_pub, identity, tun.clone(), save)?;
+        let eng = engine::start_with_tun(
+            Arc::new(Mutex::new(cfg)),
+            addr,
+            server_pub,
+            identity,
+            tun.clone(),
+            save,
+        )?;
         Ok(Node {
             eng,
             tun,
@@ -83,8 +90,16 @@ impl Node {
 
     /// Создаёт группу и ждёт GroupJoined: gid.
     fn create(&mut self, name: &str, private: bool) -> u32 {
-        self.eng.cmds.send(Cmd::Create { name: name.into(), private }).unwrap();
-        match self.wait("группа создана", T, |e| matches!(e, Event::GroupJoined { .. })) {
+        self.eng
+            .cmds
+            .send(Cmd::Create {
+                name: name.into(),
+                private,
+            })
+            .unwrap();
+        match self.wait("группа создана", T, |e| {
+            matches!(e, Event::GroupJoined { .. })
+        }) {
             Event::GroupJoined { gid, .. } => gid,
             _ => unreachable!(),
         }
@@ -92,7 +107,11 @@ impl Node {
 
     fn join(&mut self, gid: u32) {
         self.eng.cmds.send(Cmd::Join(gid)).unwrap();
-        self.wait("вход в группу", T, |e| matches!(e, Event::GroupJoined { gid: g, .. } if *g == gid));
+        self.wait(
+            "вход в группу",
+            T,
+            |e| matches!(e, Event::GroupJoined { gid: g, .. } if *g == gid),
+        );
     }
 
     /// Адрес UDP-сокета движка, как его видят пиры на localhost.
@@ -101,24 +120,39 @@ impl Node {
     }
 
     fn epoch(&self, gid: u32) -> u32 {
-        self.eng.groups.lock().unwrap().get(&gid).map(|g| g.epoch).unwrap_or(0)
+        self.eng
+            .groups
+            .lock()
+            .unwrap()
+            .get(&gid)
+            .map(|g| g.epoch)
+            .unwrap_or(0)
     }
 
     /// Сколько раз пакет попал в TUN.
     fn got(&self, pkt: &[u8]) -> usize {
-        self.tun.injected.lock().unwrap().iter().filter(|p| p.as_slice() == pkt).count()
+        self.tun
+            .injected
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.as_slice() == pkt)
+            .count()
     }
 
     /// Все участники группы, кроме нас, онлайн и их `n`.
     fn sees_online(&self, gid: u32, n: usize) -> bool {
         let g = self.eng.groups.lock().unwrap();
-        g.get(&gid).is_some_and(|gs| gs.members.len() == n && gs.members.values().all(|p| p.online))
+        g.get(&gid)
+            .is_some_and(|gs| gs.members.len() == n && gs.members.values().all(|p| p.online))
     }
 
     /// Прямой канал с пиром `ip` поднят.
     fn direct_to(&self, gid: u32, ip: u32) -> bool {
         let g = self.eng.groups.lock().unwrap();
-        g.get(&gid).and_then(|gs| gs.members.get(&ip)).is_some_and(|p| p.direct())
+        g.get(&gid)
+            .and_then(|gs| gs.members.get(&ip))
+            .is_some_and(|p| p.direct())
     }
 
     fn owner(&self, gid: u32) -> Option<[u8; 32]> {
@@ -136,7 +170,11 @@ impl Node {
         let end = Instant::now() + timeout;
         loop {
             let left = end.saturating_duration_since(Instant::now());
-            match self.eng.events.recv_timeout(left.min(Duration::from_millis(100))) {
+            match self
+                .eng
+                .events
+                .recv_timeout(left.min(Duration::from_millis(100)))
+            {
                 Ok(ev) => {
                     self.seen.push(ev.clone());
                     if pred(&ev) {
@@ -197,10 +235,21 @@ fn temp_dir(tag: &str) -> PathBuf {
 
 fn start_server(dir: &std::path::Path, port: u16) -> tunnel_server::Server {
     // Тесты окон приглашений создают 20 групп одним владельцем.
-    start_server_with(dir, port, tunnel_server::Limits { max_owned_groups: 64, ..Default::default() })
+    start_server_with(
+        dir,
+        port,
+        tunnel_server::Limits {
+            max_owned_groups: 64,
+            ..Default::default()
+        },
+    )
 }
 
-fn start_server_with(dir: &std::path::Path, port: u16, limits: tunnel_server::Limits) -> tunnel_server::Server {
+fn start_server_with(
+    dir: &std::path::Path,
+    port: u16,
+    limits: tunnel_server::Limits,
+) -> tunnel_server::Server {
     tunnel_server::Server::start(tunnel_server::Config {
         listen: SocketAddr::from(([127, 0, 0, 1], port)),
         data_dir: dir.to_path_buf(),
@@ -285,7 +334,8 @@ struct LossyProxy {
 impl LossyProxy {
     fn start(server: SocketAddr, mut drop_rule: DropRule) -> LossyProxy {
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
-        sock.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
         let addr = sock.local_addr().unwrap();
         let sent = Arc::new(Mutex::new(HashMap::new()));
         let tap: Tap = Arc::default();
@@ -302,7 +352,9 @@ impl LossyProxy {
             // ответы сервера ушли бы пиру.
             let mut client: Option<SocketAddr> = None;
             while !stop2.load(Ordering::Relaxed) {
-                let Ok((n, src)) = rx.recv_from(&mut buf) else { continue };
+                let Ok((n, src)) = rx.recv_from(&mut buf) else {
+                    continue;
+                };
                 let to_server = src != server;
                 if to_server {
                     if client.is_some_and(|c| c != src) {
@@ -341,7 +393,17 @@ impl LossyProxy {
                 }
             }
         });
-        LossyProxy { addr, server, sock, sent, tap, hold, client: client_at, stop, thread: Some(thread) }
+        LossyProxy {
+            addr,
+            server,
+            sock,
+            sent,
+            tap,
+            hold,
+            client: client_at,
+            stop,
+            thread: Some(thread),
+        }
     }
 
     /// Сколько фреймов типа `typ` клиент отправил серверу.
@@ -355,7 +417,9 @@ impl LossyProxy {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(to_server, d)| *to_server && proto::split_frame(d).is_ok_and(|(t, _)| t == typ))
+            .filter(|(to_server, d)| {
+                *to_server && proto::split_frame(d).is_ok_and(|(t, _)| t == typ)
+            })
             .map(|(_, d)| d.clone())
             .collect()
     }
@@ -435,23 +499,48 @@ fn e2e_группа_прямой_канал_без_спама_выход_кик_
 
     let mut a = Node::start("alpha", &server);
     let mut b = Node::start("bravo", &server);
-    a.wait("A подключён", T, |e| matches!(e, Event::Connected(_)));
-    b.wait("B подключён", T, |e| matches!(e, Event::Connected(_)));
+    a.wait("A подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    b.wait("B подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
 
     // A создаёт группу, B входит.
-    a.eng.cmds.send(Cmd::Create { name: "game".into(), private: false }).unwrap();
-    let gid = match a.wait("A создал группу", T, |e| matches!(e, Event::GroupJoined { .. })) {
+    a.eng
+        .cmds
+        .send(Cmd::Create {
+            name: "game".into(),
+            private: false,
+        })
+        .unwrap();
+    let gid = match a.wait("A создал группу", T, |e| {
+        matches!(e, Event::GroupJoined { .. })
+    }) {
         Event::GroupJoined { gid, .. } => gid,
         _ => unreachable!(),
     };
     b.eng.cmds.send(Cmd::Join(gid)).unwrap();
-    b.wait("B вошёл", T, |e| matches!(e, Event::GroupJoined { gid: g, .. } if *g == gid));
-    a.wait("A видит B онлайн", T, |e| matches!(e, Event::PeerOnline { .. }));
-    assert!(a.tun.addrs.lock().unwrap().contains(&a.my_ip(gid)), "адрес группы назначен");
+    b.wait(
+        "B вошёл",
+        T,
+        |e| matches!(e, Event::GroupJoined { gid: g, .. } if *g == gid),
+    );
+    a.wait("A видит B онлайн", T, |e| {
+        matches!(e, Event::PeerOnline { .. })
+    });
+    assert!(
+        a.tun.addrs.lock().unwrap().contains(&a.my_ip(gid)),
+        "адрес группы назначен"
+    );
 
     // Прямой канал (localhost: PUNCH доходит сразу).
-    a.wait("A: прямой канал", T, |e| matches!(e, Event::Direct { .. }));
-    b.wait("B: прямой канал", T, |e| matches!(e, Event::Direct { .. }));
+    a.wait("A: прямой канал", T, |e| {
+        matches!(e, Event::Direct { .. })
+    });
+    b.wait("B: прямой канал", T, |e| {
+        matches!(e, Event::Direct { .. })
+    });
 
     // Данные A → B доходят до TUN B.
     let pkt = ipv4(a.my_ip(gid), b.my_ip(gid), b"hello");
@@ -468,9 +557,17 @@ fn e2e_группа_прямой_канал_без_спама_выход_кик_
     std::thread::sleep(Duration::from_secs(6));
     let rate_a = (a.tx_pkts() - a0) as f64 / 6.0;
     let rate_b = (b.tx_pkts() - b0) as f64 / 6.0;
-    assert!(rate_a < 5.0 && rate_b < 5.0, "спам пакетами: A {rate_a:.1}/с, B {rate_b:.1}/с");
+    assert!(
+        rate_a < 5.0 && rate_b < 5.0,
+        "спам пакетами: A {rate_a:.1}/с, B {rate_b:.1}/с"
+    );
     // RTT меряется.
-    let rtt = a.eng.groups.lock().unwrap()[&gid].members.values().next().unwrap().rtt_ms;
+    let rtt = a.eng.groups.lock().unwrap()[&gid]
+        .members
+        .values()
+        .next()
+        .unwrap()
+        .rtt_ms;
     assert!(rtt.is_some(), "нет RTT");
 
     // Выход: группа пропадает и не возвращается.
@@ -487,10 +584,18 @@ fn e2e_группа_прямой_канал_без_спама_выход_кик_
 
     // Кик: B снова входит, A исключает.
     b.eng.cmds.send(Cmd::Join(gid)).unwrap();
-    b.wait("B вошёл снова", T, |e| matches!(e, Event::GroupJoined { gid: g, .. } if *g == gid));
+    b.wait(
+        "B вошёл снова",
+        T,
+        |e| matches!(e, Event::GroupJoined { gid: g, .. } if *g == gid),
+    );
     let b_pub = b.eng.my_pub;
     a.eng.cmds.send(Cmd::Kick(gid, b_pub)).unwrap();
-    b.wait("B кикнут", T, |e| matches!(e, Event::Kicked { gid: g, .. } if *g == gid));
+    b.wait(
+        "B кикнут",
+        T,
+        |e| matches!(e, Event::Kicked { gid: g, .. } if *g == gid),
+    );
     assert!(!b.has_group(gid));
 
     // Рестарт сервера на том же порту и с теми же данными: клиенты
@@ -499,12 +604,23 @@ fn e2e_группа_прямой_канал_без_спама_выход_кик_
     a.drain();
     let server = start_server(&dir, port);
     let t0 = Instant::now();
-    a.wait("A переподключился", Duration::from_secs(15), |e| matches!(e, Event::Connected(_)));
-    assert!(t0.elapsed() < Duration::from_secs(12), "переподключение заняло {:?}", t0.elapsed());
+    a.wait(
+        "A переподключился",
+        Duration::from_secs(15),
+        |e| matches!(e, Event::Connected(_)),
+    );
+    assert!(
+        t0.elapsed() < Duration::from_secs(12),
+        "переподключение заняло {:?}",
+        t0.elapsed()
+    );
     // Группа восстановилась из автовхода.
     let end = Instant::now() + T;
     while !a.has_group(gid) {
-        assert!(Instant::now() < end, "A не вернулся в группу после рестарта");
+        assert!(
+            Instant::now() < end,
+            "A не вернулся в группу после рестарта"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
     drop(a);
@@ -518,9 +634,19 @@ fn e2e_приглашение_офлайн_цели_и_отказ() {
     let dir = temp_dir("invite");
     let server = start_server(&dir, 0);
     let mut a = Node::start("alpha", &server);
-    a.wait("A подключён", T, |e| matches!(e, Event::Connected(_)));
-    a.eng.cmds.send(Cmd::Create { name: "secret".into(), private: true }).unwrap();
-    let gid = match a.wait("A создал группу", T, |e| matches!(e, Event::GroupJoined { .. })) {
+    a.wait("A подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    a.eng
+        .cmds
+        .send(Cmd::Create {
+            name: "secret".into(),
+            private: true,
+        })
+        .unwrap();
+    let gid = match a.wait("A создал группу", T, |e| {
+        matches!(e, Event::GroupJoined { .. })
+    }) {
         Event::GroupJoined { gid, .. } => gid,
         _ => unreachable!(),
     };
@@ -550,14 +676,18 @@ fn e2e_приглашение_офлайн_цели_и_отказ() {
             if *g == gid && *by_pubkey == b_pub && by_name == "bravo" && group_name == "secret")
     });
     // Отказавшему сервер отвечает свежим списком — уже без этого gid.
-    b.wait("B: отказ подтверждён списком", T, |e| {
-        matches!(e, Event::InvitesSynced { gids, from: 0, complete: true } if gids.is_empty())
-    });
+    b.wait(
+        "B: отказ подтверждён списком",
+        T,
+        |e| matches!(e, Event::InvitesSynced { gids, from: 0, complete: true } if gids.is_empty()),
+    );
     // После отказа в приватную группу не войти.
     b.eng.cmds.send(Cmd::Join(gid)).unwrap();
-    b.wait("B: вход без приглашения отклонён", T, |e| {
-        matches!(e, Event::Error(t) if t.contains("приглашение"))
-    });
+    b.wait(
+        "B: вход без приглашения отклонён",
+        T,
+        |e| matches!(e, Event::Error(t) if t.contains("приглашение")),
+    );
     assert!(!b.has_group(gid));
 
     drop(a);
@@ -571,13 +701,23 @@ fn e2e_больше_16_приглашений_движок_дочитывает_
     let dir = temp_dir("invite-pages");
     let server = start_server(&dir, 0);
     let mut a = Node::start("alpha", &server);
-    a.wait("A подключён", T, |e| matches!(e, Event::Connected(_)));
+    a.wait("A подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
     let b_id = proto::Identity::generate();
     let b_pub = b_id.ed_pub();
     let mut gids = HashSet::new();
     for i in 0..20 {
-        a.eng.cmds.send(Cmd::Create { name: format!("g{i}"), private: true }).unwrap();
-        let gid = match a.wait("A создал группу", T, |e| matches!(e, Event::GroupJoined { .. })) {
+        a.eng
+            .cmds
+            .send(Cmd::Create {
+                name: format!("g{i}"),
+                private: true,
+            })
+            .unwrap();
+        let gid = match a.wait("A создал группу", T, |e| {
+            matches!(e, Event::GroupJoined { .. })
+        }) {
             Event::GroupJoined { gid, .. } => gid,
             _ => unreachable!(),
         };
@@ -589,9 +729,11 @@ fn e2e_больше_16_приглашений_движок_дочитывает_
     // После HELLO сервер шлёт первые 16 — движок сам дочитывает остальное
     // (LIST_INVITES), без ответа на приглашения.
     let mut b = Node::start_as("bravo", &server, b_id.clone());
-    b.wait("B: последнее окно списка", T, |e| {
-        matches!(e, Event::InvitesSynced { from, complete: true, .. } if *from > 0)
-    });
+    b.wait(
+        "B: последнее окно списка",
+        T,
+        |e| matches!(e, Event::InvitesSynced { from, complete: true, .. } if *from > 0),
+    );
     let got: HashSet<u32> = b
         .seen
         .iter()
@@ -607,16 +749,23 @@ fn e2e_больше_16_приглашений_движок_дочитывает_
     // окно с самого gid говорит, есть ли приглашение.
     let mut sorted: Vec<u32> = gids.iter().copied().collect();
     sorted.sort();
-    let conn =
-        engine::CtrlConn::connect(&Config::default(), local(server.addr), &server.pubkey, &b_id)
-            .unwrap();
+    let conn = engine::CtrlConn::connect(
+        &Config::default(),
+        local(server.addr),
+        &server.pubkey,
+        &b_id,
+    )
+    .unwrap();
     let first = conn.invite_list().unwrap().expect("окно после HELLO");
     assert_eq!(first.items.len(), 16);
     assert!(!first.complete && !first.covers(sorted[19]) && !first.covers(250));
     let page = conn.invite_page(sorted[19]).unwrap().expect("окно с gid");
     assert!(page.covers(sorted[19]) && page.items.iter().any(|i| i.gid == sorted[19]));
     let none = conn.invite_page(250).unwrap().expect("окно с gid");
-    assert!(none.covers(250) && none.items.is_empty(), "приглашения в 250 нет");
+    assert!(
+        none.covers(250) && none.items.is_empty(),
+        "приглашения в 250 нет"
+    );
 
     drop(a);
     server.stop();
@@ -628,13 +777,23 @@ fn e2e_потерянные_окна_приглашений_движок_зап�
     let dir = temp_dir("invite-loss");
     let server = start_server(&dir, 0);
     let mut a = Node::start("alpha", &server);
-    a.wait("A подключён", T, |e| matches!(e, Event::Connected(_)));
+    a.wait("A подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
     let b_id = proto::Identity::generate();
     let b_pub = b_id.ed_pub();
     let mut gids = HashSet::new();
     for i in 0..20 {
-        a.eng.cmds.send(Cmd::Create { name: format!("g{i}"), private: true }).unwrap();
-        let gid = match a.wait("A создал группу", T, |e| matches!(e, Event::GroupJoined { .. })) {
+        a.eng
+            .cmds
+            .send(Cmd::Create {
+                name: format!("g{i}"),
+                private: true,
+            })
+            .unwrap();
+        let gid = match a.wait("A создал группу", T, |e| {
+            matches!(e, Event::GroupJoined { .. })
+        }) {
             Event::GroupJoined { gid, .. } => gid,
             _ => unreachable!(),
         };
@@ -658,9 +817,11 @@ fn e2e_потерянные_окна_приглашений_движок_зап�
         }),
     );
     let mut b = Node::start_via("bravo", proxy.addr, server.pubkey, b_id);
-    b.wait("B: последнее окно списка", Duration::from_secs(25), |e| {
-        matches!(e, Event::InvitesSynced { from, complete: true, .. } if *from > 0)
-    });
+    b.wait(
+        "B: последнее окно списка",
+        Duration::from_secs(25),
+        |e| matches!(e, Event::InvitesSynced { from, complete: true, .. } if *from > 0),
+    );
     let got: HashSet<u32> = b
         .seen
         .iter()
@@ -670,7 +831,10 @@ fn e2e_потерянные_окна_приглашений_движок_зап�
         })
         .collect();
     assert_eq!(got, gids, "показаны все 20 приглашений");
-    assert!(proxy.sent(ctrl::LIST_INVITES) >= 3, "окно и страница перезапрошены");
+    assert!(
+        proxy.sent(ctrl::LIST_INVITES) >= 3,
+        "окно и страница перезапрошены"
+    );
 
     drop(a);
     drop(b);
@@ -684,9 +848,19 @@ fn e2e_потерянный_отказ_от_приглашения_повтор�
     let dir = temp_dir("decline-loss");
     let server = start_server(&dir, 0);
     let mut a = Node::start("alpha", &server);
-    a.wait("A подключён", T, |e| matches!(e, Event::Connected(_)));
-    a.eng.cmds.send(Cmd::Create { name: "secret".into(), private: true }).unwrap();
-    let gid = match a.wait("A создал группу", T, |e| matches!(e, Event::GroupJoined { .. })) {
+    a.wait("A подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    a.eng
+        .cmds
+        .send(Cmd::Create {
+            name: "secret".into(),
+            private: true,
+        })
+        .unwrap();
+    let gid = match a.wait("A создал группу", T, |e| {
+        matches!(e, Event::GroupJoined { .. })
+    }) {
         Event::GroupJoined { gid, .. } => gid,
         _ => unreachable!(),
     };
@@ -703,17 +877,27 @@ fn e2e_потерянный_отказ_от_приглашения_повтор�
         }),
     );
     let mut b = Node::start_via("bravo", proxy.addr, server.pubkey, b_id);
-    b.wait("B получил приглашение", T, |e| matches!(e, Event::Invite { gid: g, .. } if *g == gid));
+    b.wait(
+        "B получил приглашение",
+        T,
+        |e| matches!(e, Event::Invite { gid: g, .. } if *g == gid),
+    );
     b.eng.cmds.send(Cmd::DeclineInvite(gid)).unwrap();
     a.wait("A: приглашение отклонено (повтором)", T, |e| {
         matches!(e, Event::InviteDeclined { gid: g, by_pubkey, .. } if *g == gid && *by_pubkey == b_pub)
     });
-    b.wait("B: отказ подтверждён списком", T, |e| {
-        matches!(e, Event::InvitesSynced { gids, complete: true, .. } if !gids.contains(&gid))
-    });
+    b.wait(
+        "B: отказ подтверждён списком",
+        T,
+        |e| matches!(e, Event::InvitesSynced { gids, complete: true, .. } if !gids.contains(&gid)),
+    );
     // Подтверждённый отказ больше не повторяется.
     std::thread::sleep(Duration::from_millis(2500));
-    assert_eq!(proxy.sent(ctrl::DECLINE_INVITE), 2, "один потерянный + один повтор");
+    assert_eq!(
+        proxy.sent(ctrl::DECLINE_INVITE),
+        2,
+        "один потерянный + один повтор"
+    );
 
     drop(a);
     drop(b);
@@ -731,7 +915,12 @@ fn e2e_сервер_не_релеит_чужим_и_шлёт_reset() {
     // Посторонний сокет без сессии: групповой фрейм не релеится, в ответ RESET.
     let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-    let h = proto::GroupHeader { gid: 1, src: 0x6442_0102, dst: 0x6442_0103, epoch: 0 };
+    let h = proto::GroupHeader {
+        gid: 1,
+        src: 0x6442_0102,
+        dst: 0x6442_0103,
+        epoch: 0,
+    };
     let frame = proto::seal_group(&[1; 32], proto::grp::DATA, &h, 0, b"x");
     sock.send_to(&frame, srv).unwrap();
     let mut buf = [0u8; 1500];
@@ -746,7 +935,9 @@ fn e2e_сервер_не_релеит_чужим_и_шлёт_reset() {
         let _ = sock.send_to(&vec![0xAB; len], srv);
     }
     let mut c = Node::start("charlie", &server);
-    c.wait("подключение после мусора", T, |e| matches!(e, Event::Connected(_)));
+    c.wait("подключение после мусора", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
     drop(c);
     server.stop();
     let _ = std::fs::remove_dir_all(&dir);
@@ -765,8 +956,15 @@ fn e2e_битый_server_json_не_затирается() {
         quiet: true,
         ..Default::default()
     });
-    assert!(r.is_err(), "сервер не должен стартовать с битым server.json");
-    assert_eq!(std::fs::read(&path).unwrap(), b"{ not json", "файл не тронут");
+    assert!(
+        r.is_err(),
+        "сервер не должен стартовать с битым server.json"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"{ not json",
+        "файл не тронут"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -779,18 +977,36 @@ fn e2e_ротация_бан_админ_разбан_и_смена_сервер�
 
     let mut a = Node::start("alpha", &server);
     let mut b = Node::start("bravo", &server);
-    a.wait("A подключён", T, |e| matches!(e, Event::Connected(_)));
-    b.wait("B подключён", T, |e| matches!(e, Event::Connected(_)));
-    a.eng.cmds.send(Cmd::Create { name: "lan".into(), private: false }).unwrap();
-    let gid = match a.wait("A создал группу", T, |e| matches!(e, Event::GroupJoined { .. })) {
+    a.wait("A подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    b.wait("B подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    a.eng
+        .cmds
+        .send(Cmd::Create {
+            name: "lan".into(),
+            private: false,
+        })
+        .unwrap();
+    let gid = match a.wait("A создал группу", T, |e| {
+        matches!(e, Event::GroupJoined { .. })
+    }) {
         Event::GroupJoined { gid, .. } => gid,
         _ => unreachable!(),
     };
     // Вход B ротирует ключ: A получает его дельтой, B — в GROUP_STATE.
     let epoch0 = a.eng.groups.lock().unwrap()[&gid].epoch;
     b.eng.cmds.send(Cmd::Join(gid)).unwrap();
-    b.wait("B вошёл", T, |e| matches!(e, Event::GroupJoined { gid: g, .. } if *g == gid));
-    a.wait("A видит B онлайн", T, |e| matches!(e, Event::PeerOnline { .. }));
+    b.wait(
+        "B вошёл",
+        T,
+        |e| matches!(e, Event::GroupJoined { gid: g, .. } if *g == gid),
+    );
+    a.wait("A видит B онлайн", T, |e| {
+        matches!(e, Event::PeerOnline { .. })
+    });
     let end = Instant::now() + T;
     while a.eng.groups.lock().unwrap()[&gid].epoch == epoch0 {
         assert!(Instant::now() < end, "ключ не ротирован после входа");
@@ -811,7 +1027,11 @@ fn e2e_ротация_бан_админ_разбан_и_смена_сервер�
     // Бан: B получает KICKED с banned, A видит бан в ADMIN_INFO.
     let b_pub = b.eng.my_pub;
     a.eng.cmds.send(Cmd::Ban(gid, b_pub)).unwrap();
-    b.wait("B забанен", T, |e| matches!(e, Event::Kicked { gid: g, banned: true, .. } if *g == gid));
+    b.wait(
+        "B забанен",
+        T,
+        |e| matches!(e, Event::Kicked { gid: g, banned: true, .. } if *g == gid),
+    );
     assert!(!b.has_group(gid));
     a.eng.cmds.send(Cmd::GroupAdmin(gid)).unwrap();
     a.wait("A: бан в списке", T, |e| {
@@ -820,27 +1040,55 @@ fn e2e_ротация_бан_админ_разбан_и_смена_сервер�
     a.eng.cmds.send(Cmd::Unban(gid, b_pub)).unwrap();
     std::thread::sleep(Duration::from_millis(300));
     a.eng.cmds.send(Cmd::GroupAdmin(gid)).unwrap();
-    a.wait("A: бан снят", T, |e| matches!(e, Event::AdminInfo { gid: g, bans, .. } if *g == gid && bans.is_empty()));
+    a.wait(
+        "A: бан снят",
+        T,
+        |e| matches!(e, Event::AdminInfo { gid: g, bans, .. } if *g == gid && bans.is_empty()),
+    );
     b.eng.cmds.send(Cmd::Join(gid)).unwrap();
-    b.wait("B вошёл после разбана", T, |e| matches!(e, Event::GroupJoined { gid: g, .. } if *g == gid));
+    b.wait(
+        "B вошёл после разбана",
+        T,
+        |e| matches!(e, Event::GroupJoined { gid: g, .. } if *g == gid),
+    );
 
     // Смена сервера без перезапуска: группы прежнего забыты, рукопожатие с новым.
     let addr2 = local(server2.addr);
     b.eng
         .cmds
-        .send(Cmd::SwitchServer { addr: addr2, pubkey: server2.pubkey, label: "two".into() })
+        .send(Cmd::SwitchServer {
+            addr: addr2,
+            pubkey: server2.pubkey,
+            label: "two".into(),
+        })
         .unwrap();
-    b.wait("B забыл группу", T, |e| matches!(e, Event::GroupLeft { gid: g, .. } if *g == gid));
-    b.wait("B переключён", T, |e| matches!(e, Event::ServerSwitched { addr, .. } if *addr == addr2));
-    b.wait("B подключён к новому", T, |e| matches!(e, Event::Connected(s) if *s == addr2));
+    b.wait(
+        "B забыл группу",
+        T,
+        |e| matches!(e, Event::GroupLeft { gid: g, .. } if *g == gid),
+    );
+    b.wait(
+        "B переключён",
+        T,
+        |e| matches!(e, Event::ServerSwitched { addr, .. } if *addr == addr2),
+    );
+    b.wait(
+        "B подключён к новому",
+        T,
+        |e| matches!(e, Event::Connected(s) if *s == addr2),
+    );
     assert!(!b.has_group(gid));
     assert_eq!(b.eng.meta.lock().unwrap().server_label, "two");
     let gid2 = b.create("other", false);
     // Туннель на новом сервере работает: тот же сокет и адаптер.
     let mut e = Node::start("echo", &server2);
-    e.wait("E подключён", T, |e| matches!(e, Event::Connected(_)));
+    e.wait("E подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
     e.join(gid2);
-    wait_until("B и E видят друг друга", T, || b.sees_online(gid2, 1) && e.sees_online(gid2, 1));
+    wait_until("B и E видят друг друга", T, || {
+        b.sees_online(gid2, 1) && e.sees_online(gid2, 1)
+    });
     deliver(&b, &e, gid2, "switched-be", T);
     deliver(&e, &b, gid2, "switched-eb", T);
     // gid у серверов свои (здесь совпадают): у B только группа нового.
@@ -866,7 +1114,9 @@ fn three_in_group(server: &tunnel_server::Server, private: bool) -> (Node, Node,
     let mut b = Node::start("bravo", server);
     let mut c = Node::start("charlie", server);
     for n in [&mut a, &mut b, &mut c] {
-        n.wait("подключён", T, |e| matches!(e, Event::Connected(_)));
+        n.wait("подключён", T, |e| {
+            matches!(e, Event::Connected(_))
+        });
     }
     let gid = a.create("trio", private);
     b.join(gid);
@@ -880,8 +1130,12 @@ fn three_in_group(server: &tunnel_server::Server, private: bool) -> (Node, Node,
     });
     let (ia, ib, ic) = (a.my_ip(gid), b.my_ip(gid), c.my_ip(gid));
     wait_until("прямые каналы попарно", T, || {
-        a.direct_to(gid, ib) && a.direct_to(gid, ic) && b.direct_to(gid, ia) && b.direct_to(gid, ic)
-            && c.direct_to(gid, ia) && c.direct_to(gid, ib)
+        a.direct_to(gid, ib)
+            && a.direct_to(gid, ic)
+            && b.direct_to(gid, ia)
+            && b.direct_to(gid, ic)
+            && c.direct_to(gid, ia)
+            && c.direct_to(gid, ib)
     });
     (a, b, c, gid)
 }
@@ -910,7 +1164,15 @@ fn e2e_три_участника_попарно_подделки_src_и_повт
     // Контроль: честные фреймы B тем же способом доходят, причём повтор того
     // же фрейма (тот же счётчик) — один раз, каким бы путём ни пришёл.
     let frame = |src: u32, inner: u32, tag: &str| {
-        b.eng.craft_frame(gid, proto::grp::DATA, src, ia, &ipv4(inner, ia, tag.as_bytes())).unwrap()
+        b.eng
+            .craft_frame(
+                gid,
+                proto::grp::DATA,
+                src,
+                ia,
+                &ipv4(inner, ia, tag.as_bytes()),
+            )
+            .unwrap()
     };
     let forged = [
         (frame(ic, ic, "forge-src-relay"), srv),
@@ -940,8 +1202,16 @@ fn e2e_три_участника_попарно_подделки_src_и_повт
     // обработаны (или отброшены).
     deliver(&b, &a, gid, "barrier", T);
     std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(a.got(&pkt(ib, "genuine-relay")), 1, "повтор через релей доставлен");
-    assert_eq!(a.got(&pkt(ib, "genuine-direct")), 1, "повтор напрямую доставлен");
+    assert_eq!(
+        a.got(&pkt(ib, "genuine-relay")),
+        1,
+        "повтор через релей доставлен"
+    );
+    assert_eq!(
+        a.got(&pkt(ib, "genuine-direct")),
+        1,
+        "повтор напрямую доставлен"
+    );
     for (tag, inner) in [
         ("forge-src-relay", ic),
         ("forge-src-direct", ic),
@@ -968,22 +1238,43 @@ fn e2e_кикнутый_со_старым_ключом_не_доставляет
     let mut ctr = 1u64 << 40;
     let mut old_frame = |key: &proto::SymKey, epoch: u32, src: u32, dst: u32, tag: &str| {
         ctr += 1;
-        let h = proto::GroupHeader { gid, src, dst, epoch };
-        proto::seal_group(key, proto::grp::DATA, &h, ctr, &ipv4(src, dst, tag.as_bytes()))
+        let h = proto::GroupHeader {
+            gid,
+            src,
+            dst,
+            epoch,
+        };
+        proto::seal_group(
+            key,
+            proto::grp::DATA,
+            &h,
+            ctr,
+            &ipv4(src, dst, tag.as_bytes()),
+        )
     };
     let before = old_frame(&old_key, old_epoch, ib, ia, "before-kick");
     b.eng.send_raw(&before, a.addr());
-    wait_until("фрейм до кика дошёл", T, || a.got(&ipv4(ib, ia, b"before-kick")) == 1);
+    wait_until("фрейм до кика дошёл", T, || {
+        a.got(&ipv4(ib, ia, b"before-kick")) == 1
+    });
 
     let b_pub = b.eng.my_pub;
     a.eng.cmds.send(Cmd::Kick(gid, b_pub)).unwrap();
-    b.wait("B кикнут", T, |e| matches!(e, Event::Kicked { gid: g, banned: false, .. } if *g == gid));
-    wait_until("A и C ротировали ключ и убрали B", T, || {
-        a.epoch(gid) != old_epoch
-            && c.epoch(gid) == a.epoch(gid)
-            && a.members(gid) == 1
-            && c.members(gid) == 1
-    });
+    b.wait(
+        "B кикнут",
+        T,
+        |e| matches!(e, Event::Kicked { gid: g, banned: false, .. } if *g == gid),
+    );
+    wait_until(
+        "A и C ротировали ключ и убрали B",
+        T,
+        || {
+            a.epoch(gid) != old_epoch
+                && c.epoch(gid) == a.epoch(gid)
+                && a.members(gid) == 1
+                && c.members(gid) == 1
+        },
+    );
     let new_epoch = a.epoch(gid);
 
     // Кикнутый со старым ключом: от себя, от имени C и со старым ключом под
@@ -997,7 +1288,8 @@ fn e2e_кикнутый_со_старым_ключом_не_доставляет
         ] {
             for (to, path) in [(srv, "relay"), (dst_addr, "direct")] {
                 let tag = format!("{tag}-{path}");
-                b.eng.send_raw(&old_frame(&old_key, epoch, src, dst, &tag), to);
+                b.eng
+                    .send_raw(&old_frame(&old_key, epoch, src, dst, &tag), to);
                 sent.push((src, dst, tag));
             }
         }
@@ -1008,13 +1300,23 @@ fn e2e_кикнутый_со_старым_ключом_не_доставляет
     std::thread::sleep(Duration::from_millis(300));
     for (src, dst, tag) in &sent {
         let to = if *dst == ia { &a } else { &c };
-        assert_eq!(to.got(&ipv4(*src, *dst, tag.as_bytes())), 0, "доставлено от кикнутого: {tag}");
+        assert_eq!(
+            to.got(&ipv4(*src, *dst, tag.as_bytes())),
+            0,
+            "доставлено от кикнутого: {tag}"
+        );
     }
     // Новый трафик старым ключом не открыть: другая эпоха, другой ключ.
-    let fresh = a.eng.craft_frame(gid, proto::grp::DATA, ia, ic, &ipv4(ia, ic, b"secret")).unwrap();
+    let fresh = a
+        .eng
+        .craft_frame(gid, proto::grp::DATA, ia, ic, &ipv4(ia, ic, b"secret"))
+        .unwrap();
     let (_, h) = proto::parse_group_header(&fresh).unwrap();
     assert_eq!(h.epoch, new_epoch);
-    assert!(proto::open_group(&old_key, &fresh).is_err(), "новый трафик читается старым ключом");
+    assert!(
+        proto::open_group(&old_key, &fresh).is_err(),
+        "новый трафик читается старым ключом"
+    );
     let (_, c_key, _) = c.eng.group_key(gid).unwrap();
     assert!(proto::open_group(&c_key, &fresh).is_ok());
     assert!(!b.has_group(gid));
@@ -1030,24 +1332,39 @@ fn e2e_ротации_ключа_при_потерях_восстанавлив�
     let budget = Budget::default();
     let proxy = LossyProxy::start(local(server.addr), budget.rule());
     let mut a = Node::start("alpha", &server);
-    let mut b = Node::start_via("bravo", proxy.addr, server.pubkey, proto::Identity::generate());
+    let mut b = Node::start_via(
+        "bravo",
+        proxy.addr,
+        server.pubkey,
+        proto::Identity::generate(),
+    );
     let mut c = Node::start("charlie", &server);
     for n in [&mut a, &mut b, &mut c] {
-        n.wait("подключён", T, |e| matches!(e, Event::Connected(_)));
+        n.wait("подключён", T, |e| {
+            matches!(e, Event::Connected(_))
+        });
     }
     let gid = a.create("lossy", false);
     // 0. Ответ на JOIN (GROUP_STATE) теряется: группа приходит по списку
     //    групп, где она уже наша (GET_GROUP).
     budget.arm(ctrl::GROUP_STATE, 1);
     b.join(gid);
-    assert_eq!(budget.left(ctrl::GROUP_STATE), 0, "ответ на JOIN не был потерян");
-    wait_until("A и B видят друг друга", T, || a.sees_online(gid, 1) && b.sees_online(gid, 1));
+    assert_eq!(
+        budget.left(ctrl::GROUP_STATE),
+        0,
+        "ответ на JOIN не был потерян"
+    );
+    wait_until("A и B видят друг друга", T, || {
+        a.sees_online(gid, 1) && b.sees_online(gid, 1)
+    });
     deliver(&a, &b, gid, "warmup-ab", T);
     deliver(&b, &a, gid, "warmup-ba", T);
     let both_ways = |tag: &str, within: Duration| {
         let t = deliver(&a, &b, gid, &format!("{tag}-ab"), within);
         let t2 = deliver(&b, &a, gid, &format!("{tag}-ba"), within);
-        wait_until("эпохи A и B сошлись", within, || a.epoch(gid) == b.epoch(gid));
+        wait_until("эпохи A и B сошлись", within, || {
+            a.epoch(gid) == b.epoch(gid)
+        });
         t.max(t2)
     };
 
@@ -1059,7 +1376,11 @@ fn e2e_ротации_ключа_при_потерях_восстанавлив�
     c.join(gid);
     wait_until("A получил ротацию", T, || a.epoch(gid) != e0);
     let t = both_ways("join-rot", Duration::from_secs(5));
-    assert_eq!(budget.left(ctrl::GROUP_UPDATE), 0, "дельта не была потеряна");
+    assert_eq!(
+        budget.left(ctrl::GROUP_UPDATE),
+        0,
+        "дельта не была потеряна"
+    );
     eprintln!("ротация входа при потере дельты: восстановление за {t:?}");
 
     // 2. Выход C — ротация с отзывом: теряются и дельта, и первый ответ на
@@ -1068,9 +1389,17 @@ fn e2e_ротации_ключа_при_потерях_восстанавлив�
     budget.arm(ctrl::GROUP_UPDATE, 1);
     budget.arm(ctrl::GROUP_STATE, 1);
     c.eng.cmds.send(Cmd::Leave(gid)).unwrap();
-    wait_until("A получил ротацию с отзывом", T, || a.epoch(gid) != e1 && a.members(gid) == 1);
+    wait_until(
+        "A получил ротацию с отзывом",
+        T,
+        || a.epoch(gid) != e1 && a.members(gid) == 1,
+    );
     let t = both_ways("leave-rot", Duration::from_secs(8));
-    assert_eq!(budget.left(ctrl::GROUP_STATE), 0, "ответ GET_GROUP не был потерян");
+    assert_eq!(
+        budget.left(ctrl::GROUP_STATE),
+        0,
+        "ответ GET_GROUP не был потерян"
+    );
     eprintln!("ротация выхода при потере дельты и состояния: {t:?}");
 
     // 3. Переподключение A (смена имени — новое рукопожатие) ротирует ключ;
@@ -1091,9 +1420,16 @@ fn e2e_ротации_ключа_при_потерях_восстанавлив�
     assert_eq!(budget.left(ctrl::WELCOME), 0, "WELCOME не был потерян");
     let b_name_at_a = |a: &Node| {
         let g = a.eng.groups.lock().unwrap();
-        g[&gid].members.values().next().map(|p| p.name.clone()).unwrap_or_default()
+        g[&gid]
+            .members
+            .values()
+            .next()
+            .map(|p| p.name.clone())
+            .unwrap_or_default()
     };
-    wait_until("A видит новое имя B", T, || b_name_at_a(&a) == "bravo-2");
+    wait_until("A видит новое имя B", T, || {
+        b_name_at_a(&a) == "bravo-2"
+    });
 
     // 5. Потерянная дельта без ротации (статус A): ни эпохи, ни следующей
     //    дельты — чинит сверка ревизий по GROUP_LIST (раз в 15 с).
@@ -1102,15 +1438,35 @@ fn e2e_ротации_ключа_при_потерях_восстанавлив�
     a.eng.cmds.send(Cmd::SetStatus("afk".into())).unwrap();
     let status_at_b = |b: &Node| {
         let g = b.eng.groups.lock().unwrap();
-        g[&gid].members.values().next().map(|p| p.status.clone()).unwrap_or_default()
+        g[&gid]
+            .members
+            .values()
+            .next()
+            .map(|p| p.status.clone())
+            .unwrap_or_default()
     };
     let t0 = Instant::now();
-    wait_until("B видит статус A", Duration::from_secs(20), || status_at_b(&b) == "afk");
-    assert_eq!(budget.left(ctrl::GROUP_UPDATE), 0, "дельта статуса не была потеряна");
-    eprintln!("потерянная дельта статуса: восстановление за {:?}", t0.elapsed());
+    wait_until(
+        "B видит статус A",
+        Duration::from_secs(20),
+        || status_at_b(&b) == "afk",
+    );
+    assert_eq!(
+        budget.left(ctrl::GROUP_UPDATE),
+        0,
+        "дельта статуса не была потеряна"
+    );
+    eprintln!(
+        "потерянная дельта статуса: восстановление за {:?}",
+        t0.elapsed()
+    );
     both_ways("final", T);
     b.drain();
-    assert!(!b.seen.iter().any(|e| matches!(e, Event::Disconnected(_))), "B терял связь: {:?}", b.seen);
+    assert!(
+        !b.seen.iter().any(|e| matches!(e, Event::Disconnected(_))),
+        "B терял связь: {:?}",
+        b.seen
+    );
 
     drop((a, b, c));
     drop(proxy);
@@ -1132,10 +1488,19 @@ fn e2e_ротация_ключа_сервера_перезакрепляет_к�
 
     // Клиент с неверным ключом сервера не подключается.
     let wrong = proto::Identity::generate().ed_pub();
-    let err = Node::start_cfg(Config::default(), addr, wrong, proto::Identity::generate(), Arc::new(|_| {}))
-        .err()
-        .expect("чужой ключ сервера принят");
-    assert!(format!("{err:#}").contains("ключ сервера не совпадает"), "{err:#}");
+    let err = Node::start_cfg(
+        Config::default(),
+        addr,
+        wrong,
+        proto::Identity::generate(),
+        Arc::new(|_| {}),
+    )
+    .err()
+    .expect("чужой ключ сервера принят");
+    assert!(
+        format!("{err:#}").contains("ключ сервера не совпадает"),
+        "{err:#}"
+    );
 
     // Клиент, закрепивший старый ключ: перезакрепление по цепочке.
     let saved: Arc<Mutex<Option<Config>>> = Arc::default();
@@ -1152,16 +1517,31 @@ fn e2e_ротация_ключа_сервера_перезакрепляет_к�
         let saved = saved.clone();
         Arc::new(move |c: &Config| *saved.lock().unwrap() = Some(c.clone()))
     };
-    let mut n = Node::start_cfg(cfg, addr, pk1, proto::Identity::generate(), save).expect("подключение по цепочке");
+    let mut n = Node::start_cfg(cfg, addr, pk1, proto::Identity::generate(), save)
+        .expect("подключение по цепочке");
     n.wait("перезакреплён", T, |e| {
         matches!(e, Event::ServerKeyRotated { addr: a, new_code } if *a == addr && *new_code == r1.code)
     });
-    n.wait("подключён", T, |e| matches!(e, Event::Connected(_)));
+    n.wait("подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
     let pinned = |saved: &Arc<Mutex<Option<Config>>>| {
-        saved.lock().unwrap().as_ref().map(|c| c.servers[0].pubkey.clone()).unwrap_or_default()
+        saved
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|c| c.servers[0].pubkey.clone())
+            .unwrap_or_default()
     };
-    assert_eq!(pinned(&saved), proto::hex_of(&r1.pubkey), "client.json не перезакреплён");
-    assert_eq!(n.eng.cfg.lock().unwrap().servers[0].pubkey, proto::hex_of(&r1.pubkey));
+    assert_eq!(
+        pinned(&saved),
+        proto::hex_of(&r1.pubkey),
+        "client.json не перезакреплён"
+    );
+    assert_eq!(
+        n.eng.cfg.lock().unwrap().servers[0].pubkey,
+        proto::hex_of(&r1.pubkey)
+    );
     let gid = n.create("keep", false);
 
     // Вторая ротация на ходу: сервер перезапущен с новым ключом, движок
@@ -1169,10 +1549,14 @@ fn e2e_ротация_ключа_сервера_перезакрепляет_к�
     server.stop();
     let r2 = tunnel_server::rotate_key(&dir).expect("rotate-key");
     let server = start_server(&dir, port);
-    n.wait("перезакреплён снова", Duration::from_secs(20), |e| {
-        matches!(e, Event::ServerKeyRotated { new_code, .. } if *new_code == r2.code)
+    n.wait(
+        "перезакреплён снова",
+        Duration::from_secs(20),
+        |e| matches!(e, Event::ServerKeyRotated { new_code, .. } if *new_code == r2.code),
+    );
+    n.wait("переподключён", T, |e| {
+        matches!(e, Event::Connected(_))
     });
-    n.wait("переподключён", T, |e| matches!(e, Event::Connected(_)));
     assert_eq!(pinned(&saved), proto::hex_of(&r2.pubkey));
     wait_until("группа вернулась", T, || n.has_group(gid));
     drop(n);
@@ -1183,13 +1567,18 @@ fn e2e_ротация_ключа_сервера_перезакрепляет_к�
 #[test]
 fn e2e_передача_владения_приглашения_в_admin_и_их_срок() {
     let dir = temp_dir("owner");
-    let limits = tunnel_server::Limits { invite_ttl: Duration::from_secs(3), ..Default::default() };
+    let limits = tunnel_server::Limits {
+        invite_ttl: Duration::from_secs(3),
+        ..Default::default()
+    };
     let server = start_server_with(&dir, 0, limits);
     let mut a = Node::start("alpha", &server);
     let mut b = Node::start("bravo", &server);
     let mut d = Node::start("delta", &server);
     for n in [&mut a, &mut b, &mut d] {
-        n.wait("подключён", T, |e| matches!(e, Event::Connected(_)));
+        n.wait("подключён", T, |e| {
+            matches!(e, Event::Connected(_))
+        });
     }
     let gid = a.create("club", true);
     let (a_pub, b_pub, d_pub) = (a.eng.my_pub, b.eng.my_pub, d.eng.my_pub);
@@ -1204,49 +1593,90 @@ fn e2e_передача_владения_приглашения_в_admin_и_их
     b.join(gid);
     a.eng.cmds.send(Cmd::Invite(gid, d_pub)).unwrap();
     a.eng.cmds.send(Cmd::Invite(gid, offline)).unwrap();
-    d.wait("D: приглашение со сроком", T, |e| matches!(e, Event::Invite { gid: g, expires_in: 3, .. } if *g == gid));
+    d.wait(
+        "D: приглашение со сроком",
+        T,
+        |e| matches!(e, Event::Invite { gid: g, expires_in: 3, .. } if *g == gid),
+    );
     let invited = Instant::now();
     a.eng.cmds.send(Cmd::GroupAdmin(gid)).unwrap();
     a.wait("A: висящие приглашения", T, |e| match e {
-        Event::AdminInfo { gid: g, bans, invites } if *g == gid => {
+        Event::AdminInfo {
+            gid: g,
+            bans,
+            invites,
+        } if *g == gid => {
             bans.is_empty()
                 && invites.len() == 2
-                && invites.iter().any(|(pk, name, left)| *pk == d_pub && name == "delta" && (1..=3).contains(left))
-                && invites.iter().any(|(pk, _, left)| *pk == offline && (1..=3).contains(left))
+                && invites.iter().any(|(pk, name, left)| {
+                    *pk == d_pub && name == "delta" && (1..=3).contains(left)
+                })
+                && invites
+                    .iter()
+                    .any(|(pk, _, left)| *pk == offline && (1..=3).contains(left))
         }
         _ => false,
     });
     // Истечение: D получает свежий список без gid, владелец — пустой список.
-    d.wait("D: приглашение истекло", T, |e| {
-        matches!(e, Event::InvitesSynced { gids, complete: true, .. } if !gids.contains(&gid))
-    });
-    assert!(invited.elapsed() >= Duration::from_secs(2), "приглашение истекло раньше срока");
+    d.wait(
+        "D: приглашение истекло",
+        T,
+        |e| matches!(e, Event::InvitesSynced { gids, complete: true, .. } if !gids.contains(&gid)),
+    );
+    assert!(
+        invited.elapsed() >= Duration::from_secs(2),
+        "приглашение истекло раньше срока"
+    );
     a.eng.cmds.send(Cmd::GroupAdmin(gid)).unwrap();
     a.wait("A: приглашений нет", T, |e| {
         matches!(e, Event::AdminInfo { gid: g, invites, .. } if *g == gid && invites.is_empty())
     });
     d.eng.cmds.send(Cmd::Join(gid)).unwrap();
-    d.wait("D: вход по истёкшему отклонён", T, |e| matches!(e, Event::Error(t) if t.contains("приглашение")));
+    d.wait(
+        "D: вход по истёкшему отклонён",
+        T,
+        |e| matches!(e, Event::Error(t) if t.contains("приглашение")),
+    );
     assert!(!d.has_group(gid));
 
     // Передача владения участнику: оба видят нового владельца, прежний
     // больше не администрирует.
     a.eng.cmds.send(Cmd::Transfer(gid, b_pub)).unwrap();
-    wait_until("владелец сменился у обоих", T, || a.owner(gid) == Some(b_pub) && b.owner(gid) == Some(b_pub));
+    wait_until("владелец сменился у обоих", T, || {
+        a.owner(gid) == Some(b_pub) && b.owner(gid) == Some(b_pub)
+    });
     a.eng.cmds.send(Cmd::GroupAdmin(gid)).unwrap();
-    a.wait("A больше не владелец", T, |e| matches!(e, Event::Error(t) if t.contains("владелец")));
+    a.wait(
+        "A больше не владелец",
+        T,
+        |e| matches!(e, Event::Error(t) if t.contains("владелец")),
+    );
     b.eng.cmds.send(Cmd::GroupAdmin(gid)).unwrap();
-    b.wait("B администрирует", T, |e| matches!(e, Event::AdminInfo { gid: g, .. } if *g == gid));
+    b.wait(
+        "B администрирует",
+        T,
+        |e| matches!(e, Event::AdminInfo { gid: g, .. } if *g == gid),
+    );
 
     // Новый владелец исключает прежнего (KICKED без бана) и снова приглашает:
     // вход после кика работает.
     b.eng.cmds.send(Cmd::Kick(gid, a_pub)).unwrap();
-    a.wait("A кикнут", T, |e| matches!(e, Event::Kicked { gid: g, banned: false, .. } if *g == gid));
+    a.wait(
+        "A кикнут",
+        T,
+        |e| matches!(e, Event::Kicked { gid: g, banned: false, .. } if *g == gid),
+    );
     assert!(!a.has_group(gid));
     b.eng.cmds.send(Cmd::Invite(gid, a_pub)).unwrap();
-    a.wait("A приглашён снова", T, |e| matches!(e, Event::Invite { gid: g, .. } if *g == gid));
+    a.wait(
+        "A приглашён снова",
+        T,
+        |e| matches!(e, Event::Invite { gid: g, .. } if *g == gid),
+    );
     a.join(gid);
-    wait_until("A и B снова вместе", T, || a.sees_online(gid, 1) && b.sees_online(gid, 1));
+    wait_until("A и B снова вместе", T, || {
+        a.sees_online(gid, 1) && b.sees_online(gid, 1)
+    });
     deliver(&a, &b, gid, "rejoined", T);
 
     drop((a, b, d));
@@ -1261,13 +1691,26 @@ fn e2e_повтор_hello3_не_мешает_живой_сессии() {
     let srv = local(server.addr);
     let proxy = LossyProxy::start(srv, Box::new(|_, _, _| false));
     let mut a = Node::start("alpha", &server);
-    let mut b = Node::start_via("bravo", proxy.addr, server.pubkey, proto::Identity::generate());
-    a.wait("A подключён", T, |e| matches!(e, Event::Connected(_)));
-    b.wait("B подключён", T, |e| matches!(e, Event::Connected(_)));
+    let mut b = Node::start_via(
+        "bravo",
+        proxy.addr,
+        server.pubkey,
+        proto::Identity::generate(),
+    );
+    a.wait("A подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    b.wait("B подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
     let gid = a.create("replay", false);
     b.join(gid);
-    wait_until("A и B видят друг друга", T, || a.sees_online(gid, 1) && b.sees_online(gid, 1));
-    wait_until("эпохи сошлись", T, || a.epoch(gid) == b.epoch(gid));
+    wait_until("A и B видят друг друга", T, || {
+        a.sees_online(gid, 1) && b.sees_online(gid, 1)
+    });
+    wait_until("эпохи сошлись", T, || {
+        a.epoch(gid) == b.epoch(gid)
+    });
     deliver(&a, &b, gid, "before", T);
     let epoch = a.epoch(gid);
     b.drain();
@@ -1278,18 +1721,27 @@ fn e2e_повтор_hello3_не_мешает_живой_сессии() {
     let with_cookie = hellos
         .iter()
         .rev()
-        .find(|d| proto::split_frame(d).is_ok_and(|(_, body)| proto::Hello3::decode(body).is_ok_and(|h| h.cookie.is_some())))
+        .find(|d| {
+            proto::split_frame(d).is_ok_and(|(_, body)| {
+                proto::Hello3::decode(body).is_ok_and(|h| h.cookie.is_some())
+            })
+        })
         .expect("HELLO3 с cookie")
         .clone();
     let without = hellos
         .iter()
-        .find(|d| proto::split_frame(d).is_ok_and(|(_, body)| proto::Hello3::decode(body).is_ok_and(|h| h.cookie.is_none())))
+        .find(|d| {
+            proto::split_frame(d).is_ok_and(|(_, body)| {
+                proto::Hello3::decode(body).is_ok_and(|h| h.cookie.is_none())
+            })
+        })
         .expect("HELLO3 без cookie")
         .clone();
 
     // С другого адреса: только CHALLENGE (cookie привязан к адресу B).
     let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
-    sock.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+    sock.set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
     for f in [&with_cookie, &without, &with_cookie] {
         sock.send_to(f, srv).unwrap();
     }
@@ -1301,7 +1753,10 @@ fn e2e_повтор_hello3_не_мешает_живой_сессии() {
             got.push(proto::split_frame(&buf[..n]).map(|(t, _)| t).unwrap_or(0));
         }
     }
-    assert!(!got.is_empty() && got.iter().all(|t| *t == ctrl::CHALLENGE), "ответы на повтор: {got:02x?}");
+    assert!(
+        !got.is_empty() && got.iter().all(|t| *t == ctrl::CHALLENGE),
+        "ответы на повтор: {got:02x?}"
+    );
 
     // С того же адреса (через посредника): тот же WELCOME, сессия и ключи
     // прежние, ротации нет.
@@ -1313,13 +1768,20 @@ fn e2e_повтор_hello3_не_мешает_живой_сессии() {
     assert_eq!(a.epoch(gid), epoch, "повтор HELLO3 ротировал ключ группы");
     assert_eq!(b.epoch(gid), epoch);
     assert!(
-        !b.saw_since(mark, |e| matches!(e, Event::Disconnected(_) | Event::Connected(_))),
+        !b.saw_since(mark, |e| matches!(
+            e,
+            Event::Disconnected(_) | Event::Connected(_)
+        )),
         "сессия B пересоздана: {:?}",
         &b.seen[mark..]
     );
     // Управляющий канал B жив: команда — ответ сервера.
     b.eng.cmds.send(Cmd::GroupAdmin(gid)).unwrap();
-    b.wait("B: ответ сервера", T, |e| matches!(e, Event::Error(t) if t.contains("владелец")));
+    b.wait(
+        "B: ответ сервера",
+        T,
+        |e| matches!(e, Event::Error(t) if t.contains("владелец")),
+    );
     drop((a, b));
     drop(proxy);
     server.stop();
@@ -1333,15 +1795,29 @@ fn e2e_запоздавший_group_state_не_возвращает_отозва
     let proxy = LossyProxy::start(local(server.addr), Box::new(|_, _, _| false));
     let proxy_c = LossyProxy::start(local(server.addr), Box::new(|_, _, _| false));
     let mut a = Node::start("alpha", &server);
-    let mut b = Node::start_via("bravo", proxy.addr, server.pubkey, proto::Identity::generate());
-    let mut c = Node::start_via("charlie", proxy_c.addr, server.pubkey, proto::Identity::generate());
+    let mut b = Node::start_via(
+        "bravo",
+        proxy.addr,
+        server.pubkey,
+        proto::Identity::generate(),
+    );
+    let mut c = Node::start_via(
+        "charlie",
+        proxy_c.addr,
+        server.pubkey,
+        proto::Identity::generate(),
+    );
     for n in [&mut a, &mut b, &mut c] {
-        n.wait("подключён", T, |e| matches!(e, Event::Connected(_)));
+        n.wait("подключён", T, |e| {
+            matches!(e, Event::Connected(_))
+        });
     }
     let gid = a.create("stale", false);
     b.join(gid);
     c.join(gid);
-    wait_until("все видят всех", T, || a.sees_online(gid, 2) && b.sees_online(gid, 2) && c.sees_online(gid, 2));
+    wait_until("все видят всех", T, || {
+        a.sees_online(gid, 2) && b.sees_online(gid, 2) && c.sees_online(gid, 2)
+    });
     wait_until("эпоха у всех одна", T, || {
         let e = a.epoch(gid);
         b.epoch(gid) == e && c.epoch(gid) == e
@@ -1355,15 +1831,27 @@ fn e2e_запоздавший_group_state_не_возвращает_отозва
     let (ia, ib, ic) = (a.my_ip(gid), b.my_ip(gid), c.my_ip(gid));
     for (n, p, ip) in [(&b, &proxy, ib), (&c, &proxy_c, ic)] {
         p.hold(ctrl::GROUP_STATE, 1);
-        let h = proto::GroupHeader { gid, src: ia, dst: ip, epoch: epoch + 1 };
-        a.eng.send_raw(&proto::seal_group(&[7; 32], proto::grp::DATA, &h, 1, b"x"), n.addr());
-        wait_until("ответ GET_GROUP придержан", T, || p.held() == 1);
+        let h = proto::GroupHeader {
+            gid,
+            src: ia,
+            dst: ip,
+            epoch: epoch + 1,
+        };
+        a.eng.send_raw(
+            &proto::seal_group(&[7; 32], proto::grp::DATA, &h, 1, b"x"),
+            n.addr(),
+        );
+        wait_until("ответ GET_GROUP придержан", T, || {
+            p.held() == 1
+        });
     }
 
     // Пока ответы в пути, C кикнут: ротация с отзывом, B получает дельту.
     a.eng.cmds.send(Cmd::Kick(gid, c.eng.my_pub)).unwrap();
     c.wait("C кикнут", T, |e| matches!(e, Event::Kicked { .. }));
-    wait_until("B получил новый ключ", T, || b.epoch(gid) != epoch && b.epoch(gid) == a.epoch(gid));
+    wait_until("B получил новый ключ", T, || {
+        b.epoch(gid) != epoch && b.epoch(gid) == a.epoch(gid)
+    });
     let mark = c.seen.len();
 
     // Запоздавшее состояние (ключ, который знает C) не откатывает B и не
@@ -1371,16 +1859,33 @@ fn e2e_запоздавший_group_state_не_возвращает_отозва
     proxy.release();
     proxy_c.release();
     std::thread::sleep(Duration::from_millis(500));
-    assert!(!c.has_group(gid), "запоздавшее состояние вернуло группу кикнутому");
-    assert!(!c.saw_since(mark, |e| matches!(e, Event::GroupJoined { .. })), "{:?}", &c.seen[mark..]);
+    assert!(
+        !c.has_group(gid),
+        "запоздавшее состояние вернуло группу кикнутому"
+    );
+    assert!(
+        !c.saw_since(mark, |e| matches!(e, Event::GroupJoined { .. })),
+        "{:?}",
+        &c.seen[mark..]
+    );
     let (b_epoch, b_key, _) = b.eng.group_key(gid).unwrap();
     let (a_epoch, a_key, _) = a.eng.group_key(gid).unwrap();
-    assert_eq!((b_epoch, b_key), (a_epoch, a_key), "B откатился к прежнему ключу");
+    assert_eq!(
+        (b_epoch, b_key),
+        (a_epoch, a_key),
+        "B откатился к прежнему ключу"
+    );
     assert_ne!(b_key, c_key);
     assert_eq!(b.members(gid), 1, "запоздавшее состояние вернуло C");
     deliver(&b, &a, gid, "after-stale", T);
-    let frame = b.eng.craft_frame(gid, proto::grp::DATA, ib, ia, &ipv4(ib, ia, b"secret")).unwrap();
-    assert!(proto::open_group(&c_key, &frame).is_err(), "B шифрует ключом, известным кикнутому");
+    let frame = b
+        .eng
+        .craft_frame(gid, proto::grp::DATA, ib, ia, &ipv4(ib, ia, b"secret"))
+        .unwrap();
+    assert!(
+        proto::open_group(&c_key, &frame).is_err(),
+        "B шифрует ключом, известным кикнутому"
+    );
 
     drop((a, b, c));
     drop(proxy);
@@ -1393,9 +1898,12 @@ fn e2e_запоздавший_group_state_не_возвращает_отозва
 /// неаутентифицированные UNSUPPORTED, RESET, WELCOME с битой подписью и
 /// WELCOME, подписанный чужим ключом (под наш ed/eph), — и лишь потом
 /// пересылает HELLO3 серверу. Остальное — прозрачно.
-fn spoofing_proxy(server: SocketAddr) -> (SocketAddr, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+fn spoofing_proxy(
+    server: SocketAddr,
+) -> (SocketAddr, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
     let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
-    sock.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+    sock.set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
     let addr = sock.local_addr().unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = stop.clone();
@@ -1404,7 +1912,9 @@ fn spoofing_proxy(server: SocketAddr) -> (SocketAddr, Arc<AtomicBool>, std::thre
         let mut buf = vec![0u8; 65_535];
         let mut client: Option<SocketAddr> = None;
         while !stop2.load(Ordering::Relaxed) {
-            let Ok((n, src)) = sock.recv_from(&mut buf) else { continue };
+            let Ok((n, src)) = sock.recv_from(&mut buf) else {
+                continue;
+            };
             if src == server {
                 if let Some(c) = client {
                     let _ = sock.send_to(&buf[..n], c);
@@ -1416,11 +1926,15 @@ fn spoofing_proxy(server: SocketAddr) -> (SocketAddr, Arc<AtomicBool>, std::thre
                 && let Ok(h) = proto::Hello3::decode(body)
             {
                 let eph = proto::EphemeralKey::generate();
-                let forged = proto::Welcome::encode(&stranger, &eph.public(), &[], &h.ed_pub, &h.eph_pub);
+                let forged =
+                    proto::Welcome::encode(&stranger, &eph.public(), &[], &h.ed_pub, &h.eph_pub);
                 let mut bad_sig = forged.clone();
                 *bad_sig.last_mut().unwrap() ^= 0xff;
                 let frames = [
-                    proto::plain_frame(ctrl::UNSUPPORTED, &proto::handshake::enc_unsupported("подделка")),
+                    proto::plain_frame(
+                        ctrl::UNSUPPORTED,
+                        &proto::handshake::enc_unsupported("подделка"),
+                    ),
                     proto::plain_frame(ctrl::RESET, &[]),
                     proto::plain_frame(ctrl::WELCOME, &bad_sig),
                     proto::plain_frame(ctrl::WELCOME, &forged),
@@ -1447,14 +1961,19 @@ fn e2e_открытые_ответы_не_обрывают_подключени�
     let t0 = Instant::now();
     let conn = engine::CtrlConn::connect(&Config::default(), addr, &server.pubkey, &id)
         .expect("CtrlConn подключается сквозь подделки");
-    assert!(t0.elapsed() < Duration::from_secs(5), "без ожидания таймаута");
+    assert!(
+        t0.elapsed() < Duration::from_secs(5),
+        "без ожидания таймаута"
+    );
     assert!(conn.rotated.is_none());
     conn.invite_list().expect("ответ сервера после подделок");
     drop(conn);
 
     // Движок: первое подключение тоже не обрывается и не шлёт Error.
     let mut n = Node::start_via("forged", addr, server.pubkey, proto::Identity::generate());
-    n.wait("подключён", T, |e| matches!(e, Event::Connected(_)));
+    n.wait("подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
     n.drain();
     assert!(
         !n.seen.iter().any(|e| matches!(e, Event::Error(_))),
@@ -1478,37 +1997,69 @@ fn e2e_кик_при_отстающей_ревизии_не_возвращает
     let server = start_server(&dir, 0);
     let proxy_c = LossyProxy::start(local(server.addr), Box::new(|_, _, _| false));
     let mut a = Node::start("alpha", &server);
-    let mut c = Node::start_via("charlie", proxy_c.addr, server.pubkey, proto::Identity::generate());
+    let mut c = Node::start_via(
+        "charlie",
+        proxy_c.addr,
+        server.pubkey,
+        proto::Identity::generate(),
+    );
     for n in [&mut a, &mut c] {
-        n.wait("подключён", T, |e| matches!(e, Event::Connected(_)));
+        n.wait("подключён", T, |e| {
+            matches!(e, Event::Connected(_))
+        });
     }
     let gid = a.create("lag", false);
     c.join(gid);
-    wait_until("видят друг друга", T, || a.sees_online(gid, 1) && c.sees_online(gid, 1));
+    wait_until("видят друг друга", T, || {
+        a.sees_online(gid, 1) && c.sees_online(gid, 1)
+    });
     std::thread::sleep(Duration::from_millis(300));
     let c_rev = c.eng.groups.lock().unwrap()[&gid].rev;
 
     // Дельта переименования до C не доходит: его ревизия отстаёт.
     proxy_c.hold(ctrl::GROUP_UPDATE, 1);
     a.eng.cmds.send(Cmd::Rename(gid, "lag2".into())).unwrap();
-    wait_until("дельта придержана", T, || proxy_c.held() == 1);
+    wait_until("дельта придержана", T, || {
+        proxy_c.held() == 1
+    });
 
     // GET_GROUP от C, ответ (ревизия новее его) задерживается.
     let (epoch, _, _) = c.eng.group_key(gid).unwrap();
     let (ia, ic) = (a.my_ip(gid), c.my_ip(gid));
     proxy_c.hold(ctrl::GROUP_STATE, 1);
-    let h = proto::GroupHeader { gid, src: ia, dst: ic, epoch: epoch + 1 };
-    a.eng.send_raw(&proto::seal_group(&[7; 32], proto::grp::DATA, &h, 1, b"x"), c.addr());
-    wait_until("ответ GET_GROUP придержан", T, || proxy_c.held() == 2);
-    assert_eq!(c.eng.groups.lock().unwrap()[&gid].rev, c_rev, "ревизия C не должна была сдвинуться");
+    let h = proto::GroupHeader {
+        gid,
+        src: ia,
+        dst: ic,
+        epoch: epoch + 1,
+    };
+    a.eng.send_raw(
+        &proto::seal_group(&[7; 32], proto::grp::DATA, &h, 1, b"x"),
+        c.addr(),
+    );
+    wait_until("ответ GET_GROUP придержан", T, || {
+        proxy_c.held() == 2
+    });
+    assert_eq!(
+        c.eng.groups.lock().unwrap()[&gid].rev,
+        c_rev,
+        "ревизия C не должна была сдвинуться"
+    );
 
     a.eng.cmds.send(Cmd::Kick(gid, c.eng.my_pub)).unwrap();
     c.wait("C кикнут", T, |e| matches!(e, Event::Kicked { .. }));
     let mark = c.seen.len();
     proxy_c.release();
     std::thread::sleep(Duration::from_millis(500));
-    assert!(!c.has_group(gid), "запоздавшее состояние вернуло группу кикнутому");
-    assert!(!c.saw_since(mark, |e| matches!(e, Event::GroupJoined { .. })), "{:?}", &c.seen[mark..]);
+    assert!(
+        !c.has_group(gid),
+        "запоздавшее состояние вернуло группу кикнутому"
+    );
+    assert!(
+        !c.saw_since(mark, |e| matches!(e, Event::GroupJoined { .. })),
+        "{:?}",
+        &c.seen[mark..]
+    );
 
     drop((a, c));
     drop(proxy_c);
@@ -1521,7 +2072,9 @@ fn e2e_потерянный_presence_повторяется_до_подтвер�
     let dir = temp_dir("presence-loss");
     let server = start_server(&dir, 0);
     let mut a = Node::start("alpha", &server);
-    a.wait("A подключён", T, |e| matches!(e, Event::Connected(_)));
+    a.wait("A подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
     let gid = a.create("game", false);
 
     // Первые два PRESENCE теряются по дороге к серверу, первый PRESENCE_ACK —
@@ -1540,24 +2093,40 @@ fn e2e_потерянный_presence_повторяется_до_подтвер�
             false
         }),
     );
-    let mut b = Node::start_via("bravo", proxy.addr, server.pubkey, proto::Identity::generate());
-    b.wait("B подключён", T, |e| matches!(e, Event::Connected(_)));
+    let mut b = Node::start_via(
+        "bravo",
+        proxy.addr,
+        server.pubkey,
+        proto::Identity::generate(),
+    );
+    b.wait("B подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
     b.join(gid);
     wait_until("A видит B онлайн", T, || a.sees_online(gid, 1));
 
     b.eng.cmds.send(Cmd::SetInvisible(true)).unwrap();
     wait_until("A видит невидимку B офлайн", T, || {
         let g = a.eng.groups.lock().unwrap();
-        g.get(&gid).is_some_and(|gs| gs.members.len() == 1 && gs.members.values().all(|p| !p.online))
+        g.get(&gid)
+            .is_some_and(|gs| gs.members.len() == 1 && gs.members.values().all(|p| !p.online))
     });
     // Два потерянных + дошедший (его ACK потерян) + подтверждённый; дальше
     // подтверждённое не повторяется.
-    wait_until("B получил подтверждение", T, || proxy.sent(ctrl::PRESENCE) >= 4);
+    wait_until("B получил подтверждение", T, || {
+        proxy.sent(ctrl::PRESENCE) >= 4
+    });
     std::thread::sleep(Duration::from_millis(2500));
-    assert_eq!(proxy.sent(ctrl::PRESENCE), 4, "повторы только до PRESENCE_ACK");
+    assert_eq!(
+        proxy.sent(ctrl::PRESENCE),
+        4,
+        "повторы только до PRESENCE_ACK"
+    );
 
     b.eng.cmds.send(Cmd::SetInvisible(false)).unwrap();
-    wait_until("A снова видит B онлайн", T, || a.sees_online(gid, 1));
+    wait_until("A снова видит B онлайн", T, || {
+        a.sees_online(gid, 1)
+    });
 
     drop(a);
     drop(b);
@@ -1582,28 +2151,54 @@ fn e2e_переименование_и_передача_дельтой_kind3_у�
     let server = start_server(&dir, 0);
     let proxy = LossyProxy::start(local(server.addr), Box::new(|_, _, _| false));
     let mut a = Node::start("alpha", &server);
-    let mut b = Node::start_via("bravo", proxy.addr, server.pubkey, proto::Identity::generate());
+    let mut b = Node::start_via(
+        "bravo",
+        proxy.addr,
+        server.pubkey,
+        proto::Identity::generate(),
+    );
     let mut c = Node::start("charlie", &server);
     for n in [&mut a, &mut b, &mut c] {
-        n.wait("подключён", T, |e| matches!(e, Event::Connected(_)));
+        n.wait("подключён", T, |e| {
+            matches!(e, Event::Connected(_))
+        });
     }
     let gid = a.create("old-name", false);
     b.join(gid);
     c.join(gid);
-    wait_until("все видят всех", T, || a.sees_online(gid, 2) && b.sees_online(gid, 2) && c.sees_online(gid, 2));
+    wait_until("все видят всех", T, || {
+        a.sees_online(gid, 2) && b.sees_online(gid, 2) && c.sees_online(gid, 2)
+    });
     let rev = |n: &Node| n.eng.groups.lock().unwrap().get(&gid).map(|g| g.rev);
-    let name = |n: &Node| n.eng.groups.lock().unwrap().get(&gid).map(|g| g.name.clone());
-    wait_until("ревизия у всех одна", T, || rev(&a) == rev(&b) && rev(&b) == rev(&c));
+    let name = |n: &Node| {
+        n.eng
+            .groups
+            .lock()
+            .unwrap()
+            .get(&gid)
+            .map(|g| g.name.clone())
+    };
+    wait_until("ревизия у всех одна", T, || {
+        rev(&a) == rev(&b) && rev(&b) == rev(&c)
+    });
     std::thread::sleep(Duration::from_millis(300));
     let states0 = from_server(&proxy, ctrl::GROUP_STATE);
-    assert!(states0 > 0, "посредник не видит GROUP_STATE входа — проверка ниже пуста");
+    assert!(
+        states0 > 0,
+        "посредник не видит GROUP_STATE входа — проверка ниже пуста"
+    );
     let gets0 = proxy.sent(ctrl::GET_GROUP);
     let rev0 = rev(&b).unwrap();
 
     // (b) RENAME — дельта kind 3: имя меняется у всех, без полного состояния.
-    a.eng.cmds.send(Cmd::Rename(gid, "new-name".into())).unwrap();
+    a.eng
+        .cmds
+        .send(Cmd::Rename(gid, "new-name".into()))
+        .unwrap();
     wait_until("имя сменилось у всех", T, || {
-        [&a, &b, &c].iter().all(|n| name(n).as_deref() == Some("new-name"))
+        [&a, &b, &c]
+            .iter()
+            .all(|n| name(n).as_deref() == Some("new-name"))
     });
     assert_eq!(rev(&b), Some(rev0 + 1), "переименование — одна ревизия");
     assert_eq!(rev(&a), rev(&b));
@@ -1616,10 +2211,22 @@ fn e2e_переименование_и_передача_дельтой_kind3_у�
         [&a, &b, &c].iter().all(|n| n.owner(gid) == Some(c_pub))
     });
     assert_eq!(rev(&b), Some(rev0 + 2), "передача — одна ревизия");
-    assert_eq!(name(&b).as_deref(), Some("new-name"), "передача затёрла имя");
+    assert_eq!(
+        name(&b).as_deref(),
+        Some("new-name"),
+        "передача затёрла имя"
+    );
     std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(from_server(&proxy, ctrl::GROUP_STATE), states0, "B получил GROUP_STATE вместо дельты");
-    assert_eq!(proxy.sent(ctrl::GET_GROUP), gets0, "B запрашивал полное состояние");
+    assert_eq!(
+        from_server(&proxy, ctrl::GROUP_STATE),
+        states0,
+        "B получил GROUP_STATE вместо дельты"
+    );
+    assert_eq!(
+        proxy.sent(ctrl::GET_GROUP),
+        gets0,
+        "B запрашивал полное состояние"
+    );
     // Группа жива после дельт.
     deliver(&b, &c, gid, "after-meta", T);
 
@@ -1632,7 +2239,10 @@ fn e2e_переименование_и_передача_дельтой_kind3_у�
             matches!(e, Event::GroupDeleted { gid: g, name } if *g == gid && name == "new-name")
         });
         assert!(!n.has_group(gid), "группа осталась после удаления");
-        assert!(!n.saw_since(mark, |e| matches!(e, Event::GroupJoined { gid: g, .. } if *g == gid)));
+        assert!(!n.saw_since(
+            mark,
+            |e| matches!(e, Event::GroupJoined { gid: g, .. } if *g == gid)
+        ));
     }
     std::thread::sleep(Duration::from_millis(500));
     for n in [&a, &b, &c] {
@@ -1671,7 +2281,11 @@ fn dns_query(src: u32, id: u16, name: &str) -> Vec<u8> {
 fn dns_answer(n: &Node, id: u16) -> Option<Vec<u8>> {
     let inj = n.tun.injected.lock().unwrap();
     inj.iter()
-        .find(|p| p.len() >= 30 && p[12..16] == crate::dns::DNS_ADDR.octets() && p[28..30] == id.to_be_bytes())
+        .find(|p| {
+            p.len() >= 30
+                && p[12..16] == crate::dns::DNS_ADDR.octets()
+                && p[28..30] == id.to_be_bytes()
+        })
         .cloned()
 }
 
@@ -1694,11 +2308,17 @@ fn e2e_dns_имена_участников_и_ipv6_оверлей() {
     let server = start_server(&dir, 0);
     let mut a = Node::start("Alpha", &server);
     let mut b = Node::start("Bravo Two", &server);
-    a.wait("A подключён", T, |e| matches!(e, Event::Connected(_)));
-    b.wait("B подключён", T, |e| matches!(e, Event::Connected(_)));
+    a.wait("A подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
+    b.wait("B подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
     let gid = a.create("Game Room", false);
     b.join(gid);
-    a.wait("A видит B онлайн", T, |e| matches!(e, Event::PeerOnline { .. }));
+    a.wait("A видит B онлайн", T, |e| {
+        matches!(e, Event::PeerOnline { .. })
+    });
     let (ia, ib) = (a.my_ip(gid), b.my_ip(gid));
 
     // DNS: ответ вброшен в TUN самого A, в туннель не уходит.
@@ -1722,7 +2342,10 @@ fn e2e_dns_имена_участников_и_ipv6_оверлей() {
     }
 
     // IPv6 оверлея A → B доходит до TUN B.
-    let (a6, b6) = (crate::ipv6::v6_of(ia).unwrap(), crate::ipv6::v6_of(ib).unwrap());
+    let (a6, b6) = (
+        crate::ipv6::v6_of(ia).unwrap(),
+        crate::ipv6::v6_of(ib).unwrap(),
+    );
     let pkt = ipv6_pkt(a6, b6, b"hello6");
     wait_until("IPv6 A→B", T, || {
         a.eng.send_ip_packet(&pkt);
@@ -1743,9 +2366,18 @@ fn e2e_dns_имена_участников_и_ipv6_оверлей() {
         std::thread::sleep(Duration::from_millis(50));
         b.got(&marker) > 0
     });
-    assert_eq!((b.got(&fake), b.got(&alien)), (0, 0), "подделки IPv6 не доставлены");
+    assert_eq!(
+        (b.got(&fake), b.got(&alien)),
+        (0, 0),
+        "подделки IPv6 не доставлены"
+    );
     assert!(
-        !b.tun.injected.lock().unwrap().iter().any(|p| p.len() > 16 && p[12..16] == crate::dns::DNS_ADDR.octets()),
+        !b.tun
+            .injected
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.len() > 16 && p[12..16] == crate::dns::DNS_ADDR.octets()),
         "DNS-запросы A не уходят пирам"
     );
 
@@ -1785,7 +2417,8 @@ impl TcpOnlyBridge {
                 };
                 tcp.set_nonblocking(false).unwrap();
                 let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
-                udp.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+                udp.set_read_timeout(Some(Duration::from_millis(200)))
+                    .unwrap();
                 // TCP → сервер.
                 let (mut rd, u1, s1) = (tcp.try_clone().unwrap(), udp.clone(), st.clone());
                 std::thread::spawn(move || {
@@ -1803,7 +2436,9 @@ impl TcpOnlyBridge {
                 std::thread::spawn(move || {
                     let mut buf = vec![0u8; 65_535];
                     while !s2.load(Ordering::Relaxed) {
-                        let Ok((n, src)) = udp.recv_from(&mut buf) else { continue };
+                        let Ok((n, src)) = udp.recv_from(&mut buf) else {
+                            continue;
+                        };
                         if src != server {
                             continue;
                         }
@@ -1817,7 +2452,11 @@ impl TcpOnlyBridge {
                 });
             }
         });
-        TcpOnlyBridge { addr, stop, _udp_hole: hole }
+        TcpOnlyBridge {
+            addr,
+            stop,
+            _udp_hole: hole,
+        }
     }
 }
 
@@ -1834,18 +2473,33 @@ fn e2e_udp_заблокирован_движок_уходит_на_tcp() {
     let bridge = TcpOnlyBridge::start(local(server.addr));
 
     let mut a = Node::start("alpha", &server);
-    a.wait("A подключён", T, |e| matches!(e, Event::Connected(_)));
+    a.wait("A подключён", T, |e| {
+        matches!(e, Event::Connected(_))
+    });
     assert_eq!(a.eng.meta.lock().unwrap().transport, engine::Transport::Udp);
 
     // B видит сервер только по TCP: auto — несколько HELLO3 по UDP, потом TCP.
-    let cfg = Config { name: "bravo".into(), ..Config::default() };
-    let mut b = Node::start_cfg(cfg, bridge.addr, server.pubkey, proto::Identity::generate(), Arc::new(|_| {}))
-        .expect("B подключается по TCP");
+    let cfg = Config {
+        name: "bravo".into(),
+        ..Config::default()
+    };
+    let mut b = Node::start_cfg(
+        cfg,
+        bridge.addr,
+        server.pubkey,
+        proto::Identity::generate(),
+        Arc::new(|_| {}),
+    )
+    .expect("B подключается по TCP");
     assert_eq!(b.eng.meta.lock().unwrap().transport, engine::Transport::Tcp);
 
     let gid = a.create("tcp", false);
     b.join(gid);
-    wait_until("оба видят друг друга онлайн", T, || a.sees_online(gid, 1) && b.sees_online(gid, 1));
+    wait_until(
+        "оба видят друг друга онлайн",
+        T,
+        || a.sees_online(gid, 1) && b.sees_online(gid, 1),
+    );
     deliver(&a, &b, gid, "a-to-b", T);
     deliver(&b, &a, gid, "b-to-a", T);
 
@@ -1856,14 +2510,26 @@ fn e2e_udp_заблокирован_движок_уходит_на_tcp() {
         ..Config::default()
     };
     let t0 = Instant::now();
-    let c = Node::start_cfg(cfg, bridge.addr, server.pubkey, proto::Identity::generate(), Arc::new(|_| {}))
-        .expect("C подключается по TCP");
-    assert!(t0.elapsed() < Duration::from_secs(2), "режим tcp не ждёт UDP");
+    let c = Node::start_cfg(
+        cfg,
+        bridge.addr,
+        server.pubkey,
+        proto::Identity::generate(),
+        Arc::new(|_| {}),
+    )
+    .expect("C подключается по TCP");
+    assert!(
+        t0.elapsed() < Duration::from_secs(2),
+        "режим tcp не ждёт UDP"
+    );
     assert_eq!(c.eng.meta.lock().unwrap().transport, engine::Transport::Tcp);
 
     // CLI-соединение: тот же фолбэк.
     let cli = engine::CtrlConn::connect(
-        &Config { name: "delta".into(), ..Config::default() },
+        &Config {
+            name: "delta".into(),
+            ..Config::default()
+        },
         bridge.addr,
         &server.pubkey,
         &proto::Identity::generate(),

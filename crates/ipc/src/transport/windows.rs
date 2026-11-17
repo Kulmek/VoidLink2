@@ -202,7 +202,10 @@ impl Listener {
 
     /// Поднимает пайп; `owner_sid` — SID пользователя, записанный при установке.
     /// Падает, если пайп с таким именем уже существует (`FIRST_PIPE_INSTANCE`).
-    pub fn bind_with_owner(name: impl AsRef<OsStr>, owner_sid: Option<&str>) -> io::Result<Listener> {
+    pub fn bind_with_owner(
+        name: impl AsRef<OsStr>,
+        owner_sid: Option<&str>,
+    ) -> io::Result<Listener> {
         let sd = SecDesc::from_sddl(&pipe_sddl(owner_sid)?)?;
         let l = Listener {
             name: wide(name.as_ref()),
@@ -264,7 +267,9 @@ impl Listener {
         };
         let ev = new_event()?;
         let h = pipe.as_raw_handle();
-        let res = overlapped(h, ev.as_raw_handle(), None, |ov| unsafe { ConnectNamedPipe(h, ov) });
+        let res = overlapped(h, ev.as_raw_handle(), None, |ov| unsafe {
+            ConnectNamedPipe(h, ov)
+        });
         match res {
             Ok(_) => {}
             // Клиент подключился между CreateNamedPipe и ConnectNamedPipe.
@@ -330,7 +335,9 @@ fn server_is_system(pipe: HANDLE) -> io::Result<bool> {
     match process_is_system(pid) {
         Ok(v) => Ok(v),
         // Токен службы непривилегированному пользователю обычно не открыть.
-        Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => pipe_owner_is_system(pipe),
+        Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
+            pipe_owner_is_system(pipe)
+        }
         Err(e) => Err(e),
     }
 }
@@ -434,12 +441,17 @@ impl Read for Conn {
         let h = self.handle.as_raw_handle();
         let len = buf.len().min(u32::MAX as usize) as u32;
         let ptr = buf.as_mut_ptr();
-        match overlapped(h, self.event.as_raw_handle(), Some(&self.closed), |ov| unsafe {
-            ReadFile(h, ptr, len, ptr::null_mut(), ov)
-        }) {
+        match overlapped(
+            h,
+            self.event.as_raw_handle(),
+            Some(&self.closed),
+            |ov| unsafe { ReadFile(h, ptr, len, ptr::null_mut(), ov) },
+        ) {
             Ok(n) => Ok(n as usize),
             // Отменено нашим shutdown — EOF, как на unix.
-            Err(e) if e.raw_os_error() == Some(ERROR_OPERATION_ABORTED as i32) && self.is_closed() => {
+            Err(e)
+                if e.raw_os_error() == Some(ERROR_OPERATION_ABORTED as i32) && self.is_closed() =>
+            {
                 Ok(0)
             }
             // Пир закрыл пайп — это EOF.
@@ -465,11 +477,16 @@ impl Write for Conn {
         let h = self.handle.as_raw_handle();
         let len = buf.len().min(u32::MAX as usize) as u32;
         let ptr = buf.as_ptr();
-        match overlapped(h, self.event.as_raw_handle(), Some(&self.closed), |ov| unsafe {
-            WriteFile(h, ptr, len, ptr::null_mut(), ov)
-        }) {
+        match overlapped(
+            h,
+            self.event.as_raw_handle(),
+            Some(&self.closed),
+            |ov| unsafe { WriteFile(h, ptr, len, ptr::null_mut(), ov) },
+        ) {
             Ok(n) => Ok(n as usize),
-            Err(e) if e.raw_os_error() == Some(ERROR_OPERATION_ABORTED as i32) && self.is_closed() => {
+            Err(e)
+                if e.raw_os_error() == Some(ERROR_OPERATION_ABORTED as i32) && self.is_closed() =>
+            {
                 Err(closed_err())
             }
             Err(e) => Err(e),

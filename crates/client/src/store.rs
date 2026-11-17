@@ -195,7 +195,9 @@ pub fn default_dir() -> PathBuf {
 impl Store {
     pub fn new(dir: &Path) -> Self {
         let _ = std::fs::create_dir_all(dir);
-        Self { path: dir.join("client.json") }
+        Self {
+            path: dir.join("client.json"),
+        }
     }
 
     pub fn load(&self) -> Result<Config> {
@@ -216,14 +218,22 @@ impl Store {
 /// Инициализация identity: загрузка из конфига или генерация новой.
 pub fn ensure_identity(cfg: &mut Config) -> proto::Identity {
     if let Some(si) = &cfg.identity
-        && let (Ok(ed), Ok(x)) = (proto::hex_to_bytes(&si.ed_seed), proto::hex_to_bytes(&si.x_seed))
-            && ed.len() == 32 && x.len() == 32 {
-                let mut edb = [0u8; 32];
-                let mut xb = [0u8; 32];
-                edb.copy_from_slice(&ed);
-                xb.copy_from_slice(&x);
-                return proto::Identity { ed_seed: edb, x_seed: xb };
-            }
+        && let (Ok(ed), Ok(x)) = (
+            proto::hex_to_bytes(&si.ed_seed),
+            proto::hex_to_bytes(&si.x_seed),
+        )
+        && ed.len() == 32
+        && x.len() == 32
+    {
+        let mut edb = [0u8; 32];
+        let mut xb = [0u8; 32];
+        edb.copy_from_slice(&ed);
+        xb.copy_from_slice(&x);
+        return proto::Identity {
+            ed_seed: edb,
+            x_seed: xb,
+        };
+    }
     let id = proto::Identity::generate();
     cfg.identity = Some(StoredIdentity {
         ed_seed: proto::hex_of(&id.ed_seed),
@@ -239,9 +249,10 @@ pub fn resolve_peer(cfg: &Config, token: &str) -> Result<[u8; 32]> {
     }
     let t = token.trim().to_lowercase();
     if let Ok(v) = proto::hex_to_bytes(&t)
-        && v.len() == 32 {
-            return Ok(v.try_into().unwrap());
-        }
+        && v.len() == 32
+    {
+        return Ok(v.try_into().unwrap());
+    }
     if let Some(f) = cfg.friends.iter().find(|f| f.alias.to_lowercase() == t) {
         let v = proto::hex_to_bytes(&f.pubkey)?;
         anyhow::ensure!(v.len() == 32, "bad stored pubkey");
@@ -262,9 +273,15 @@ mod tests {
         let d = Config::default();
         assert!(d.lan_discovery);
         assert_eq!(d.mtu, DEFAULT_MTU);
-        let wild = Config { mtu: 9000, ..Config::default() };
+        let wild = Config {
+            mtu: 9000,
+            ..Config::default()
+        };
         assert_eq!(wild.mtu(), MTU_MAX);
-        let zero = Config { mtu: 0, ..Config::default() };
+        let zero = Config {
+            mtu: 0,
+            ..Config::default()
+        };
         assert_eq!(zero.mtu(), MTU_MIN);
     }
 
@@ -273,7 +290,10 @@ mod tests {
         let a: SocketAddr = "1.1.1.1:5555".parse().unwrap();
         let b: SocketAddr = "2.2.2.2:5555".parse().unwrap();
         // Старый конфиг: список принадлежит первому активированному серверу.
-        let mut cfg = Config { autojoin: vec![1, 2], ..Config::default() };
+        let mut cfg = Config {
+            autojoin: vec![1, 2],
+            ..Config::default()
+        };
         assert!(cfg.activate_server(a));
         assert_eq!(cfg.autojoin, vec![1, 2]);
         assert!(!cfg.activate_server(a));
@@ -290,7 +310,11 @@ mod tests {
     fn перезакрепление_ключа_по_адресу() {
         let a: SocketAddr = "1.1.1.1:5555".parse().unwrap();
         let mut cfg = Config {
-            servers: vec![StoredServer { addr: a.to_string(), pubkey: "00".into(), label: String::new() }],
+            servers: vec![StoredServer {
+                addr: a.to_string(),
+                pubkey: "00".into(),
+                label: String::new(),
+            }],
             ..Config::default()
         };
         assert!(cfg.repin_server(a, &[0xab; 32]));

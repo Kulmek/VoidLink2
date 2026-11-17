@@ -53,7 +53,10 @@ fn win_err(code: i32) -> impl Fn(&windows_service::Error) -> bool {
 /// установлена, они попадают в [`InstallReport::warnings`].
 pub fn install(opts: &InstallOptions) -> Result<InstallReport> {
     if !opts.daemon_exe.is_absolute() {
-        bail!("путь службы должен быть абсолютным: {}", opts.daemon_exe.display());
+        bail!(
+            "путь службы должен быть абсолютным: {}",
+            opts.daemon_exe.display()
+        );
     }
     let dir = data_dir();
     prepare_data_dir(&dir)?;
@@ -88,7 +91,13 @@ pub fn install(opts: &InstallOptions) -> Result<InstallReport> {
     {
         warnings.push(format!("запуск службы: {e:#}"));
     }
-    Ok(InstallReport { data_dir: dir, config_imported, owner_sid, service_updated, warnings })
+    Ok(InstallReport {
+        data_dir: dir,
+        config_imported,
+        owner_sid,
+        service_updated,
+        warnings,
+    })
 }
 
 /// Каталог данных, которому можно доверять. Существующий каталог
@@ -129,7 +138,8 @@ fn prepare_data_dir(dir: &Path) -> Result<()> {
 /// созданием — это ошибка, а не молчаливое использование чужого каталога.
 fn create_fresh_dir(dir: &Path) -> Result<()> {
     if let Some(parent) = dir.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("создание {}", parent.display()))?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("создание {}", parent.display()))?;
     }
     std::fs::create_dir(dir).with_context(|| format!("создание {}", dir.display()))
 }
@@ -168,7 +178,11 @@ where
             Err(e) => errors.push(format!("{}: {e}", dir.display())),
         }
     }
-    if errors.is_empty() { Ok(()) } else { Err(anyhow!(errors.join("; "))) }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(errors.join("; ")))
+    }
 }
 
 fn install_service(opts: &InstallOptions) -> Result<bool> {
@@ -193,16 +207,22 @@ fn install_service(opts: &InstallOptions) -> Result<bool> {
     let (svc, updated) = match mgr.create_service(&info, access) {
         Ok(s) => (s, false),
         Err(e) if win_err(ERROR_SERVICE_EXISTS)(&e) => {
-            let s = mgr.open_service(&opts.service_name, access).context("OpenService")?;
+            let s = mgr
+                .open_service(&opts.service_name, access)
+                .context("OpenService")?;
             s.change_config(&info).context("ChangeServiceConfig")?;
             (s, true)
         }
         Err(e) => return Err(e).context("CreateService"),
     };
-    svc.set_description(&opts.description).context("описание службы")?;
+    svc.set_description(&opts.description)
+        .context("описание службы")?;
     let actions = RECOVERY_DELAYS
         .iter()
-        .map(|&delay| ServiceAction { action_type: ServiceActionType::Restart, delay })
+        .map(|&delay| ServiceAction {
+            action_type: ServiceActionType::Restart,
+            delay,
+        })
         .collect();
     svc.update_failure_actions(ServiceFailureActions {
         reset_period: ServiceFailureResetPeriod::After(RECOVERY_RESET),
@@ -354,8 +374,7 @@ fn set_dir_acl(dir: &Path, sddl: &str) -> Result<()> {
                 bail!("в SDDL нет DACL");
             }
             let mut owner: PSID = std::ptr::null_mut();
-            if GetSecurityDescriptorOwner(sd, &mut owner, &mut defaulted) == 0 || owner.is_null()
-            {
+            if GetSecurityDescriptorOwner(sd, &mut owner, &mut defaulted) == 0 || owner.is_null() {
                 bail!("в SDDL нет владельца");
             }
             let rc = TreeSetNamedSecurityInfoW(

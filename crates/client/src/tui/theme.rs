@@ -304,7 +304,13 @@ impl Theme {
         let c = Palette::of(kind);
         let fg = |col: Color| Style::default().fg(col);
         let contrast = kind == ThemeKind::Contrast;
-        let strong = |s: Style| if contrast { s.add_modifier(Modifier::BOLD) } else { s };
+        let strong = |s: Style| {
+            if contrast {
+                s.add_modifier(Modifier::BOLD)
+            } else {
+                s
+            }
+        };
         Theme {
             c,
             base: fg(c.text),

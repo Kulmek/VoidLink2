@@ -47,7 +47,12 @@ impl Utun {
     pub fn open(mtu: usize) -> Result<Self> {
         let fd = open_utun_fd().context("создание utun (запуск от root?)")?;
         let name = read_ifname(fd.as_raw_fd()).context("чтение имени utun")?;
-        let dev = Utun { fd, name, v4: Mutex::new(HashSet::new()), v6: Mutex::new(HashSet::new()) };
+        let dev = Utun {
+            fd,
+            name,
+            v4: Mutex::new(HashSet::new()),
+            v6: Mutex::new(HashSet::new()),
+        };
         dev.set_mtu(mtu)?;
         run(&ifconfig_up_args(&dev.name)).context("ifconfig up")?;
         eprintln!("[tun] utun {} создан, mtu {mtu}", dev.name);
@@ -77,8 +82,14 @@ impl Utun {
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
         let mut hdr = [0u8; AF_HEADER_LEN];
         let mut iov = [
-            libc::iovec { iov_base: hdr.as_mut_ptr().cast(), iov_len: AF_HEADER_LEN },
-            libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len().min(MAX_PACKET) },
+            libc::iovec {
+                iov_base: hdr.as_mut_ptr().cast(),
+                iov_len: AF_HEADER_LEN,
+            },
+            libc::iovec {
+                iov_base: buf.as_mut_ptr().cast(),
+                iov_len: buf.len().min(MAX_PACKET),
+            },
         ];
         loop {
             // SAFETY: msghdr — POD, нули валидны; iov указывают на живые буферы нужной длины.
@@ -95,14 +106,23 @@ impl Utun {
                 return Err(e);
             }
             if msg.msg_flags & libc::MSG_TRUNC != 0 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "utun: пакет больше буфера, обрезан"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "utun: пакет больше буфера, обрезан",
+                ));
             }
             let n = n as usize;
             if n < AF_HEADER_LEN {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "utun: короткий пакет"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "utun: короткий пакет",
+                ));
             }
             if !is_ip_family(af_from_header(hdr)) {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "utun: неизвестное семейство адресов"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "utun: неизвестное семейство адресов",
+                ));
             }
             return Ok(n - AF_HEADER_LEN);
         }
@@ -111,11 +131,20 @@ impl Utun {
     /// Пишет один IP-пакет; заголовок семейства выбирается по версии IP.
     pub fn write(&self, packet: &[u8]) -> io::Result<usize> {
         let Some(hdr) = af_header_for(packet) else {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "utun: не IPv4/IPv6 пакет"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "utun: не IPv4/IPv6 пакет",
+            ));
         };
         let iov = [
-            libc::iovec { iov_base: hdr.as_ptr() as *mut _, iov_len: AF_HEADER_LEN },
-            libc::iovec { iov_base: packet.as_ptr() as *mut _, iov_len: packet.len() },
+            libc::iovec {
+                iov_base: hdr.as_ptr() as *mut _,
+                iov_len: AF_HEADER_LEN,
+            },
+            libc::iovec {
+                iov_base: packet.as_ptr() as *mut _,
+                iov_len: packet.len(),
+            },
         ];
         loop {
             // SAFETY: iov указывают на живые буферы нужной длины, ядро их только читает.
@@ -234,7 +263,10 @@ fn read_ifname(fd: RawFd) -> io::Result<String> {
 
 fn run(args: &[String]) -> Result<()> {
     let (cmd, rest) = args.split_first().context("пустая команда")?;
-    let out = Command::new(cmd).args(rest).output().with_context(|| format!("запуск {cmd}"))?;
+    let out = Command::new(cmd)
+        .args(rest)
+        .output()
+        .with_context(|| format!("запуск {cmd}"))?;
     if !out.status.success() {
         bail!(
             "{} завершился с ошибкой: {}{}",
@@ -297,7 +329,15 @@ fn mtu_args(ifname: &str, mtu: usize) -> Vec<String> {
 /// `ifconfig utunN inet <ip> <ip> netmask 255.255.255.0 [alias]`.
 fn ifconfig_inet_args(ifname: &str, ip: u32, alias: bool) -> Vec<String> {
     let a = Ipv4Addr::from(ip).to_string();
-    let mut v = vec![s("ifconfig"), s(ifname), s("inet"), a.clone(), a, s("netmask"), s("255.255.255.0")];
+    let mut v = vec![
+        s("ifconfig"),
+        s(ifname),
+        s("inet"),
+        a.clone(),
+        a,
+        s("netmask"),
+        s("255.255.255.0"),
+    ];
     if alias {
         v.push(s("alias"));
     }
@@ -318,7 +358,15 @@ fn route_add_args(ifname: &str, ip: u32) -> Vec<String> {
 }
 
 fn ifconfig_inet6_args(ifname: &str, ip: Ipv6Addr, prefix: u8) -> Vec<String> {
-    vec![s("ifconfig"), s(ifname), s("inet6"), ip.to_string(), s("prefixlen"), prefix.to_string(), s("alias")]
+    vec![
+        s("ifconfig"),
+        s(ifname),
+        s("inet6"),
+        ip.to_string(),
+        s("prefixlen"),
+        prefix.to_string(),
+        s("alias"),
+    ]
 }
 
 /// `route add` для уже существующего маршрута пишет «File exists».
@@ -380,7 +428,9 @@ mod tests {
 
     #[test]
     fn route_exists_detection() {
-        assert!(route_exists_error("route: writing to routing socket: File exists"));
+        assert!(route_exists_error(
+            "route: writing to routing socket: File exists"
+        ));
         assert!(!route_exists_error("route: bad address"));
     }
 
@@ -393,6 +443,7 @@ mod tests {
         let a = ip(100, 66, 250, 9);
         dev.ensure_address(a).expect("addr");
         dev.ensure_address(a).expect("addr повторно");
-        dev.ensure_address(ip(100, 66, 251, 9)).expect("второй адрес");
+        dev.ensure_address(ip(100, 66, 251, 9))
+            .expect("второй адрес");
     }
 }

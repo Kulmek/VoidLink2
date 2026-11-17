@@ -226,7 +226,7 @@ mod tests {
 
     #[test]
     fn сверка_с_эталоном_на_случайных_последовательностях() {
-        use rand::{rngs::StdRng, RngExt, SeedableRng};
+        use rand::{RngExt, SeedableRng, rngs::StdRng};
         use std::collections::HashSet;
         let mut rng = StdRng::seed_from_u64(0x5eed);
         for _ in 0..50 {
@@ -239,7 +239,9 @@ mod tests {
                 let c = match rng.random_range(0..20) {
                     0 => base.saturating_add(rng.random_range(0..5000)),
                     1 => base.saturating_sub(rng.random_range(0..3000)),
-                    _ => base.saturating_add(rng.random_range(0..40)).saturating_sub(20),
+                    _ => base
+                        .saturating_add(rng.random_range(0..40))
+                        .saturating_sub(20),
                 };
                 base = base.max(c);
                 let expect = match top {

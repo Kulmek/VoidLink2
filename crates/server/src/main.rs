@@ -113,7 +113,10 @@ fn main() -> Result<()> {
             "--max-invites-per-target" => l.max_invites_per_target = value(&args, i, a)?,
             "--metrics" => {
                 let m: String = value(&args, i, a)?;
-                cfg.metrics = Some(m.parse::<SocketAddr>().context("--metrics: неверный адрес")?);
+                cfg.metrics = Some(
+                    m.parse::<SocketAddr>()
+                        .context("--metrics: неверный адрес")?,
+                );
             }
             "--tcp" | "--no-tcp" => {
                 cfg.tcp = a == "--tcp";
@@ -129,7 +132,9 @@ fn main() -> Result<()> {
                 i += 1;
                 continue;
             }
-            other if other.starts_with('-') => anyhow::bail!("неизвестный флаг {other:?} (см. --help)"),
+            other if other.starts_with('-') => {
+                anyhow::bail!("неизвестный флаг {other:?} (см. --help)")
+            }
             other => {
                 listen = other.to_string();
                 i += 1;
@@ -157,7 +162,10 @@ fn main() -> Result<()> {
     ] {
         anyhow::ensure!(v.is_finite() && v >= 1.0, "{name}: нужно число ≥ 1");
     }
-    anyhow::ensure!(!l.session_timeout.is_zero(), "--session-timeout: нужно ≥ 1 с");
+    anyhow::ensure!(
+        !l.session_timeout.is_zero(),
+        "--session-timeout: нужно ≥ 1 с"
+    );
     anyhow::ensure!(!l.invite_ttl.is_zero(), "--invite-ttl-days: нужно ≥ 1");
     cfg.listen = listen.parse::<SocketAddr>().context("bad listen addr")?;
     // Обработчики — до старта: сигнал в первые миллисекунды тоже корректно

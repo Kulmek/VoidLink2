@@ -194,8 +194,9 @@ impl PendingInvites {
     /// Отказ отправлен (`Cmd::DeclineInvite`): убрать сразу, не дожидаясь
     /// списка от сервера, и запомнить на [`INVITE_DECLINE_MEMORY`].
     pub fn on_decline(&mut self, gid: u32, now: Instant) -> Option<Invite> {
-        self.declined
-            .retain(|(g, t)| *g != gid && now.saturating_duration_since(*t) < INVITE_DECLINE_MEMORY);
+        self.declined.retain(|(g, t)| {
+            *g != gid && now.saturating_duration_since(*t) < INVITE_DECLINE_MEMORY
+        });
         self.declined.push((gid, now));
         self.remove(gid, now)
     }
@@ -304,7 +305,11 @@ mod tests {
         let later = t + Duration::from_secs(1);
         assert_eq!(p.on_invite(renamed, later), InviteOutcome::Updated);
         let l = p.list(later);
-        assert_eq!(l.iter().map(|i| i.gid).collect::<Vec<_>>(), vec![1, 2], "по gid");
+        assert_eq!(
+            l.iter().map(|i| i.gid).collect::<Vec<_>>(),
+            vec![1, 2],
+            "по gid"
+        );
         assert_eq!(l[1].group_name, "новое имя");
         assert_eq!(l[1].from_name, "charlie");
         assert_eq!(l[1].from_pubkey, [3; 32]);
@@ -331,7 +336,10 @@ mod tests {
         let mut p = PendingInvites::new();
         p.on_invite(inc(1), t);
         p.on_invite(inc(2), t);
-        assert_eq!(p.on_group_deleted(1, t).map(|i| i.group_name), Some("g1".into()));
+        assert_eq!(
+            p.on_group_deleted(1, t).map(|i| i.group_name),
+            Some("g1".into())
+        );
         assert_eq!(p.on_revoked(2, t).map(|i| i.gid), Some(2));
         // Отзыв неизвестного — None (фронтенд не тостит).
         assert!(p.on_revoked(2, t).is_none());
@@ -439,7 +447,10 @@ mod tests {
         let now = fresh_at + INVITE_SYNC_GRACE - Duration::from_millis(1);
         let gone = p.on_synced(&[], 0, true, now);
         assert_eq!(gone, named(&[(1, "g1")]));
-        assert!(p.contains(2), "свежее приглашение не снято устаревшим списком");
+        assert!(
+            p.contains(2),
+            "свежее приглашение не снято устаревшим списком"
+        );
         // Ровно через INVITE_SYNC_GRACE — уже снимается (как `>=` в App).
         let gone = p.on_synced(&[], 0, true, fresh_at + INVITE_SYNC_GRACE);
         assert_eq!(gone, named(&[(2, "g2")]));
@@ -461,7 +472,10 @@ mod tests {
         p.on_invite(a, t + Duration::from_secs(9));
         assert!(p.tick(t + Duration::from_secs(15)).is_empty());
         // Повтор без срока (v2-сервер) срок не снимает.
-        assert_eq!(p.on_invite(inc(1), t + Duration::from_secs(15)), InviteOutcome::Updated);
+        assert_eq!(
+            p.on_invite(inc(1), t + Duration::from_secs(15)),
+            InviteOutcome::Updated
+        );
         let gone = p.tick(t + Duration::from_secs(19));
         assert_eq!(gone.iter().map(|i| i.gid).collect::<Vec<_>>(), vec![1]);
         assert_eq!(gone[0].expires_in_s, Some(0));
@@ -495,6 +509,9 @@ mod tests {
     #[test]
     fn константы_совпадают_с_tui() {
         assert_eq!(INVITE_SYNC_GRACE, crate::tui::app::INVITE_SYNC_GRACE);
-        assert_eq!(INVITE_DECLINE_MEMORY, crate::tui::app::INVITE_DECLINE_MEMORY);
+        assert_eq!(
+            INVITE_DECLINE_MEMORY,
+            crate::tui::app::INVITE_DECLINE_MEMORY
+        );
     }
 }
