@@ -1560,3 +1560,82 @@ fn e2e_потерянный_presence_повторяется_до_подтвер�
     server.stop();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Управляющие фреймы сервера клиенту типа `typ`, прошедшие посредника.
+fn from_server(p: &LossyProxy, typ: u8) -> usize {
+    p.tap
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(to_server, d)| !*to_server && proto::split_frame(d).is_ok_and(|(t, _)| t == typ))
+        .count()
+}
+
+#[test]
+fn e2e_переименование_и_передача_дельтой_kind3_удаление_без_сверки_ревизии() {
+    let dir = temp_dir("meta-delta");
+    let server = start_server(&dir, 0);
+    let proxy = LossyProxy::start(local(server.addr), Box::new(|_, _, _| false));
+    let mut a = Node::start("alpha", &server);
+    let mut b = Node::start_via("bravo", proxy.addr, server.pubkey, proto::Identity::generate());
+    let mut c = Node::start("charlie", &server);
+    for n in [&mut a, &mut b, &mut c] {
+        n.wait("подключён", T, |e| matches!(e, Event::Connected(_)));
+    }
+    let gid = a.create("old-name", false);
+    b.join(gid);
+    c.join(gid);
+    wait_until("все видят всех", T, || a.sees_online(gid, 2) && b.sees_online(gid, 2) && c.sees_online(gid, 2));
+    let rev = |n: &Node| n.eng.groups.lock().unwrap().get(&gid).map(|g| g.rev);
+    let name = |n: &Node| n.eng.groups.lock().unwrap().get(&gid).map(|g| g.name.clone());
+    wait_until("ревизия у всех одна", T, || rev(&a) == rev(&b) && rev(&b) == rev(&c));
+    std::thread::sleep(Duration::from_millis(300));
+    let states0 = from_server(&proxy, ctrl::GROUP_STATE);
+    assert!(states0 > 0, "посредник не видит GROUP_STATE входа — проверка ниже пуста");
+    let gets0 = proxy.sent(ctrl::GET_GROUP);
+    let rev0 = rev(&b).unwrap();
+
+    // (b) RENAME — дельта kind 3: имя меняется у всех, без полного состояния.
+    a.eng.cmds.send(Cmd::Rename(gid, "new-name".into())).unwrap();
+    wait_until("имя сменилось у всех", T, || {
+        [&a, &b, &c].iter().all(|n| name(n).as_deref() == Some("new-name"))
+    });
+    assert_eq!(rev(&b), Some(rev0 + 1), "переименование — одна ревизия");
+    assert_eq!(rev(&a), rev(&b));
+    assert_eq!(rev(&c), rev(&b));
+
+    // (c) TRANSFER_OWNER — дельта kind 3: новый владелец у всех.
+    let c_pub = c.eng.my_pub;
+    a.eng.cmds.send(Cmd::Transfer(gid, c_pub)).unwrap();
+    wait_until("владелец сменился у всех", T, || {
+        [&a, &b, &c].iter().all(|n| n.owner(gid) == Some(c_pub))
+    });
+    assert_eq!(rev(&b), Some(rev0 + 2), "передача — одна ревизия");
+    assert_eq!(name(&b).as_deref(), Some("new-name"), "передача затёрла имя");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(from_server(&proxy, ctrl::GROUP_STATE), states0, "B получил GROUP_STATE вместо дельты");
+    assert_eq!(proxy.sent(ctrl::GET_GROUP), gets0, "B запрашивал полное состояние");
+    // Группа жива после дельт.
+    deliver(&b, &c, gid, "after-meta", T);
+
+    // (a) Удаление: GROUP_STATE deleted (rev 0) применяется в обход сверки
+    // ревизии — у всех группа исчезает с событием GroupDeleted.
+    let marks = [a.seen.len(), b.seen.len(), c.seen.len()];
+    c.eng.cmds.send(Cmd::Delete(gid)).unwrap();
+    for (n, mark) in [(&mut a, marks[0]), (&mut b, marks[1]), (&mut c, marks[2])] {
+        n.wait("группа удалена", T, |e| {
+            matches!(e, Event::GroupDeleted { gid: g, name } if *g == gid && name == "new-name")
+        });
+        assert!(!n.has_group(gid), "группа осталась после удаления");
+        assert!(!n.saw_since(mark, |e| matches!(e, Event::GroupJoined { gid: g, .. } if *g == gid)));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    for n in [&a, &b, &c] {
+        assert!(!n.has_group(gid), "группа вернулась после удаления");
+    }
+
+    drop((a, b, c));
+    drop(proxy);
+    server.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
