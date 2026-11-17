@@ -90,6 +90,16 @@ const GROUP_NAME_MAX_CHARS: usize = 48;
 /// последнего).
 const INVITES_PER_LIST: usize = 16;
 /// Ответ на v2 HELLO и HELLO3 другой версии.
+/// Повтор WELCOME на повтор HELLO3 той же попытки — не чаще (клиент
+/// повторяет HELLO3 раз в секунду): поток перехваченных HELLO3 с адреса
+/// жертвы даёт ей не больше двух WELCOME в секунду.
+const WELCOME_RESEND_GAP: Duration = Duration::from_millis(500);
+/// Сколько помнится `(ed_pub, eph_pub)` закрытой сессии: дольше срока
+/// cookie (текущий и предыдущий bucket — до 60 с) с запасом на часы.
+const RETIRED_EPH_TTL: Duration = Duration::from_secs(2 * hs::COOKIE_BUCKET_SECS + 5);
+/// Порог, после которого `retired_eph` чистится от истёкших записей.
+const RETIRED_EPH_PURGE: usize = 256;
+
 const UNSUPPORTED_TEXT: &str = "сервер VoidLink v3: обновите клиент";
 
 // ---------- конфигурация и запуск ----------
@@ -203,6 +213,7 @@ impl Server {
                 groups: loaded.groups,
                 next_gid: loaded.next_gid,
                 invite_ttl_ms: duration_ms(cfg.limits.invite_ttl),
+                retired_eph: HashMap::new(),
             }),
             identity: loaded.identity,
             links: loaded.links,
@@ -397,6 +408,9 @@ struct Session {
     keys: proto::DirKeys,
     /// Готовый WELCOME этой сессии: повтор HELLO3 получает его же.
     welcome: Vec<u8>,
+    /// Когда WELCOME уходил последний раз, мс от старта сервера
+    /// (`WELCOME_RESEND_GAP`).
+    welcome_at: AtomicU64,
     /// Счётчик nonce s2c (с 0, строго растёт; атомарный — шифруют и
     /// воркеры под блокировкой на чтение).
     tx: AtomicU64,
@@ -500,6 +514,10 @@ struct State {
     next_gid: u32,
     /// `Limits::invite_ttl` в мс (нужен почти всем спискам приглашений).
     invite_ttl_ms: u64,
+    /// `(ed_pub, eph_pub)` закрытых сессий → когда закрыта. HELLO3 с таким
+    /// ключом (старая попытка клиента, повторённая в пределах срока cookie)
+    /// игнорируется: иначе он пересоздавал бы живую сессию.
+    retired_eph: HashMap<([u8; 32], [u8; 32]), Instant>,
 }
 
 impl State {
@@ -518,7 +536,18 @@ impl State {
         if self.by_pub.get(&ses.ed_pub) == Some(addr) {
             self.by_pub.remove(&ses.ed_pub);
         }
+        let now = Instant::now();
+        if self.retired_eph.len() >= RETIRED_EPH_PURGE {
+            self.retired_eph.retain(|_, t| now.duration_since(*t) < RETIRED_EPH_TTL);
+        }
+        self.retired_eph.insert((ses.ed_pub, ses.eph_pub), now);
         Some(ses)
+    }
+
+    /// Эфемерный ключ закрытой сессии этой identity, cookie под него ещё
+    /// может быть жив.
+    fn eph_retired(&self, ed: &[u8; 32], eph: &[u8; 32]) -> bool {
+        self.retired_eph.get(&(*ed, *eph)).is_some_and(|t| t.elapsed() < RETIRED_EPH_TTL)
     }
 
     fn groups_of(&self, pk: &[u8; 32]) -> Vec<u32> {
@@ -1521,9 +1550,17 @@ fn handle_hello3(sh: &Shared, src: SocketAddr, body: &[u8]) {
             && ses.ed_pub == h.ed_pub
             && ses.eph_pub == h.eph_pub
         {
-            push_hello_replay(src, ses, &mut out);
+            push_hello_replay(sh, src, ses, &mut out);
             drop(s);
             sh.flush(out);
+            return;
+        }
+        // HELLO3 прошлой попытки (её сессию уже сменила более новая или
+        // закрыл таймаут) — молча: cookie под старый eph ещё жив, но
+        // пересоздавать сессию и рассылать состояние по нему нельзя.
+        if s.eph_retired(&h.ed_pub, &h.eph_pub) {
+            drop(s);
+            sh.drop_frame();
             return;
         }
     }
@@ -1546,7 +1583,9 @@ fn handle_hello3(sh: &Shared, src: SocketAddr, body: &[u8]) {
             && ses.ed_pub == h.ed_pub
             && ses.eph_pub == h.eph_pub
         {
-            push_hello_replay(src, ses, &mut out);
+            push_hello_replay(sh, src, ses, &mut out);
+        } else if s.eph_retired(&h.ed_pub, &h.eph_pub) {
+            sh.drop_frame();
         } else {
             install_session(sh, &mut s, src, &h, keys, welcome, &mut out);
         }
@@ -1559,8 +1598,18 @@ fn handle_hello3(sh: &Shared, src: SocketAddr, body: &[u8]) {
 /// первым, клиент либо держит (принятые до WELCOME разбираются после него),
 /// либо дочитает сам (GROUP_LIST → GET_GROUP, LIST_INVITES). Повтор всего
 /// состояния превращал бы перехваченный HELLO3 (cookie живёт до 60 с) в
-/// усилитель: ~200 байт → все GROUP_STATE клиента.
-fn push_hello_replay(src: SocketAddr, ses: &Session, out: &mut Outbox) {
+/// усилитель: ~200 байт → все GROUP_STATE клиента. И сам WELCOME — не
+/// чаще `WELCOME_RESEND_GAP`.
+fn push_hello_replay(sh: &Shared, src: SocketAddr, ses: &Session, out: &mut Outbox) {
+    let now = sh.now_ms();
+    let gap = WELCOME_RESEND_GAP.as_millis() as u64;
+    let last = ses.welcome_at.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < gap
+        || ses.welcome_at.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err()
+    {
+        sh.drop_frame();
+        return;
+    }
     out.push((src, ses.welcome.clone()));
 }
 
@@ -1612,6 +1661,7 @@ fn install_session(
             status: status.clone(),
             keys,
             welcome: welcome.clone(),
+            welcome_at: AtomicU64::new(sh.now_ms()),
             tx: AtomicU64::new(0),
             msg_id: AtomicU32::new(0),
             rx: Mutex::new(proto::ReplayWindow::new()),
@@ -2205,6 +2255,7 @@ mod tests {
             groups: HashMap::new(),
             next_gid: GID_MIN,
             invite_ttl_ms: duration_ms(Limits::default().invite_ttl),
+            retired_eph: HashMap::new(),
         }
     }
 
@@ -2616,6 +2667,64 @@ mod tests {
         assert!(seen.is_empty(), "за повтором WELCOME пришло: {seen:02x?}");
         a.send(ctrl::GET_GROUP, &payloads::enc_gid(gid));
         assert_eq!(a.state().gid, gid, "сессия жива");
+
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn повтор_старого_hello3_не_пересоздаёт_сессию_и_welcome_ограничен() {
+        // Типы всех датаграмм (и открытых) за `wait`.
+        fn raw_types(sock: &UdpSocket, wait: Duration) -> Vec<u8> {
+            let end = Instant::now() + wait;
+            let mut buf = [0u8; 65_535];
+            let mut seen = Vec::new();
+            while Instant::now() < end {
+                if let Ok((n, _)) = sock.recv_from(&mut buf)
+                    && let Ok((typ, _)) = proto::split_frame(&buf[..n])
+                {
+                    seen.push(typ);
+                }
+            }
+            seen
+        }
+        let (server, dir) = test_server("hello-replay");
+        let id = proto::Identity::generate();
+        let a1 = Raw::connect_as(server.addr, "alpha", &id);
+        a1.sync();
+        let gid = a1.create("g", false).gid;
+        a1.sync();
+        // Новая попытка той же identity (новый eph) сменила сессию.
+        let a2 = Raw::connect_as(server.addr, "alpha", &id);
+        let a2_addr = a2.sock.local_addr().unwrap();
+        a2.sync();
+        a1.drain(Duration::from_millis(200));
+
+        // HELLO3 прошлой попытки с её адреса (cookie ещё жив) — тишина:
+        // ни WELCOME, ни состояния, сессия новой попытки на месте.
+        for _ in 0..3 {
+            a1.sock.send_to(&a1.hello, server.addr).unwrap();
+        }
+        let got = raw_types(&a1.sock, Duration::from_millis(600));
+        assert!(got.is_empty(), "ответ на старый HELLO3: {got:02x?}");
+        {
+            let s = server.shared.state.read().unwrap();
+            assert_eq!(s.sessions.len(), 1);
+            assert_eq!(s.by_pub[&id.ed_pub()], a2_addr, "старый HELLO3 пересоздал сессию");
+        }
+        assert!(a2.sync().is_empty(), "живой сессии что-то пришло");
+        a2.send(ctrl::GET_GROUP, &payloads::enc_gid(gid));
+        assert_eq!(a2.state().gid, gid, "сессия жива");
+
+        // Поток повторов HELLO3 живой попытки — не больше одного WELCOME на
+        // `WELCOME_RESEND_GAP`, и ничего кроме него.
+        thread::sleep(WELCOME_RESEND_GAP);
+        for _ in 0..5 {
+            a2.sock.send_to(&a2.hello, server.addr).unwrap();
+        }
+        let got = raw_types(&a2.sock, Duration::from_millis(300));
+        assert_eq!(got.iter().filter(|&&t| t == ctrl::WELCOME).count(), 1, "WELCOME: {got:02x?}");
+        assert!(got.iter().all(|&t| t == ctrl::WELCOME), "за WELCOME пришло: {got:02x?}");
 
         server.stop();
         let _ = std::fs::remove_dir_all(&dir);
@@ -3168,6 +3277,7 @@ mod tests {
                         status: long_text('s'),
                         keys: proto::DirKeys { tx: [1; 32], rx: [2; 32] },
                         welcome: Vec::new(),
+                        welcome_at: AtomicU64::new(0),
                         tx: AtomicU64::new(0),
                         msg_id: AtomicU32::new(0),
                         rx: Mutex::new(proto::ReplayWindow::new()),
