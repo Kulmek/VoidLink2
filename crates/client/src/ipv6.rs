@@ -118,18 +118,24 @@ fn check_v4(packet: &[u8]) -> Option<()> {
     Some(())
 }
 
+/// Адрес из сети участников 100.66.0.0/16.
+fn is_member_v4(ip: u32) -> bool {
+    ip & V4_MASK == V4_NET
+}
+
 fn v4_at(packet: &[u8], off: usize) -> u32 {
     u32::from_be_bytes(packet[off..off + 4].try_into().unwrap())
 }
 
 /// Куда маршрутизировать пакет из адаптера: IPv4 участника-получателя.
-/// IPv4 — адрес назначения как есть; IPv6 — только адреса нашего префикса
-/// (мультикаст, link-local и чужие адреса отбрасываются).
+/// Оба семейства фильтруются одинаково: IPv4 — только 100.66.0.0/16,
+/// IPv6 — только адреса нашего префикса (мультикаст, broadcast, link-local
+/// и чужие адреса отбрасываются).
 pub fn route_target(packet: &[u8]) -> Option<u32> {
     match family(packet)? {
         Family::V4 => {
             check_v4(packet)?;
-            Some(v4_at(packet, 16))
+            Some(v4_at(packet, 16)).filter(|ip| is_member_v4(*ip))
         }
         Family::V6 => v4_of(ipv6_dst(packet)?),
     }
@@ -141,7 +147,7 @@ pub fn source_member(packet: &[u8]) -> Option<u32> {
     match family(packet)? {
         Family::V4 => {
             check_v4(packet)?;
-            Some(v4_at(packet, 12))
+            Some(v4_at(packet, 12)).filter(|ip| is_member_v4(*ip))
         }
         Family::V6 => v4_of(ipv6_src(packet)?),
     }
@@ -166,28 +172,47 @@ fn strs(a: &[&str]) -> Vec<String> {
     a.iter().map(|s| s.to_string()).collect()
 }
 
-/// Windows: `netsh interface ipv6 add address interface=<if> address=<a>/64 store=active`.
-pub fn cmd_add_windows(ifname: &str, v4: u32) -> Option<Cmd> {
+/// Имя Unix-интерфейса пригодно для передачи аргументом: непустое, не
+/// начинается с `-` (иначе будет прочитано как опция), только
+/// `[A-Za-z0-9._-]`, не длиннее 15 байт (IFNAMSIZ - 1 в Linux).
+fn valid_ifname(ifname: &str) -> bool {
+    !ifname.is_empty()
+        && ifname.len() <= 15
+        && !ifname.starts_with('-')
+        && ifname
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Windows: `netsh interface ipv6 add address <idx> <a>/64 store=active`.
+/// Интерфейс задаётся индексом (wintun: GetAdapterLuid →
+/// ConvertInterfaceLuidToIndex), а не именем — имя с пробелом Rust
+/// закавычит целиком вместе с `interface=`, и netsh его не разберёт.
+pub fn cmd_add_windows(if_index: u32, v4: u32) -> Option<Cmd> {
     let a = v6_of(v4)?;
     let mut args = strs(&["interface", "ipv6", "add", "address"]);
-    args.push(format!("interface={ifname}"));
-    args.push(format!("address={a}/{GROUP_PREFIX_LEN}"));
+    args.push(if_index.to_string());
+    args.push(format!("{a}/{GROUP_PREFIX_LEN}"));
     args.push("store=active".into());
     Some(Cmd { program: "netsh", args })
 }
 
-/// Windows: удалить адрес при выходе из группы.
-pub fn cmd_del_windows(ifname: &str, v4: u32) -> Option<Cmd> {
+/// Windows: удалить адрес при выходе из группы
+/// (`netsh interface ipv6 delete address <idx> <a>`).
+pub fn cmd_del_windows(if_index: u32, v4: u32) -> Option<Cmd> {
     let a = v6_of(v4)?;
     let mut args = strs(&["interface", "ipv6", "delete", "address"]);
-    args.push(format!("interface={ifname}"));
-    args.push(format!("address={a}"));
+    args.push(if_index.to_string());
+    args.push(a.to_string());
     Some(Cmd { program: "netsh", args })
 }
 
-/// Linux: `ip -6 addr add <a>/64 dev <if>`.
+/// Linux: `ip -6 addr add <a>/64 dev <if> nodad` — без DAD адрес сразу
+/// рабочий, а не «tentative» ещё 1–2 с.
 pub fn cmd_add_linux(ifname: &str, v4: u32) -> Option<Cmd> {
-    linux("add", ifname, v4)
+    let mut c = linux("add", ifname, v4)?;
+    c.args.push("nodad".into());
+    Some(c)
 }
 
 /// Linux: `ip -6 addr del <a>/64 dev <if>`.
@@ -196,6 +221,9 @@ pub fn cmd_del_linux(ifname: &str, v4: u32) -> Option<Cmd> {
 }
 
 fn linux(op: &str, ifname: &str, v4: u32) -> Option<Cmd> {
+    if !valid_ifname(ifname) {
+        return None;
+    }
     let a = v6_of(v4)?;
     let mut args = strs(&["-6", "addr", op]);
     args.push(format!("{a}/{GROUP_PREFIX_LEN}"));
@@ -206,6 +234,9 @@ fn linux(op: &str, ifname: &str, v4: u32) -> Option<Cmd> {
 
 /// macOS: `ifconfig <if> inet6 <a> prefixlen 64 alias`.
 pub fn cmd_add_macos(ifname: &str, v4: u32) -> Option<Cmd> {
+    if !valid_ifname(ifname) {
+        return None;
+    }
     let a = v6_of(v4)?;
     let mut args = vec![ifname.to_string(), "inet6".into(), a.to_string()];
     args.extend(strs(&["prefixlen", "64", "alias"]));
@@ -214,30 +245,40 @@ pub fn cmd_add_macos(ifname: &str, v4: u32) -> Option<Cmd> {
 
 /// macOS: `ifconfig <if> inet6 <a> -alias`.
 pub fn cmd_del_macos(ifname: &str, v4: u32) -> Option<Cmd> {
+    if !valid_ifname(ifname) {
+        return None;
+    }
     let a = v6_of(v4)?;
     let args = vec![ifname.to_string(), "inet6".into(), a.to_string(), "-alias".into()];
     Some(Cmd { program: "ifconfig", args })
 }
 
+/// Адаптер оверлея: имя (Linux/macOS) и индекс интерфейса (Windows).
+#[derive(Debug, Clone, Copy)]
+pub struct Iface<'a> {
+    pub name: &'a str,
+    pub index: u32,
+}
+
 /// Команда добавления адреса для текущей ОС.
-pub fn cmd_add(ifname: &str, v4: u32) -> Option<Cmd> {
+pub fn cmd_add(iface: Iface<'_>, v4: u32) -> Option<Cmd> {
     if cfg!(windows) {
-        cmd_add_windows(ifname, v4)
+        cmd_add_windows(iface.index, v4)
     } else if cfg!(target_os = "macos") {
-        cmd_add_macos(ifname, v4)
+        cmd_add_macos(iface.name, v4)
     } else {
-        cmd_add_linux(ifname, v4)
+        cmd_add_linux(iface.name, v4)
     }
 }
 
 /// Команда удаления адреса для текущей ОС.
-pub fn cmd_del(ifname: &str, v4: u32) -> Option<Cmd> {
+pub fn cmd_del(iface: Iface<'_>, v4: u32) -> Option<Cmd> {
     if cfg!(windows) {
-        cmd_del_windows(ifname, v4)
+        cmd_del_windows(iface.index, v4)
     } else if cfg!(target_os = "macos") {
-        cmd_del_macos(ifname, v4)
+        cmd_del_macos(iface.name, v4)
     } else {
-        cmd_del_linux(ifname, v4)
+        cmd_del_linux(iface.name, v4)
     }
 }
 
@@ -350,26 +391,31 @@ mod tests {
     }
 
     #[test]
+    fn чужие_ipv4_не_маршрутизируются() {
+        let me = ip4(100, 66, 3, 1);
+        for dst in [ip4(10, 0, 0, 1), ip4(224, 0, 0, 1), ip4(255, 255, 255, 255), ip4(8, 8, 8, 8)] {
+            assert_eq!(route_target(&v4_packet(me, dst)), None);
+            assert_eq!(source_member(&v4_packet(dst, me)), None);
+        }
+    }
+
+    #[test]
     fn команды_адаптера() {
         let v4 = ip4(100, 66, 5, 9);
-        let w = cmd_add_windows("VoidLink", v4).unwrap();
+        let w = cmd_add_windows(17, v4).unwrap();
         assert_eq!(w.program, "netsh");
         assert_eq!(
             w.args,
-            [
-                "interface",
-                "ipv6",
-                "add",
-                "address",
-                "interface=VoidLink",
-                "address=fd66:766c:696e:5::9/64",
-                "store=active"
-            ]
+            ["interface", "ipv6", "add", "address", "17", "fd66:766c:696e:5::9/64", "store=active"]
         );
-        assert_eq!(cmd_del_windows("VoidLink", v4).unwrap().args[2], "delete");
+        let wd = cmd_del_windows(17, v4).unwrap();
+        assert_eq!(wd.args, ["interface", "ipv6", "delete", "address", "17", "fd66:766c:696e:5::9"]);
         let l = cmd_add_linux("vl0", v4).unwrap();
         assert_eq!(l.program, "ip");
-        assert_eq!(l.args, ["-6", "addr", "add", "fd66:766c:696e:5::9/64", "dev", "vl0"]);
+        assert_eq!(
+            l.args,
+            ["-6", "addr", "add", "fd66:766c:696e:5::9/64", "dev", "vl0", "nodad"]
+        );
         assert_eq!(cmd_del_linux("vl0", v4).unwrap().args[2], "del");
         let m = cmd_add_macos("utun7", v4).unwrap();
         assert_eq!(m.program, "ifconfig");
@@ -378,7 +424,20 @@ mod tests {
             ["utun7", "inet6", "fd66:766c:696e:5::9", "prefixlen", "64", "alias"]
         );
         assert_eq!(cmd_del_macos("utun7", v4).unwrap().args[3], "-alias");
-        assert!(cmd_add("x", ip4(10, 0, 0, 1)).is_none());
-        assert!(cmd_add("x", v4).is_some() && cmd_del("x", v4).is_some());
+        let ok = Iface { name: "vl0", index: 17 };
+        assert!(cmd_add(ok, ip4(10, 0, 0, 1)).is_none());
+        assert!(cmd_add(ok, v4).is_some() && cmd_del(ok, v4).is_some());
+    }
+
+    #[test]
+    fn плохие_имена_интерфейса() {
+        let v4 = ip4(100, 66, 5, 9);
+        for bad in ["", "-down", "a b", "x;y", "abcdefghijklmnop"] {
+            assert!(cmd_add_linux(bad, v4).is_none(), "{bad}");
+            assert!(cmd_del_linux(bad, v4).is_none(), "{bad}");
+            assert!(cmd_add_macos(bad, v4).is_none(), "{bad}");
+            assert!(cmd_del_macos(bad, v4).is_none(), "{bad}");
+        }
+        assert!(cmd_add_linux("voidlink.0_a-b", v4).is_some());
     }
 }
