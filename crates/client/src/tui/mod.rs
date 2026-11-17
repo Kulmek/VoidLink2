@@ -5,6 +5,7 @@
 //! события (`Engine::events`).
 
 pub mod app;
+pub mod badges;
 pub mod identicon;
 pub mod setup;
 pub mod theme;
