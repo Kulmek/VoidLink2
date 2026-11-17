@@ -18,8 +18,14 @@
 #   symmetric     оба за symmetric NAT (случайный порт на каждое назначение)     → relay
 #   mixed         c1 за cone, c2 за symmetric                                     → relay
 #   samenat       c1, c2 за одним NAT, hairpin выключен (только LAN-кандидаты)   → direct
+#   samenat-nolan то же, lan_discovery: false у обоих (ни LAN, ни hairpin)        → relay
 #   hairpin       c1, c2 за одним NAT, hairpin включён                            → direct
+#   hairpin-nolan то же, lan_discovery: false — работает только hairpin-путь      → direct
 #   udpblock      у c1 UDP наружу заблокирован                                    → tcp (фолбэк)
+#
+# Коды возврата check/run: 0 PASS, 1 FAIL, 2 нет TUN на этой ОС,
+#   3 XFAIL (udpblock до TCP-фолбэка: ping не прошёл, но движок c1 жив и
+#   сообщил о недоступности сервера — ожидаемое поведение).
 #
 # Топология (адреса фиксированы):
 #
@@ -28,7 +34,7 @@
 #   vl-nat1 203.0.113.21 ─┤                 vl-nat2 203.0.113.22
 #     lan 10.1.0.1/24     │                   lan 10.2.0.1/24
 #     ├─ vl-c1 10.1.0.11  └───────────────────  └─ vl-c2 10.2.0.12
-#     └─ vl-c2 10.1.0.12   (samenat/hairpin: c2 в LAN nat1, nat2 не создаётся)
+#     └─ vl-c2 10.1.0.12   (samenat*/hairpin*: c2 в LAN nat1, nat2 не создаётся)
 #
 # Замечание о «full cone»: conntrack Linux фильтрует входящее по полному
 # кортежу (адрес+порт удалённой стороны), поэтому «cone» здесь —
@@ -43,6 +49,7 @@
 #   WORK         каталог данных и логов      (по умолчанию: /tmp/vl-nat-lab)
 #   PINGS        число ping в check          (по умолчанию: 20)
 #   SETTLE       секунд на пробитие до check (по умолчанию: 8)
+#   STOP_WAIT    секунд на штатную остановку по SIGTERM в down (по умолчанию: 3)
 
 set -euo pipefail
 
@@ -55,6 +62,7 @@ ADAPTER="${ADAPTER:-vl0}"
 WORK="${WORK:-/tmp/vl-nat-lab}"
 PINGS="${PINGS:-20}"
 SETTLE="${SETTLE:-8}"
+STOP_WAIT="${STOP_WAIT:-3}"
 
 SRV_IP=203.0.113.10
 SRV_PORT=5555
@@ -76,8 +84,8 @@ need_root() {
 
 scenario_expect() {
     case "$1" in
-        cone | samenat | hairpin) echo direct ;;
-        symmetric | mixed) echo relay ;;
+        cone | samenat | hairpin | hairpin-nolan) echo direct ;;
+        symmetric | mixed | samenat-nolan) echo relay ;;
         udpblock) echo tcp ;;
         *) die "неизвестный сценарий: $1 (см. ./nat-lab.sh list)" ;;
     esac
@@ -154,6 +162,12 @@ cmd_up() {
     scenario_expect "$sc" >/dev/null
     need_root
     cmd_down quiet
+    # прогоны независимы: старые идентичности клиентов, группы сервера и логи
+    # прошлого сценария удаляются (иначе add-server падает «сервер уже добавлен»)
+    [[ -n $WORK && $WORK != / ]] || die "WORK пуст или равен /"
+    rm -rf "${WORK:?}/c1" "${WORK:?}/c2" "${WORK:?}/srv"
+    rm -f "$WORK"/*.log "$WORK"/*.group "$WORK"/*.mode "$WORK"/*.nat "$WORK"/*.pid \
+        "$WORK/gid" "$WORK/scenario"
     mkdir -p "$WORK"
     echo "$sc" >"$WORK/scenario"
 
@@ -195,7 +209,7 @@ EOF
             mk_client c1 1 10.1.0.11
             mk_client c2 2 10.2.0.12
             ;;
-        samenat | hairpin)
+        samenat | samenat-nolan | hairpin | hairpin-nolan)
             mk_nat 1 cone
             mk_client c1 1 10.1.0.11
             mk_client c2 1 10.1.0.12
@@ -231,9 +245,39 @@ overlay_ip() { # из вывода create/join: «… мой IP 10.x.y.z»
     grep -oE 'мой IP [0-9.]+' "$1" | awk '{print $3}' | tail -n1
 }
 
-udp_port() { # UDP-порт движка клиента в его пространстве
-    nsx "vl-$1" ss -Huanp 2>/dev/null | grep -F "$(basename "$CLIENT_BIN")" |
-        awk '{print $4}' | grep -oE '[0-9]+$' | head -n1
+# Порты потока клиент → сервер по conntrack nat1: «<локальный> <публичный>».
+# Публичный берётся из conntrack (dport ответа), а не равным локальному:
+# masquerade может переназначить порт (коллизия c1/c2, старая запись).
+# $1 LAN-адрес клиента.
+nat_ports() {
+    local addr="$1" line sp dp
+    if command -v conntrack >/dev/null; then
+        line=$(nsx vl-nat1 conntrack -L -p udp --orig-src "$addr" --orig-dst "$SRV_IP" \
+            --dport "$SRV_PORT" 2>/dev/null | head -n1)
+    else
+        line=$(nsx vl-nat1 cat /proc/net/nf_conntrack 2>/dev/null |
+            grep -F "src=$addr dst=$SRV_IP" | grep -F "dport=$SRV_PORT " | head -n1)
+    fi
+    # две группы sport/dport: оригинал (локальный sport) и ответ (публичный dport)
+    sp=$(grep -oE 'sport=[0-9]+' <<<"$line" | head -n1 | cut -d= -f2)
+    dp=$(grep -oE 'dport=[0-9]+' <<<"$line" | tail -n1 | cut -d= -f2)
+    [[ -n $sp && -n $dp ]] && echo "$sp $dp"
+}
+
+# lan_discovery: false в client.json клиента (поле v3, см. PROTOCOL.md)
+disable_lan() {
+    local f="$WORK/$1/client.json"
+    [[ -f $f ]] || die "нет $f"
+    python3 - "$f" <<'PY'
+import json, os, sys
+p = sys.argv[1]
+with open(p) as fh:
+    cfg = json.load(fh)
+cfg["lan_discovery"] = False
+with open(p + ".tmp", "w") as fh:
+    json.dump(cfg, fh, indent=2)
+os.replace(p + ".tmp", p)
+PY
 }
 
 cmd_start() {
@@ -264,6 +308,12 @@ cmd_start() {
     client c2 join "$gid" | tee "$WORK/c2.group" >&2
     echo "$gid" >"$WORK/gid"
 
+    if [[ $sc == *-nolan ]]; then
+        disable_lan c1
+        disable_lan c2
+        log "lan_discovery: false у c1 и c2"
+    fi
+
     if [[ $sc == udpblock ]]; then
         # группа уже настроена по UDP; дальше UDP c1 наружу режется целиком,
         # включая уже установленные потоки (правило встаёт первым в цепочке)
@@ -278,15 +328,18 @@ cmd_start() {
     done
     sleep 2
 
-    if [[ $sc == hairpin ]]; then
-        local p1 p2
-        p1=$(udp_port c1)
-        p2=$(udp_port c2)
-        [[ -n $p1 && -n $p2 ]] || die "не найден UDP-порт клиентов для hairpin (ss)"
-        # статическое отражение публичных портов (cone сохраняет порт) обратно в LAN
-        nsx vl-nat1 nft add rule ip vlnat pre iifname lan ip daddr "$NAT1_WAN" udp dport "$p1" dnat ip to "10.1.0.11:$p1"
-        nsx vl-nat1 nft add rule ip vlnat pre iifname lan ip daddr "$NAT1_WAN" udp dport "$p2" dnat ip to "10.1.0.12:$p2"
-        log "hairpin включён: $NAT1_WAN:$p1 → c1, $NAT1_WAN:$p2 → c2"
+    if [[ $sc == hairpin* ]]; then
+        local m1 m2 l1 g1 l2 g2
+        m1=$(nat_ports 10.1.0.11 || true)
+        m2=$(nat_ports 10.1.0.12 || true)
+        [[ -n $m1 && -n $m2 ]] || die "нет записи conntrack клиент → сервер в vl-nat1 (нужен conntrack или /proc/net/nf_conntrack)"
+        read -r l1 g1 <<<"$m1"
+        read -r l2 g2 <<<"$m2"
+        # отражение публичного endpoint (WAN:публичный порт) на LAN-адрес и
+        # локальный порт клиента
+        nsx vl-nat1 nft add rule ip vlnat pre iifname lan ip daddr "$NAT1_WAN" udp dport "$g1" dnat ip to "10.1.0.11:$l1"
+        nsx vl-nat1 nft add rule ip vlnat pre iifname lan ip daddr "$NAT1_WAN" udp dport "$g2" dnat ip to "10.1.0.12:$l2"
+        log "hairpin включён: $NAT1_WAN:$g1 → 10.1.0.11:$l1, $NAT1_WAN:$g2 → 10.1.0.12:$l2"
     fi
 }
 
@@ -321,6 +374,14 @@ cmd_check() {
     [[ $expect == tcp ]] && path="tcp?(udp-счётчик $delta)"
     log "датаграмм на сервер за ping: $delta → путь: $path, ожидалось: $expect"
     if [[ $expect != tcp && $path != "$expect" ]]; then rc=1; fi
+    if [[ $expect == tcp ]] && ((rc != 0)); then
+        # до TCP-фолбэка: ожидается «сервер недоступен» без падения движка
+        if c1_alive && grep -qiE 'недоступен|unreachable|timed? ?out|таймаут' "$WORK/c1.log"; then
+            log "СЦЕНАРИЙ $sc: XFAIL — TCP-фолбэка нет, движок c1 жив и сообщил о недоступности"
+            return 3
+        fi
+        log "движок c1 упал или не сообщил о недоступности сервера"
+    fi
     if ((rc == 0)); then
         log "СЦЕНАРИЙ $sc: PASS"
     else
@@ -329,20 +390,53 @@ cmd_check() {
     return "$rc"
 }
 
+c1_alive() {
+    [[ -f $WORK/vl-c1.pid ]] && kill -0 "$(cat "$WORK/vl-c1.pid")" 2>/dev/null
+}
+
 counter_val() {
     nsx vl-srv nft list counter inet vlmon relay_in | grep -oE 'packets [0-9]+' | awk '{print $2}'
 }
 
 cmd_down() {
-    local ns pid
+    local ns pid alive _ pids=() names=()
     for ns in "${ALL_NS[@]}"; do
         if [[ -f $WORK/$ns.pid ]]; then
             pid=$(cat "$WORK/$ns.pid")
             # SIGTERM: заодно проверяется корректная остановка сервера/движка
-            kill -TERM "$pid" 2>/dev/null || true
+            if kill -TERM "$pid" 2>/dev/null; then
+                pids+=("$pid")
+                names+=("$ns")
+            fi
             rm -f "$WORK/$ns.pid"
         fi
     done
+    # даём процессам STOP_WAIT секунд завершиться штатно, только потом KILL
+    for _ in $(seq 1 $((STOP_WAIT * 10))); do
+        alive=0
+        for ns in "${ALL_NS[@]}"; do
+            [[ -n $(ip netns pids "$ns" 2>/dev/null) ]] && alive=1
+        done
+        ((alive)) || break
+        sleep 0.1
+    done
+    if [[ ${1:-} != quiet ]]; then
+        local i
+        for i in "${!pids[@]}"; do
+            if kill -0 "${pids[$i]}" 2>/dev/null; then
+                log "${names[$i]}: не остановился по SIGTERM за ${STOP_WAIT}s — KILL"
+            else
+                log "${names[$i]}: остановлен по SIGTERM"
+            fi
+        done
+        if [[ -d $WORK/srv ]]; then
+            if [[ -n $(find "$WORK/srv" -name 'server.json' 2>/dev/null) ]]; then
+                log "server.json сохранён"
+            else
+                log "server.json не найден в $WORK/srv"
+            fi
+        fi
+    fi
     for ns in "${ALL_NS[@]}"; do
         if ip netns pids "$ns" >/dev/null 2>&1; then
             ip netns pids "$ns" 2>/dev/null | xargs -r kill -KILL 2>/dev/null || true
@@ -378,6 +472,6 @@ case "${1:-help}" in
         shift
         cmd_exec "$@"
         ;;
-    list) printf '%s\n' cone symmetric mixed samenat hairpin udpblock ;;
-    *) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//' ;;
+    list) printf '%s\n' cone symmetric mixed samenat samenat-nolan hairpin hairpin-nolan udpblock ;;
+    *) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//' ;;
 esac

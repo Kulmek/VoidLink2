@@ -29,20 +29,36 @@ cargo clippy --workspace --all-targets -- -D warnings   # на Windows; на Lin
 # лаборатория NAT (Linux, root)
 cargo build --release -p tunnel-server -p tunnel-client
 sudo infrastructure/netns/nat-lab.sh list
-sudo infrastructure/netns/nat-lab.sh run cone        # PASS/FAIL, код возврата 0/1
-for s in cone symmetric mixed samenat hairpin udpblock; do
-    sudo infrastructure/netns/nat-lab.sh run "$s" || echo "FAIL: $s"
+sudo infrastructure/netns/nat-lab.sh run cone        # код возврата: 0 PASS, 1 FAIL, 2 нет TUN, 3 XFAIL
+for s in $(infrastructure/netns/nat-lab.sh list); do
+    sudo infrastructure/netns/nat-lab.sh run "$s" || echo "rc=$?: $s"
 done
 ```
 
-До переноса движка в `tunnel-engine` (7.1) клиент на Linux не собирается с
-настоящим TUN; лаборатория тогда проверяет только рукопожатие и группу
-(`check` вернёт 2 и покажет хвост логов). После 7.1 — полный прогон с ping по
-оверлею. Пути к бинарникам переопределяются `SERVER_BIN` / `CLIENT_BIN`.
+Каждый `run`/`up` начинает с чистого состояния: каталоги `c1`, `c2`, `srv` и
+логи прошлого прогона в `$WORK` удаляются, так что сценарии независимы.
+
+**До 7.1 лаборатория не запускается вовсе.** `tunnel-client` безусловно
+зависит от `wintun` (Windows-only), поэтому `cargo build -p tunnel-client` на
+Linux не собирается, а `start` останавливается на «нет `$CLIENT_BIN`» — не
+проверяются даже рукопожатие и create/join. Условие запуска: движок вынесен в
+`tunnel-engine` (7.1), а `wintun` переведён в
+`[target.'cfg(windows)'.dependencies]` (это нужно сделать при интеграции 7.1).
+Код 2 из `check` («нет интерфейса TUN») означает промежуточное состояние:
+Linux-клиент уже собирается, рукопожатие и группа проходят, но TUN на Linux
+ещё не реализован. После реализации TUN — полный прогон с ping по оверлею.
+Пути к бинарникам переопределяются `SERVER_BIN` / `CLIENT_BIN`.
 
 В CI (ubuntu, `sudo` доступен на GitHub-раннерах): отдельная задача
 `nat-lab` с матрицей по сценариям, артефакт — каталог `$WORK`
-(`/tmp/vl-nat-lab`: логи сервера, клиентов, ping).
+(`/tmp/vl-nat-lab`: логи сервера, клиентов, ping). Успех — код 0; для
+`udpblock` до реализации TCP-фолбэка успехом считается и код 3 (XFAIL), задача
+матрицы для него помечается allowed-to-fail до появления фолбэка.
+
+Для сценариев `hairpin*` в nat1 нужна утилита `conntrack` (пакет
+`conntrack`) или `/proc/net/nf_conntrack`: публичный порт клиента берётся из
+записи conntrack потока к серверу, а не принимается равным локальному. Для
+`*-nolan` нужен `python3` (правка `client.json`).
 
 ---
 
@@ -162,9 +178,10 @@ CANDIDATES, ADMIN_INFO. Критерий — нет паник/переполн�
 | `symmetric` | оба за symmetric NAT (`masquerade fully-random`) | пробитие не удаётся, ping идёт через релей без потерь; клиент не спамит PUNCH бесконечно (интервал растёт) |
 | `mixed` | cone + symmetric | релей (или прямой, если реализовано предсказание портов — тогда поправить ожидание) |
 | `samenat` | оба за одним NAT, hairpin выключен | прямой канал по LAN-кандидатам (10.1.0.x); ответ пришёл с кандидата — на нём и канал |
-| `samenat` + `lan_discovery: false` у обоих | то же | релей (нет кандидатов, hairpin нет) — проверить вручную правкой `client.json` |
+| `samenat-nolan` | как `samenat`, `lan_discovery: false` у обоих | релей (нет кандидатов, hairpin нет) |
 | `hairpin` | один NAT, hairpin включён | прямой: по LAN-кандидату или через публичный endpoint, путь фиксируется первым ответом; оба варианта — PASS |
-| `udpblock` | у c1 весь UDP наружу режется | после потери UDP — фолбэк на TCP (если реализован), туннель восстановлен ≤ 30 с; до реализации TCP — ожидается явное «сервер недоступен», без падения |
+| `hairpin-nolan` | как `hairpin`, `lan_discovery: false` у обоих | прямой только через публичный endpoint (hairpin) — единственный сценарий, реально проверяющий hairpin-путь |
+| `udpblock` | у c1 весь UDP наружу режется | после потери UDP — фолбэк на TCP (если реализован), туннель восстановлен ≤ 30 с; до реализации TCP — ожидается явное «сервер недоступен», без падения: `check` возвращает 3 (XFAIL), если ping не прошёл, но движок c1 жив и в логе есть сообщение о недоступности |
 
 Дополнительно в лаборатории:
 
@@ -177,8 +194,9 @@ CANDIDATES, ADMIN_INFO. Критерий — нет паник/переполн�
 * **Потери/задержка** — `exec wan tc qdisc add dev br0 root netem loss 5%
   delay 50ms`: рукопожатие проходит (повторы HELLO3), FRAG-сообщения
   догоняются сверкой ревизий, ping < 10% потерь.
-* **SIGTERM** — `down` шлёт SIGTERM; в логах сервера и клиента — штатная
-  остановка, `server.json` сохранён (см. 6).
+* **SIGTERM** — `down` шлёт SIGTERM и ждёт до `STOP_WAIT` (3 с) до KILL;
+  по каждому процессу печатает «остановлен по SIGTERM» или «KILL», и есть ли
+  `server.json`. Ожидается штатная остановка всех процессов (см. 6).
 
 ---
 
@@ -273,6 +291,6 @@ CANDIDATES, ADMIN_INFO. Критерий — нет паник/переполн�
 ## 9. Критерии релиза
 
 1. Все U и E зелёные на ubuntu и windows в CI.
-2. `nat-lab.sh run` — PASS для `cone`, `symmetric`, `mixed`, `samenat`, `hairpin`; `udpblock` — PASS после реализации TCP-фолбэка.
+2. `nat-lab.sh run` — PASS для `cone`, `symmetric`, `mixed`, `samenat`, `samenat-nolan`, `hairpin`, `hairpin-nolan`; `udpblock` — XFAIL (3) до TCP-фолбэка, PASS после.
 3. Чек-лист 7.2 пройден на чистой Windows 10 и Windows 11.
 4. Фаззинг разборщиков ≥ 1 ч на каждый без находок.
