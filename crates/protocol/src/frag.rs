@@ -332,6 +332,59 @@ mod tests {
     }
 
     #[test]
+    fn любой_битый_кусок_выбрасывает_начатую_сборку() {
+        // Сборка msg_id 7 из 3 кусков; каждый вариант битого куска того же
+        // msg_id должен выбросить её целиком (раздел 3), а итог не собраться.
+        let m = msg(2 * FRAG_THRESHOLD + 300);
+        let parts = split_frag(7, ctrl::GROUP_STATE, &m).unwrap().unwrap();
+        let hdr = |idx: u16, count: u16, inner: u8| {
+            let mut v = 7u32.to_be_bytes().to_vec();
+            v.push(inner);
+            v.extend_from_slice(&idx.to_be_bytes());
+            v.extend_from_slice(&count.to_be_bytes());
+            v
+        };
+        let with_len = |idx: u16, len: usize| {
+            let mut v = hdr(idx, 3, ctrl::GROUP_STATE);
+            v.extend(std::iter::repeat_n(1u8, len));
+            v
+        };
+        let bad: Vec<(&str, Vec<u8>)> = vec![
+            ("не последний длиннее порога", with_len(1, FRAG_THRESHOLD + 1)),
+            ("не последний короче порога", with_len(1, 300)),
+            ("последний длиннее порога", with_len(2, FRAG_THRESHOLD + 1)),
+            ("последний пустой", with_len(2, 0)),
+            ("idx ≥ count", {
+                let mut v = hdr(3, 3, ctrl::GROUP_STATE);
+                v.extend(std::iter::repeat_n(1u8, 10));
+                v
+            }),
+            ("FRAG в FRAG", {
+                let mut v = hdr(2, 3, ctrl::FRAG);
+                v.extend(std::iter::repeat_n(1u8, 10));
+                v
+            }),
+        ];
+        let now = Instant::now();
+        for (what, b) in bad {
+            let mut r = Reassembler::new();
+            assert!(r.push(&parts[0], now).unwrap().is_none());
+            assert!(r.push(&parts[1], now).unwrap().is_none());
+            assert!(r.push(&b, now).is_err(), "{what}: должен быть отвергнут");
+            assert_eq!(r.pending(), 0, "{what}: сборка не выброшена");
+            // Верный последний кусок не завершает выброшенную сборку.
+            assert!(r.push(&parts[2], now).unwrap().is_none(), "{what}: собралось из остатков");
+            assert_eq!(r.pending(), 1);
+        }
+        // Контроль: без битого куска сообщение собирается целиком.
+        let mut r = Reassembler::new();
+        for p in &parts[..2] {
+            assert!(r.push(p, now).unwrap().is_none());
+        }
+        assert_eq!(r.push(&parts[2], now).unwrap(), Some((ctrl::GROUP_STATE, m)));
+    }
+
+    #[test]
     fn неверные_куски() {
         let mk = |idx: u16, count: u16, len: usize, inner: u8| {
             let mut v = 1u32.to_be_bytes().to_vec();
