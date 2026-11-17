@@ -32,7 +32,10 @@
 //!   чаще раза в `HOUSEKEEPING_EVERY`, а не на каждую команду;
 //! - мусор и чужие фреймы отбрасываются молча, без записи в лог.
 
+pub mod metrics;
 pub mod persist;
+pub mod signals;
+pub mod tcp;
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};

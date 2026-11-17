@@ -1,0 +1,24 @@
+[package]
+name = "tunnel-tray"
+version = "0.2.0"
+edition = "2024"
+
+[[bin]]
+name = "tunnel-tray"
+path = "src/main.rs"
+
+[dependencies]
+serde_json.workspace = true
+tunnel-ipc = { path = "../ipc" }
+
+# Трей только под Windows (этап 7.5). Меню — `muda`, реэкспорт `tray_icon::menu`
+# (одна версия с tray-icon, без рассинхрона типов).
+[target.'cfg(windows)'.dependencies]
+tray-icon = "0.26"
+tauri-winrt-notification = "0.8"
+arboard = { version = "3", default-features = false }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+] }

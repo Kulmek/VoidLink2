@@ -36,11 +36,21 @@
 //! Если в конфиге нет имени или серверов, `tui` сначала показывает
 //! экран первичной настройки (tui::setup): имя, сервер, адаптер, dll.
 
+mod dns;
 mod engine;
 #[cfg(test)]
 mod engine_e2e;
+mod ipv6;
+mod invites;
+mod snapshot;
+mod profile;
 mod store;
+mod tcp_link;
 mod tun;
+#[cfg(target_os = "linux")]
+mod tun_linux;
+#[cfg(target_os = "macos")]
+mod tun_macos;
 mod tui;
 
 use std::net::SocketAddr;

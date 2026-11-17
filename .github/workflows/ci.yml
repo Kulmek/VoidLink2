@@ -7,40 +7,132 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# Новый пуш в ту же ветку/PR отменяет предыдущий прогон.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  # Юнит-тесты кроссплатформенных крейтов (protocol, server). Клиент
-  # зависит от wintun (Windows API) и на Linux не собирается.
-  tests-linux:
-    name: tests · ubuntu (protocol + server)
+  # Форматирование всего workspace.
+  # Пока существующий код не прогнан через `cargo fmt --all` (разовый коммит
+  # при интеграции), job информационный: не валит CI и не блокирует сборки.
+  # После форматирования — убрать continue-on-error.
+  fmt:
+    name: fmt
     runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  # Кроссплатформенные крейты на Linux: всё, кроме Windows-only
+  # (client зависит от wintun, tray и winsvc — только Windows).
+  # Новые кроссплатформенные крейты (tunnel-ipc, tunnel-daemon, …)
+  # подхватываются автоматически — список исключений, а не включений.
+  # Отсутствующий в workspace пакет в --exclude даёт лишь warning.
+  linux:
+    name: test · ubuntu (кроссплатформенные крейты)
+    runs-on: ubuntu-latest
+    env:
+      EXCLUDES: --exclude tunnel-client --exclude tunnel-tray --exclude tunnel-winsvc
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Тесты (protocol, server)
-        run: cargo test -p tunnel-protocol -p tunnel-server
-      - name: Clippy (protocol, server)
-        run: cargo clippy -p tunnel-protocol -p tunnel-server --all-targets -- -D warnings
+      - name: Тесты
+        run: cargo test --workspace $EXCLUDES
+      - name: Clippy
+        run: cargo clippy --workspace $EXCLUDES --all-targets -- -D warnings
 
-  # Полный набор тестов (включая client/TUI) — только на Windows.
-  tests-windows:
-    name: tests · windows (весь workspace)
+  # Полный workspace (включая client/TUI, tray, winsvc) — только на Windows.
+  windows:
+    name: test · windows (весь workspace)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Тесты (workspace)
+      - name: Тесты
         run: cargo test --workspace
+      # В tunnel-client пока ~40 старых lint'ов (collapsible_if, manual_clamp, …).
+      # До разовой чистки (`cargo clippy --fix` на Windows) шаг не валит job,
+      # чтобы не блокировать релизную сборку. После чистки — убрать continue-on-error.
+      - name: Clippy
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # Лицензии, баны, источники, advisories — по deny.toml.
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+          manifest-path: ./Cargo.toml
+
+  # Уязвимости в Cargo.lock по базе RustSec.
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    # audit-check создаёт check run и issues через GITHUB_TOKEN.
+    permissions:
+      contents: read
+      checks: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Релизный tunnel-server под Linux + systemd-юнит (если есть).
+  build-linux-server:
+    name: build · linux server release
+    needs: [linux, deny]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Сборка (release)
+        run: cargo build --release -p tunnel-server --target x86_64-unknown-linux-gnu
+      - name: Собрать артефакты
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-gnu/release/tunnel-server dist/
+          # systemd-юнит и прочие файлы деплоя (весь каталог) — если уже появились.
+          if [ -d infrastructure/linux ]; then
+            cp -r infrastructure/linux dist/
+          fi
+          ls -la dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tunnel-server-linux-x64
+          path: dist/
+          retention-days: 14
 
   # Сборка релиза для Windows: exe-шники + подписанный wintun.dll
-  # в один артефакт. Поднимается, только если тесты прошли.
+  # + PowerShell-скрипты установки в один артефакт.
   build-windows:
     name: build · windows release
-    needs: [tests-linux, tests-windows]
+    needs: [linux, windows, deny]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -51,10 +143,23 @@ jobs:
       - name: Собрать артефакты
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory dist | Out-Null
-          Copy-Item target/release/tunnel-client.exe dist/
-          Copy-Item target/release/tunnel-server.exe dist/
+          # Бинарники кладём только те, что реально собрались
+          # (daemon/tray появляются по ходу Этапа 7).
+          foreach ($exe in 'tunnel-client', 'tunnel-server', 'tunnel-daemon', 'tunnel-tray') {
+            $path = "target/release/$exe.exe"
+            if (Test-Path $path) {
+              Copy-Item $path dist/
+            } else {
+              Write-Host "пропуск: $path не найден"
+            }
+          }
           Copy-Item vendor/wintun/wintun.dll dist/
+          if (Test-Path infrastructure/windows) {
+            Get-ChildItem infrastructure/windows -Filter *.ps1 | Copy-Item -Destination dist/
+          }
+          Get-ChildItem dist
       - uses: actions/upload-artifact@v4
         with:
           name: tunnel-windows-x64

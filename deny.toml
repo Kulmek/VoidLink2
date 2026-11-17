@@ -1,0 +1,47 @@
+# Конфигурация cargo-deny: лицензии, баны, источники, advisories.
+# Запуск локально: cargo deny check
+# В CI — job `deny` (.github/workflows/ci.yml).
+
+[graph]
+# Проверяем дерево зависимостей для всех платформ сразу (клиент — Windows,
+# сервер — Linux), поэтому targets не ограничиваем.
+all-features = false
+
+[advisories]
+# Уязвимости из RustSec — ошибка; unmaintained/unsound — по умолчанию тоже.
+# Если какой-то advisory нельзя быстро закрыть — добавить его id в ignore
+# с комментарием, почему это безопасно.
+ignore = []
+
+[licenses]
+# Allow-list под фактическое дерево зависимостей. Новая лицензия в дереве =
+# ошибка CI: сначала проверить совместимость, потом добавить сюда.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[licenses.private]
+# Свои крейты workspace не публикуются (publish = false) и лицензии не имеют.
+ignore = true
+
+[bans]
+# Дубли версий (windows-sys, syn, thiserror…) приходят транзитивно —
+# только предупреждаем.
+multiple-versions = "warn"
+wildcards = "deny"
+# path-зависимости внутри workspace без версии — это нормально.
+allow-wildcard-paths = true
+
+[sources]
+# Только crates.io: никаких git-зависимостей и сторонних реестров.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
