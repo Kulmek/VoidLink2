@@ -78,6 +78,10 @@ const IP_SHARD_MAX: usize = 4096;
 const STATS_EVERY: Duration = Duration::from_secs(300);
 /// Как часто воркер проверяет флаг остановки.
 const RECV_POLL: Duration = Duration::from_millis(250);
+/// Сколько датаграмм подряд одному адресу уходит без паузы.
+const SEND_BURST: usize = 8;
+/// Пауза между пачками залпа: клиент успевает опустошить буфер приёма.
+const SEND_PAUSE: Duration = Duration::from_millis(1);
 
 const NAME_MAX_CHARS: usize = 32;
 const STATUS_MAX_CHARS: usize = 100;
@@ -916,8 +920,24 @@ impl Shared {
     }
 
     fn flush(&self, out: Outbox) {
+        // Залп одному адресу (например, 175 кусков FRAG худшего
+        // GROUP_STATE — 192 КБ) клиент не успевает принять: буфер приёма UDP
+        // на Windows — 64 КБ, лишние датаграммы ядро отбрасывает, сообщение
+        // не собирается никогда. Разбавляем длинные залпы паузой: между
+        // пачками клиент успевает опустошить буфер.
+        let mut prev: Option<SocketAddr> = None;
+        let mut burst = 0usize;
         for (addr, frame) in out {
+            if prev != Some(addr) {
+                prev = Some(addr);
+                burst = 0;
+            }
+            if burst >= SEND_BURST {
+                std::thread::sleep(SEND_PAUSE);
+                burst = 0;
+            }
             self.send_to(&frame, addr);
+            burst += 1;
         }
     }
 

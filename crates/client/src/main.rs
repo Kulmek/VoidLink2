@@ -916,11 +916,22 @@ fn main() -> Result<()> {
             // серверов) и флаги не заданы — спрашиваем прямо в TUI, до старта
             // движка. Консольному `run` достаточно CLI-подсказки.
             if tui_mode && (cfg.name.is_empty() || cfg.servers.is_empty()) {
-                if !tui::setup::run(&mut cfg, &mut adapter, &mut dll)? {
+                // Свой движок: адаптер и dll — наши, спрашиваем и запоминаем.
+                if !tui::setup::run(
+                    &mut cfg,
+                    &mut adapter,
+                    &mut dll,
+                    true,
+                    &identity.friend_code(),
+                )? {
                     bail!(
                         "настройка не завершена; запусти ещё раз или задай параметры командами CLI"
                     );
                 }
+                // Адаптер и dll — в конфиг: иначе введённое при первом старте
+                // терялось и следующий запуск спрашивал бы заново.
+                cfg.adapter = adapter.clone();
+                cfg.dll = dll.clone().unwrap_or_default();
                 save(&cfg)?;
             }
             if cfg.name.is_empty() {
@@ -959,8 +970,11 @@ fn run_remote_tui(ep: &Endpoint, dir: &std::path::Path, local: &Config) -> Resul
     let snap = eng.snapshot();
     if snap.cfg.name.is_empty() || snap.cfg.servers.is_empty() {
         let mut c = snap.cfg.to_config();
+        // Адаптер и dll в тонком режиме задаёт демон (служба): спрашивать их
+        // здесь нельзя — поле было бы обязательным, а применять его некуда,
+        // и первичную настройку нельзя было бы завершить.
         let (mut adapter, mut dll) = (String::new(), None);
-        if !tui::setup::run(&mut c, &mut adapter, &mut dll)? {
+        if !tui::setup::run(&mut c, &mut adapter, &mut dll, false, &eng.me().my_code)? {
             bail!("настройка не завершена; запусти ещё раз или задай параметры командами CLI");
         }
         if c.name != snap.cfg.name {
@@ -981,6 +995,10 @@ fn run_remote_tui(ep: &Endpoint, dir: &std::path::Path, local: &Config) -> Resul
                 label: s.label.clone(),
             })?;
         }
+        // Команды уходят демону без ответа: ждём, пока он их применит, —
+        // иначе настройка молча пропала бы (имя/сервер не сохранены).
+        let want: Vec<String> = c.servers.iter().map(|s| s.addr.clone()).collect();
+        wait_daemon_cfg(&eng, &c.name, &want, std::time::Duration::from_secs(10))?;
     }
     // Тема — локальная: ui.json (client.json при демоне — его).
     let mut ui = local.clone();
@@ -989,6 +1007,46 @@ fn run_remote_tui(ep: &Endpoint, dir: &std::path::Path, local: &Config) -> Resul
         ui.theme = prefs.theme;
     }
     tui::run_remote(eng, &ui)
+}
+
+/// Ждёт, пока демон применит правки конфига: снимок с нужным именем и
+/// серверами. Если демон не подтвердил — его ошибка (или «не сохранил»).
+fn wait_daemon_cfg(
+    eng: &IpcEngine,
+    want_name: &str,
+    want_servers: &[String],
+    timeout: std::time::Duration,
+) -> Result<()> {
+    use tunnel_client::api::EngineApi;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let s = eng.snapshot();
+        let name_ok = s.cfg.name == want_name;
+        let srv_ok = want_servers
+            .iter()
+            .all(|a| s.cfg.servers.iter().any(|x| x.addr == *a));
+        if name_ok && srv_ok {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            // Причину отказа демона забираем из событий (ошибка пришла
+            // событием, а не в ответе на команду).
+            let mut why = String::new();
+            for ev in eng.poll_events() {
+                if let engine::Event::Error(e) = ev {
+                    why = e;
+                }
+            }
+            if !why.is_empty() {
+                bail!("демон: {why}");
+            }
+            bail!(
+                "демон не сохранил настройку (имя «{want_name}») — задай параметры командами CLI \
+                 (set-name, add-server)"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 /// Подсказка по флагам `run` для текущей ОС.
