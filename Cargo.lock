@@ -1786,6 +1786,7 @@ dependencies = [
  "serde_json",
  "tunnel-protocol",
  "tunnel-server",
+ "windows-sys 0.61.2",
  "wintun",
 ]
 
