@@ -36,6 +36,8 @@ mod engine;
 mod engine_e2e;
 mod store;
 mod tun;
+#[cfg(target_os = "macos")]
+mod tun_macos;
 mod tui;
 
 use std::net::SocketAddr;

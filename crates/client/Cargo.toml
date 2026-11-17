@@ -12,6 +12,10 @@ serde.workspace = true
 serde_json.workspace = true
 wintun.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# utun-устройство на macOS (tun_macos.rs).
+libc = "0.2"
+
 [dev-dependencies]
 # e2e-тесты движка: настоящий сервер в том же процессе.
 tunnel-server = { path = "../server" }
