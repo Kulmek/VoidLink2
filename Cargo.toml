@@ -3,6 +3,7 @@ resolver = "2"
 members = ["crates/protocol", "crates/server", "crates/client", "crates/daemon"]
 members = ["crates/protocol", "crates/server", "crates/client", "crates/winsvc"]
 members = ["crates/protocol", "crates/server", "crates/client", "crates/ipc"]
+members = ["crates/protocol", "crates/server", "crates/client", "crates/tray"]
 
 [workspace.dependencies]
 anyhow = "1"
