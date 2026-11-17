@@ -245,7 +245,7 @@ impl ServersView {
                 form.error = None;
                 None
             }
-            KeyCode::Char(c) if !c.is_control() => {
+            KeyCode::Char(c) if is_text_input(&key, c) => {
                 push_char(field_add(form), c);
                 form.error = None;
                 None
@@ -279,6 +279,9 @@ impl ServersView {
         }
         let pubkey = proto::parse_friend_code(code)
             .map_err(|_| "код сервера — не friend code вида TUN-…".to_string())?;
+        if self.servers.iter().any(|s| s.pubkey == pubkey) {
+            return Err("сервер с этим кодом уже в списке".into());
+        }
         Ok(ServersAction::Add {
             addr: addr.to_string(),
             pubkey,
@@ -503,7 +506,7 @@ fn key_adapter(form: &mut AdapterForm, key: KeyEvent) -> Option<ServersAction> {
             form.error = None;
             None
         }
-        KeyCode::Char(c) if !c.is_control() => {
+        KeyCode::Char(c) if is_text_input(&key, c) => {
             push_char(if form.focus == 0 { &mut form.name } else { &mut form.dll }, c);
             form.error = None;
             None
@@ -528,6 +531,13 @@ fn field_add(form: &mut AddForm) -> &mut String {
     }
 }
 
+/// Печатный символ без Ctrl/Alt: Ctrl+V, Alt+x и т.п. не вставляют букву в поле.
+/// Ctrl+Alt вместе — это AltGr на Windows, его пропускаем как обычный ввод.
+fn is_text_input(key: &KeyEvent, c: char) -> bool {
+    let m = key.modifiers & (KeyModifiers::CONTROL | KeyModifiers::ALT);
+    !c.is_control() && (m.is_empty() || m == KeyModifiers::CONTROL | KeyModifiers::ALT)
+}
+
 fn push_char(s: &mut String, c: char) {
     if s.chars().count() < MAX_INPUT {
         s.push(c);
@@ -537,14 +547,17 @@ fn push_char(s: &mut String, c: char) {
 /// Адрес: `SocketAddr` (`1.2.3.4:5`, `[::1]:5`) или синтаксически верный
 /// `host:port` — имя резолвится позже, при подключении.
 pub fn valid_addr(addr: &str) -> bool {
-    if addr.parse::<std::net::SocketAddr>().is_ok() {
-        return true;
+    if let Ok(sa) = addr.parse::<std::net::SocketAddr>() {
+        return sa.port() != 0;
     }
     let Some((host, port)) = addr.rsplit_once(':') else {
         return false;
     };
     let port_ok = port.parse::<u16>().is_ok_and(|p| p != 0);
+    // Все метки из цифр — это кривой IPv4 (`999.1.1.1`), а не имя хоста.
+    let bad_ipv4 = host.split('.').all(|l| l.chars().all(|c| c.is_ascii_digit()));
     let host_ok = !host.is_empty()
+        && !bad_ipv4
         && host.len() <= 253
         && host.split('.').all(|l| {
             !l.is_empty()
@@ -715,7 +728,7 @@ mod tests {
     use crate::tui::theme::ThemeKind;
     use ratatui::backend::TestBackend;
 
-    const THEMES: [ThemeKind; 3] = [ThemeKind::Dark, ThemeKind::Light, ThemeKind::Contrast];
+    const THEMES: [ThemeKind; 5] = ThemeKind::ALL;
 
     fn k(code: KeyCode) -> KeyEvent {
         key(code)
@@ -915,6 +928,23 @@ mod tests {
         );
         assert_eq!(v.mode, Mode::List);
 
+        // тот же ключ под другим адресом — дубликат
+        v.servers.push(ServerEntry { label: String::new(), addr: "vpn.example.org:5555".into(), pubkey: id.ed_pub() });
+        v.mode = Mode::Add(AddForm { addr: "other.example.org:1".into(), code: code.clone(), ..Default::default() });
+        v.handle_key(k(KeyCode::Enter));
+        let Mode::Add(f) = &v.mode else { panic!() };
+        assert!(f.error.as_deref().unwrap().contains("кодом"), "{:?}", f.error);
+
+        // Ctrl/Alt + буква не печатают, AltGr (Ctrl+Alt) и Shift — печатают
+        v.mode = Mode::Add(AddForm::default());
+        v.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+        v.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT));
+        v.handle_key(KeyEvent::new(KeyCode::Char('@'), KeyModifiers::CONTROL | KeyModifiers::ALT));
+        v.handle_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT));
+        let Mode::Add(f) = &v.mode else { panic!() };
+        assert_eq!(f.addr, "@A");
+
+        v.mode = Mode::List;
         v.handle_key(k(KeyCode::Char('a')));
         assert_eq!(v.handle_key(k(KeyCode::Esc)), None);
         assert_eq!(v.mode, Mode::List);
@@ -922,10 +952,10 @@ mod tests {
 
     #[test]
     fn адреса() {
-        for ok in ["1.2.3.4:5555", "[::1]:5555", "localhost:1", "a-b.example.com:65535"] {
+        for ok in ["1.2.3.4:5555", "[::1]:5555", "localhost:1", "a-b.example.com:65535", "10.0.0.1x:5"] {
             assert!(valid_addr(ok), "{ok}");
         }
-        for bad in ["", "1.2.3.4", "host:0", "host:70000", ":5555", "-a.com:1", "a..b:1", "::1:5555", "хост:1"] {
+        for bad in ["", "1.2.3.4", "host:0", "host:70000", ":5555", "-a.com:1", "a..b:1", "::1:5555", "хост:1", "1.2.3.4:0", "[::1]:0", "999.1.1.1:5", "1.2.3:5"] {
             assert!(!valid_addr(bad), "{bad}");
         }
     }
