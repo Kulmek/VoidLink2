@@ -2803,6 +2803,40 @@ mod tests {
     }
 
     #[test]
+    fn каждый_подписанный_welcome_держится_до_ответа_сервера() {
+        // PROTOCOL.md, раздел 2: под один eph — несколько WELCOME (сервер
+        // пересоздал сессию на HELLO3 с другого адреса). Клиент держит все
+        // наборы; отправка — тем, под которым сервер последним ответил.
+        let client = proto::Identity::generate();
+        let id = proto::Identity::generate();
+        let (s1, s2) = (Srv::new(id.clone()), Srv::new(id.clone()));
+        let hs = Handshake::new();
+        let eph = hs.eph.public();
+        let acc1 = accept_welcome(&client, &hs.eph, &id.ed_pub(), &s1.welcome(&client, &eph, &[])).unwrap().unwrap();
+        let mut sess = CtrlSession::new(hs.eph, acc1);
+        let (k1, k2) = (s1.keys(&client, &eph), s2.keys(&client, &eph));
+        // Первая сессия ответила…
+        let m = proto::seal_ctrl(&k1.tx, 0, ctrl::CTRL_PONG, &[]);
+        assert!(matches!(open_frame(&mut sess, &m), Some(Some(_))));
+        // …затем WELCOME второй: набор добавлен, но отправка ещё первым.
+        let acc2 = accept_welcome(&client, &sess.eph, &id.ed_pub(), &s2.welcome(&client, &eph, &[])).unwrap().unwrap();
+        assert!(sess.add(acc2));
+        let f = sess.seal(ctrl::CTRL_PING, &[]);
+        let (t, b) = proto::split_frame(&f).unwrap();
+        assert!(proto::open_ctrl(&k1.rx, t, b).is_ok());
+        // Вторая сессия ответила — отправка переходит на её ключи, а фреймы
+        // первой по-прежнему открываются.
+        std::thread::sleep(Duration::from_millis(2));
+        let m = proto::seal_ctrl(&k2.tx, 0, ctrl::GROUP_LIST, &[]);
+        assert!(matches!(open_frame(&mut sess, &m), Some(Some(_))));
+        let f = sess.seal(ctrl::CTRL_PING, &[]);
+        let (t, b) = proto::split_frame(&f).unwrap();
+        assert!(proto::open_ctrl(&k2.rx, t, b).is_ok());
+        let m = proto::seal_ctrl(&k1.tx, 1, ctrl::CTRL_PONG, &[]);
+        assert!(matches!(open_frame(&mut sess, &m), Some(Some(_))));
+    }
+
+    #[test]
     fn ротация_ключа_сервера_по_цепочке() {
         let client = proto::Identity::generate();
         let old = proto::Identity::generate();
