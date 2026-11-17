@@ -36,6 +36,8 @@ mod engine;
 #[cfg(test)]
 mod engine_e2e;
 mod ipv6;
+mod invites;
+mod snapshot;
 mod store;
 mod tcp_link;
 mod tun;
