@@ -1,18 +1,24 @@
 //! tunnel-daemon: кроссплатформенное ядро демона (PLAN.md, этап 7.3).
 //!
-//! Движок и IPC сюда не подключены — они собираются в своих крейтах; демон
-//! знает о движке только через трейт [`hub::Backend`] (JSON-снимки и события),
-//! интеграция заменит JSON на типы `tunnel-engine` / `ipc`.
+//! Движок сюда не подключён — демон знает о нём только через трейт
+//! [`hub::Backend`] (JSON-снимки и события). IPC — [`server`] поверх
+//! `tunnel-ipc`; [`fake::FakeBackend`] — бэкенд в памяти для тестов и
+//! `console --fake`.
 
 pub mod cli;
+pub mod fake;
 pub mod hub;
 pub mod lock;
 pub mod log;
+pub mod server;
 pub mod service;
 
+pub use fake::FakeBackend;
 pub use hub::{Backend, Hub, HubMsg, Subscription};
 pub use lock::{InstanceLock, LockError};
 pub use log::{Level, LogFn, Logger};
+pub use server::IpcServer;
+pub use service::{IpcMode, RunOpts, run_daemon};
 
 use std::path::{Path, PathBuf};
 

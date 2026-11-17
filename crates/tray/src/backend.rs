@@ -1,6 +1,6 @@
-//! Источник данных трея. Настоящая реализация — IPC-клиент демона (7.3/7.4),
-//! подключается при интеграции; пока — `StubBackend` в памяти.
-#![allow(dead_code)] // подключается при интеграции
+//! Источник данных трея: [`crate::remote::IpcTrayBackend`] — IPC-клиент
+//! демона (7.3/7.5), `StubBackend` — состояние в памяти (`--demo`, тесты).
+#![cfg_attr(not(windows), allow(dead_code))] // вне Windows трей не собирается в бинарь
 
 use std::sync::Mutex;
 
@@ -9,8 +9,9 @@ use crate::model::{Action, Conn, TrayGroup, TrayInvite, TrayState};
 pub trait TrayBackend {
     /// Текущий снимок; вызывается по таймеру (раз в ~500 мс), не должен блокировать надолго.
     /// IPC-реализация обязана заполнять `TrayState::kicked` из событий демона
-    /// (Kicked / GroupDeleted), накопленных с прошлого вызова, и отдавать каждое
-    /// один раз: трей не угадывает исключение по разнице снимков.
+    /// (Kicked / GroupDeleted) и `TrayState::errors`, накопленные с прошлого
+    /// вызова, и отдавать каждое один раз: трей не угадывает исключение по
+    /// разнице снимков.
     fn state(&self) -> TrayState;
     /// Действие демона (группы, приглашения, остановка). Локальные действия
     /// (`Action::is_local`) трей выполняет сам и сюда не передаёт.
@@ -40,6 +41,7 @@ impl StubBackend {
             ],
             invites: vec![TrayInvite { gid: 3, group_name: "игры".into(), from: "друг".into() }],
             kicked: Vec::new(),
+            errors: Vec::new(),
             tui_open: false,
         })
     }

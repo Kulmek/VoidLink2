@@ -2654,6 +2654,7 @@ version = "0.2.0"
 dependencies = [
  "libc",
  "serde_json",
+ "tunnel-ipc",
  "windows-sys 0.61.2",
 ]
 
@@ -2696,8 +2697,10 @@ name = "tunnel-tray"
 version = "0.2.0"
 dependencies = [
  "arboard",
+ "serde_json",
  "tauri-winrt-notification",
  "tray-icon",
+ "tunnel-ipc",
  "windows-sys 0.61.2",
 ]
 

@@ -8,6 +8,8 @@ name = "tunnel-tray"
 path = "src/main.rs"
 
 [dependencies]
+serde_json.workspace = true
+tunnel-ipc = { path = "../ipc" }
 
 # Трей только под Windows (этап 7.5). Меню — `muda`, реэкспорт `tray_icon::menu`
 # (одна версия с tray-icon, без рассинхрона типов).

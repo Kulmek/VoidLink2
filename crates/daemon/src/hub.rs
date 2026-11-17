@@ -93,7 +93,9 @@ struct Inner {
     subs: Vec<Sub>,
     next_id: u64,
     last_snap: Option<Instant>,
-    snap: Option<Arc<Value>>,
+    /// Кэш снимка и `seq` последнего события, учтённого в нём (не `seq`
+    /// хаба на момент рассылки: между тактами они могут разойтись).
+    snap: Option<(u64, Arc<Value>)>,
 }
 
 pub struct Hub<B: Backend> {
@@ -154,8 +156,13 @@ impl<B: Backend> Hub<B> {
     /// Новый подписчик с очередью `queue` сообщений (минимум 1).
     pub fn subscribe(&self, queue: usize) -> Subscription {
         let (tx, rx) = mpsc::sync_channel(queue.max(1));
-        // Снимок бэкенда — вне мьютекса хаба.
-        let fresh = if self.lock().snap.is_none() { Some(Arc::new(self.backend.snapshot())) } else { None };
+        // Снимок бэкенда — вне мьютекса хаба. `seq` берём до снимка: события
+        // с номером ≤ seq уже забраны из бэкенда, значит, в снимке учтены.
+        let pre = {
+            let g = self.lock();
+            g.snap.is_none().then_some(g.seq)
+        };
+        let fresh = pre.map(|seq| (seq, Arc::new(self.backend.snapshot())));
         let mut g = self.lock();
         let snap = match (&g.snap, fresh) {
             (Some(s), _) => s.clone(),
@@ -171,7 +178,7 @@ impl<B: Backend> Hub<B> {
         Subscription {
             id,
             history: g.ring.iter().cloned().collect(),
-            snapshot: (g.seq, snap),
+            snapshot: snap,
             rx,
         }
     }
@@ -192,7 +199,7 @@ impl<B: Backend> Hub<B> {
         let events = self.backend.poll_events();
         let changed = self.backend.changed();
         let mut overflowed = Vec::new();
-        let need = {
+        let (need, snap_seq) = {
             let mut g = self.lock();
             let g = &mut *g;
             for ev in events {
@@ -206,7 +213,10 @@ impl<B: Backend> Hub<B> {
                 g.subs.retain_mut(|s| deliver(s, HubMsg::Event { seq, ev: ev.clone() }, &mut overflowed));
             }
             let due = g.last_snap.is_none_or(|t| now.saturating_duration_since(t) >= SNAPSHOT_EVERY);
-            changed || due || g.snap.is_none()
+            // Подписчику с пропуском нужен снимок, покрывающий дырку: кэш,
+            // не учитывающий последние события, не годится.
+            let stale = g.snap.as_ref().is_some_and(|(q, _)| *q < g.seq) && g.subs.iter().any(|s| s.need_snapshot);
+            (changed || due || stale || g.snap.is_none(), g.seq)
         };
         if let Some(log) = &self.log {
             for id in overflowed {
@@ -219,14 +229,13 @@ impl<B: Backend> Hub<B> {
         let mut g = self.lock();
         let g = &mut *g;
         if let Some(s) = fresh {
-            g.snap = Some(s);
+            g.snap = Some((snap_seq, s));
             g.last_snap = Some(now);
             for s in &mut g.subs {
                 s.need_snapshot = true;
             }
         }
-        let Some(snap) = g.snap.clone() else { return };
-        let seq = g.seq;
+        let Some((seq, snap)) = g.snap.clone() else { return };
         g.subs.retain_mut(|s| {
             if !s.need_snapshot {
                 return true;

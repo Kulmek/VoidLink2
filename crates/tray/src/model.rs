@@ -57,6 +57,10 @@ pub struct TrayState {
     /// (Kicked / GroupDeleted) с прошлого вызова `state()`. Бэкенд отдаёт каждое
     /// один раз; свой выход (меню, CLI, TUI) сюда не попадает.
     pub kicked: Vec<TrayKick>,
+    /// Ошибки, о которых надо сказать пользователю (отказ демона в `Ack` на
+    /// действие из трея, несовместимая версия IPC), с прошлого вызова `state()`;
+    /// бэкенд отдаёт каждую один раз.
+    pub errors: Vec<String>,
     /// Открыт ли сейчас TUI (для политики уведомлений).
     pub tui_open: bool,
 }
@@ -71,6 +75,7 @@ impl Default for TrayState {
             groups: Vec::new(),
             invites: Vec::new(),
             kicked: Vec::new(),
+            errors: Vec::new(),
             tui_open: false,
         }
     }
@@ -325,6 +330,9 @@ pub enum Notice {
     /// Источник — только `TrayState::kicked` (события демона), не разница снимков.
     Kicked { gid: u32, group_name: String },
     Disconnected,
+    /// Ответ на своё действие из трея (`Ack` с ошибкой) и т.п. — показывается
+    /// при любом `NotifyMode`: в TUI об этом никто не скажет.
+    Error(String),
 }
 
 impl Notice {
@@ -338,6 +346,7 @@ impl Notice {
                 ("Группа недоступна".into(), format!("Вы больше не в группе «{group_name}»"))
             }
             Notice::Disconnected => ("Нет связи".into(), "Tunnel не на связи больше 30 секунд".into()),
+            Notice::Error(text) => ("Tunnel: ошибка".into(), text.clone()),
         }
     }
 }
@@ -414,6 +423,8 @@ impl Notifier {
         if !should_show(self.mode, s.tui_open) {
             out.clear();
         }
+        // Ошибки своих действий — мимо политики.
+        out.extend(s.errors.iter().map(|e| Notice::Error(e.clone())));
         out
     }
 }
@@ -441,6 +452,7 @@ mod tests {
             ],
             invites: vec![TrayInvite { gid: 7, group_name: "игры".into(), from: "петя".into() }],
             kicked: Vec::new(),
+            errors: Vec::new(),
             tui_open: false,
         }
     }
@@ -661,5 +673,18 @@ mod tests {
         // Уже увиденное при открытом TUI не всплывает после закрытия.
         s.tui_open = false;
         assert!(n.observe(&s, t0).is_empty());
+    }
+
+    #[test]
+    fn notify_errors_bypass_mode() {
+        let t0 = Instant::now();
+        let mut n = Notifier::new(NotifyMode::WhenTuiClosed);
+        let mut s = st();
+        s.tui_open = true;
+        s.errors.push("нет сервера".into());
+        assert_eq!(n.observe(&s, t0), vec![Notice::Error("нет сервера".into())]);
+        let down = TrayState { errors: vec!["служба недоступна".into()], ..Default::default() };
+        assert_eq!(n.observe(&down, t0).len(), 1);
+        assert_eq!(Notice::Error("x".into()).text().1, "x");
     }
 }

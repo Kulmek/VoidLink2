@@ -19,11 +19,15 @@ fn main() -> ExitCode {
             print!("{}", cli::USAGE);
             Ok(())
         }
-        Mode::Console { debug, data_dir } => {
+        Mode::Console { debug, fake, data_dir } => {
             // Остановка — Ctrl+C / SIGTERM: флаг, хаб выходит штатно.
             let stop = Arc::new(AtomicBool::new(false));
             service::install_ctrl_handler(stop.clone());
-            service::run_console(&dir(data_dir), debug, |_log| service::NullBackend, stop)
+            if fake {
+                service::run_console(&dir(data_dir), debug, |_log| tunnel_daemon::FakeBackend::new(), stop)
+            } else {
+                service::run_console(&dir(data_dir), debug, |_log| service::NullBackend, stop)
+            }
         }
         Mode::Service { data_dir } => service::run_service(&dir(data_dir)),
         Mode::Install => service::install(),
