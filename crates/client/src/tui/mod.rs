@@ -6,6 +6,7 @@
 
 pub mod admin;
 pub mod app;
+pub mod badges;
 pub mod identicon;
 pub mod servers;
 pub mod setup;
