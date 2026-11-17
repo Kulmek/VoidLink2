@@ -1957,6 +1957,9 @@ fn handle_mutation(
                 sh.log(format!("presence: {uname} invisible={invisible}"));
                 member_changed(s, &me, out);
             }
+            // Подтверждение — всегда, и на повтор: клиент повторяет PRESENCE,
+            // пока не получит его (потерянный PRESENCE оставлял бы видимым).
+            push_ctrl(out, src, &s.sessions[&src], ctrl::PRESENCE_ACK, &pl::enc_presence(invisible));
         }
         ctrl::CREATE_GROUP => {
             let (name, private) = pl::dec_create_group(payload)?;
@@ -3303,7 +3306,12 @@ mod tests {
         let ub = b.update();
         assert_eq!(ub.base_rev, sb.rev);
 
+        // Повтор того же значения — без дельты, но с подтверждением.
+        b.send(ctrl::PRESENCE, &payloads::enc_presence(true));
+        assert!(payloads::dec_presence(&b.expect(ctrl::PRESENCE_ACK)).unwrap());
+        assert!(!a.sync().contains(&ctrl::GROUP_UPDATE), "повтор PRESENCE — не изменение");
         b.send(ctrl::PRESENCE, &payloads::enc_presence(false));
+        assert!(!payloads::dec_presence(&b.expect(ctrl::PRESENCE_ACK)).unwrap());
         let GroupDelta::Member(m) = a.update().delta else { panic!() };
         assert!(m.online);
         assert_eq!(m.endpoint, Some(b.sock.local_addr().unwrap()));

@@ -1510,3 +1510,53 @@ fn e2e_кик_при_отстающей_ревизии_не_возвращает
     server.stop();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn e2e_потерянный_presence_повторяется_до_подтверждения() {
+    let dir = temp_dir("presence-loss");
+    let server = start_server(&dir, 0);
+    let mut a = Node::start("alpha", &server);
+    a.wait("A подключён", T, |e| matches!(e, Event::Connected(_)));
+    let gid = a.create("game", false);
+
+    // Первые два PRESENCE теряются по дороге к серверу, первый PRESENCE_ACK —
+    // по дороге к клиенту.
+    let mut acks = 0;
+    let proxy = LossyProxy::start(
+        local(server.addr),
+        Box::new(move |to_server, typ, sent| {
+            if to_server {
+                return typ == ctrl::PRESENCE && sent[&typ] <= 2;
+            }
+            if typ == ctrl::PRESENCE_ACK {
+                acks += 1;
+                return acks == 1;
+            }
+            false
+        }),
+    );
+    let mut b = Node::start_via("bravo", proxy.addr, server.pubkey, proto::Identity::generate());
+    b.wait("B подключён", T, |e| matches!(e, Event::Connected(_)));
+    b.join(gid);
+    wait_until("A видит B онлайн", T, || a.sees_online(gid, 1));
+
+    b.eng.cmds.send(Cmd::SetInvisible(true)).unwrap();
+    wait_until("A видит невидимку B офлайн", T, || {
+        let g = a.eng.groups.lock().unwrap();
+        g.get(&gid).is_some_and(|gs| gs.members.len() == 1 && gs.members.values().all(|p| !p.online))
+    });
+    // Два потерянных + дошедший (его ACK потерян) + подтверждённый; дальше
+    // подтверждённое не повторяется.
+    wait_until("B получил подтверждение", T, || proxy.sent(ctrl::PRESENCE) >= 4);
+    std::thread::sleep(Duration::from_millis(2500));
+    assert_eq!(proxy.sent(ctrl::PRESENCE), 4, "повторы только до PRESENCE_ACK");
+
+    b.eng.cmds.send(Cmd::SetInvisible(false)).unwrap();
+    wait_until("A снова видит B онлайн", T, || a.sees_online(gid, 1));
+
+    drop(a);
+    drop(b);
+    drop(proxy);
+    server.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}

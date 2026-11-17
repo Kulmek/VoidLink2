@@ -85,6 +85,9 @@ const CAND_EVERY: Duration = Duration::from_secs(60);
 /// `SELF_RETRY`: потерянный PRESENCE не оставляет клиента видимым на минуту.
 const SELF_RETRIES: u8 = 3;
 const SELF_RETRY: Duration = Duration::from_secs(1);
+/// PRESENCE повторяется раз в `SELF_RETRY`, пока сервер не подтвердит его
+/// PRESENCE_ACK с тем же значением; дальше — только периодический повтор.
+const PRESENCE_GIVE_UP: Duration = Duration::from_secs(20);
 const HISTORY_LEN: usize = 60;
 const NEW_GROUP_GRACE: Duration = Duration::from_secs(10);
 /// Таймаут чтения rx-потока (как часто он проверяет флаг выхода).
@@ -1470,6 +1473,9 @@ struct State {
     /// Последние отправленные CANDIDATES.
     candidates: Vec<SocketAddr>,
     last_cand: Instant,
+    /// Неподтверждённый PRESENCE: значение, первая и последняя отправка.
+    /// Повторяется, пока не придёт PRESENCE_ACK с этим значением.
+    presence: Option<(bool, Instant, Instant)>,
     last_ping: Instant,
     last_list: Instant,
     last_rtt: Instant,
@@ -1501,6 +1507,7 @@ impl State {
             last_get: HashMap::new(),
             candidates: Vec::new(),
             last_cand: now,
+            presence: None,
             last_ping: now,
             last_list: now,
             last_rtt: now,
@@ -1518,6 +1525,14 @@ impl State {
         self.hs = Some(Handshake::new());
         self.early.clear();
         self.next_hello = Instant::now();
+    }
+
+    /// PRESENCE с ожиданием подтверждения (без связи — только запоминается:
+    /// уйдёт флагом HELLO3 и повтором после WELCOME).
+    fn send_presence(&mut self, env: &Env, invisible: bool) {
+        let now = Instant::now();
+        self.presence = Some((invisible, now, now));
+        self.send_ctrl(env, ctrl::PRESENCE, &payloads::enc_presence(invisible));
     }
 
     fn send_ctrl(&mut self, env: &Env, typ: u8, payload: &[u8]) {
@@ -1631,6 +1646,11 @@ fn restore(env: &Env, st: &mut State) {
     let cfg = env.cfg.lock().unwrap().clone();
     if !cfg.status.is_empty() {
         st.send_ctrl(env, ctrl::STATUS, &payloads::enc_status(&cfg.status));
+    }
+    // Неподтверждённая смена невидимки — заново в новую сессию (HELLO3 мог
+    // уйти до смены); подтверждённая уже в флагах HELLO3.
+    if st.presence.is_some() {
+        st.send_presence(env, cfg.invisible);
     }
     st.candidates = lan_candidates(env);
     st.last_cand = Instant::now();
@@ -1861,8 +1881,22 @@ fn tick(env: &Env, st: &mut State, now: Instant) {
                 st.send_ctrl(env, ctrl::GET_GROUP, &payloads::enc_gid(gid));
             }
         }
+        if let Some((on, first, last)) = st.presence
+            && now.duration_since(last) >= SELF_RETRY
+        {
+            if now.duration_since(first) >= PRESENCE_GIVE_UP {
+                // Дальше чинит периодический повтор раз в `CAND_EVERY`.
+                st.presence = None;
+            } else {
+                st.presence = Some((on, first, now));
+                st.send_ctrl(env, ctrl::PRESENCE, &payloads::enc_presence(on));
+            }
+        }
         if now.duration_since(st.last_cand) >= CAND_EVERY {
             st.last_cand = now;
+            // Повтор без изменения сервер не считает изменением (только ACK).
+            let on = env.cfg.lock().unwrap().invisible;
+            st.send_ctrl(env, ctrl::PRESENCE, &payloads::enc_presence(on));
             let cands = lan_candidates(env);
             if cands != st.candidates {
                 st.candidates = cands;
@@ -1911,8 +1945,9 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
         }
         Cmd::SetInvisible(on) => {
             env.update_cfg(|c| c.invisible = on);
-            // Без связи — уйдёт флагом в следующем HELLO3.
-            st.send_ctrl(env, ctrl::PRESENCE, &payloads::enc_presence(on));
+            // Без связи — уйдёт флагом в следующем HELLO3. Повторяется, пока
+            // сервер не подтвердит PRESENCE_ACK.
+            st.send_presence(env, on);
             return;
         }
         Cmd::Leave(gid) => {
@@ -2191,6 +2226,14 @@ fn on_ctrl(env: &Env, st: &mut State, typ: u8, payload: &[u8]) {
                         .map(|i| (i.pubkey, i.name, i.expires_in))
                         .collect(),
                 });
+            }
+        }
+        ctrl::PRESENCE_ACK => {
+            // Подтверждено именно последнее отправленное значение — хватит.
+            if let Ok(on) = payloads::dec_presence(payload)
+                && st.presence.is_some_and(|(want, ..)| want == on)
+            {
+                st.presence = None;
             }
         }
         ctrl::ERROR => {
