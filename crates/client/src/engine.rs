@@ -2867,6 +2867,39 @@ mod tests {
     }
 
     #[test]
+    fn скачок_эпохи_не_сохраняет_прошлый_ключ() {
+        let now = Instant::now();
+        // Скачок 5 -> 7: промежуточная ротация 6 могла быть KICK с revoke_prev —
+        // ключ эпохи 5 не принимается даже без revoke_prev в эпохе 7.
+        let mut g = GroupSess::new(&state(1, 5, 1), now, KeyLog::default());
+        g.set_key(7, [3; 32], false, now);
+        assert!(g.prev.is_none());
+        assert_eq!(g.rx_key(5, now), None);
+        assert_eq!(g.rx_key(7, now), Some([3; 32]));
+
+        // Ровно +1, но с revoke_prev — тоже без grace.
+        let mut g = GroupSess::new(&state(1, 5, 1), now, KeyLog::default());
+        g.set_key(6, [2; 32], true, now);
+        assert!(g.prev.is_none());
+        assert_eq!(g.rx_key(5, now), None);
+
+        // Ровно +1 без revoke_prev — grace сохраняется.
+        let mut g = GroupSess::new(&state(1, 5, 1), now, KeyLog::default());
+        g.set_key(6, [2; 32], false, now);
+        assert_eq!(g.rx_key(5, now), Some([1; 32]));
+        // Затем скачок 6 -> 8: прежний prev (5) и текущий (6) не остаются.
+        g.set_key(8, [4; 32], false, now);
+        assert!(g.prev.is_none());
+        assert_eq!(g.rx_key(5, now), None);
+        assert_eq!(g.rx_key(6, now), None);
+        // Тот же ключ со скачком эпохи — prev тоже забывается.
+        let mut g = GroupSess::new(&state(1, 5, 1), now, KeyLog::default());
+        g.set_key(6, [2; 32], false, now);
+        g.set_key(8, [2; 32], false, now);
+        assert!(g.prev.is_none());
+    }
+
+    #[test]
     fn возврат_к_ключу_продолжает_счётчик() {
         let now = Instant::now();
         let log = KeyLog::default();
