@@ -29,6 +29,9 @@ const USAGE: &str = "\
   --session-timeout <сек>   сессия без пакетов столько — офлайн (30)
   --max-owned-groups N      групп во владении одной identity (16)
   --invite-ttl-days N       срок жизни приглашения, дней (7)
+  --max-invites-per-group N приглашений на группу (256)
+  --max-bans-per-group N    банов на группу (1024)
+  --max-invites-per-target N живых приглашений одной identity по всем группам (64)
 
 rotate-key: сменить ключ сервера. Старый ключ подписывает новый, звено
 дописывается в server.json; клиенты со старым кодом перезакрепляются сами,
@@ -98,6 +101,9 @@ fn main() -> Result<()> {
             "--join-burst" => l.join_burst = value(&args, i, a)?,
             "--session-timeout" => l.session_timeout = Duration::from_secs(value(&args, i, a)?),
             "--max-owned-groups" => l.max_owned_groups = value(&args, i, a)?,
+            "--max-invites-per-group" => l.max_invites_per_group = value(&args, i, a)?,
+            "--max-bans-per-group" => l.max_bans_per_group = value(&args, i, a)?,
+            "--max-invites-per-target" => l.max_invites_per_target = value(&args, i, a)?,
             "--invite-ttl-days" => {
                 let days: u64 = value(&args, i, a)?;
                 l.invite_ttl = Duration::from_secs(days.saturating_mul(24 * 3600));

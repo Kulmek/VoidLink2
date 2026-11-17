@@ -68,11 +68,6 @@ const URGENT_SAVE_GAP: Duration = Duration::from_millis(200);
 /// `SAVE_EVERY`, и после падения сервера номера, уже выданные клиентам с
 /// другим ключом, иначе выдавались бы снова (раздел 5: номера только растут).
 const LOAD_MARGIN: u32 = 1 << 16;
-/// Приглашений и банов на группу: без предела любой владелец раздувал бы
-/// server.json (переписывается раз в 3 с) и списки, которые сервер
-/// обходит постоянно.
-const MAX_INVITES_PER_GROUP: usize = 64;
-const MAX_BANS_PER_GROUP: usize = 256;
 /// Лимитер HELLO по IP: шардов и записей в шарде (новые адреса сверх —
 /// без ответа, пока housekeeping не забудет молчащие).
 const IP_SHARDS: usize = 16;
@@ -133,6 +128,14 @@ pub struct Limits {
     pub max_owned_groups: usize,
     /// Срок жизни приглашения.
     pub invite_ttl: Duration,
+    /// Приглашений и банов на группу: без предела любой владелец раздувал бы
+    /// server.json (переписывается раз в 3 с) и списки, которые сервер
+    /// обходит постоянно.
+    pub max_invites_per_group: usize,
+    pub max_bans_per_group: usize,
+    /// Живых приглашений на одну цель по всем группам: иначе владельцы
+    /// множества групп заваливали бы одну identity окнами приглашений.
+    pub max_invites_per_target: usize,
 }
 
 impl Default for Limits {
@@ -151,6 +154,9 @@ impl Default for Limits {
             session_timeout: Duration::from_secs(30),
             max_owned_groups: 16,
             invite_ttl: Duration::from_secs(7 * 24 * 3600),
+            max_invites_per_group: 256,
+            max_bans_per_group: 1024,
+            max_invites_per_target: 64,
         }
     }
 }
@@ -2065,14 +2071,27 @@ fn handle_mutation(
             let (gid, target) = pl::dec_gid_target(payload)?;
             let tname = known_name(s, &target);
             let ttl_secs = s.invite_ttl_ms.div_ceil(1000).min(u32::MAX as u64) as u32;
+            let (max_group, max_target) = (sh.limits.max_invites_per_group, sh.limits.max_invites_per_target);
+            // Живые приглашения цели в других группах (продление своего — не новое).
+            let now = unix_ms();
+            let target_pending = s
+                .groups
+                .values()
+                .filter(|g| g.id != gid)
+                .filter(|g| g.invites.get(&target).is_some_and(|i| s.invite_live(i, now)))
+                .count();
             let g = s.groups.get_mut(&gid).context("группа не найдена")?;
             anyhow::ensure!(g.owner == me, "приглашать может только владелец");
             anyhow::ensure!(!g.banned.contains_key(&target), "цель забанена");
             // Участнику окно приглашения ни к чему (и владельцу самому себе).
             anyhow::ensure!(!g.members.contains_key(&target), "уже участник группы");
             anyhow::ensure!(
-                g.invites.contains_key(&target) || g.invites.len() < MAX_INVITES_PER_GROUP,
-                "лимит приглашений в группе ({MAX_INVITES_PER_GROUP}): дождитесь ответов или отзовите (KICK)"
+                g.invites.contains_key(&target) || g.invites.len() < max_group,
+                "лимит приглашений в группе ({max_group}): дождитесь ответов или отзовите (KICK)"
+            );
+            anyhow::ensure!(
+                g.invites.contains_key(&target) || target_pending < max_target,
+                "лимит приглашений у цели ({max_target}): у неё слишком много неотвеченных приглашений"
             );
             // Повторное приглашение продлевает срок.
             g.invites.insert(target, Invite { created_ms: unix_ms(), name: tname });
@@ -2116,12 +2135,13 @@ fn handle_mutation(
             let (gid, target) = pl::dec_gid_target(payload)?;
             let banned = typ == ctrl::BAN;
             let tname = known_name(s, &target);
+            let max_bans = sh.limits.max_bans_per_group;
             let g = s.groups.get_mut(&gid).context("группа не найдена")?;
             anyhow::ensure!(g.owner == me, "может только владелец");
             anyhow::ensure!(target != g.owner, "нельзя исключить владельца");
             anyhow::ensure!(
-                !banned || g.banned.contains_key(&target) || g.banned.len() < MAX_BANS_PER_GROUP,
-                "лимит банов в группе ({MAX_BANS_PER_GROUP}): снимите старые (UNBAN) или исключите без бана"
+                !banned || g.banned.contains_key(&target) || g.banned.len() < max_bans,
+                "лимит банов в группе ({max_bans}): снимите старые (UNBAN) или исключите без бана"
             );
             let kicked = g.remove_member(&target);
             // Приглашение снимают и KICK, и BAN: кикнутому не всплывёт окно
@@ -2787,8 +2807,46 @@ mod tests {
     }
 
     #[test]
+    fn лимит_приглашений_на_одну_цель() {
+        let limits = Limits { max_invites_per_target: 2, ctrl_rate: 1e6, ctrl_burst: 1e6, ..Limits::default() };
+        let (server, dir) = test_server_with("target-cap", limits);
+        let a = Raw::connect(server.addr, "alpha");
+        let target = [0x77; 32];
+        let gids: Vec<u32> = (0..3).map(|i| a.create(&format!("g{i}"), false).gid).collect();
+        for &gid in &gids[..2] {
+            a.send(ctrl::INVITE, &payloads::enc_gid_target(gid, &target));
+        }
+        assert!(!a.sync().contains(&ctrl::ERROR));
+        a.send(ctrl::INVITE, &payloads::enc_gid_target(gids[2], &target));
+        assert!(a.error().contains("лимит приглашений у цели"));
+        // Продление уже висящего — не новое приглашение.
+        a.send(ctrl::INVITE, &payloads::enc_gid_target(gids[0], &target));
+        assert!(!a.sync().contains(&ctrl::ERROR));
+        // Другой цели лимит не мешает.
+        a.send(ctrl::INVITE, &payloads::enc_gid_target(gids[2], &[0x78; 32]));
+        assert!(!a.sync().contains(&ctrl::ERROR));
+        // Отзыв (KICK) освобождает место.
+        a.send(ctrl::KICK, &payloads::enc_gid_target(gids[0], &target));
+        a.send(ctrl::INVITE, &payloads::enc_gid_target(gids[2], &target));
+        assert!(!a.sync().contains(&ctrl::ERROR));
+        assert!(server.shared.state.read().unwrap().groups[&gids[2]].invites.contains_key(&target));
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn лимиты_приглашений_банов_и_входов_в_группу() {
-        let limits = Limits { join_rate: 0.001, join_burst: 2.0, ctrl_rate: 1e6, ctrl_burst: 1e6, ..Limits::default() };
+        const MAX_INVITES_PER_GROUP: usize = 64;
+        const MAX_BANS_PER_GROUP: usize = 256;
+        let limits = Limits {
+            join_rate: 0.001,
+            join_burst: 2.0,
+            ctrl_rate: 1e6,
+            ctrl_burst: 1e6,
+            max_invites_per_group: MAX_INVITES_PER_GROUP,
+            max_bans_per_group: MAX_BANS_PER_GROUP,
+            ..Limits::default()
+        };
         let (server, dir) = test_server_with("caps", limits);
         let a = Raw::connect(server.addr, "alpha");
         let gid = a.create("g", false).gid;
