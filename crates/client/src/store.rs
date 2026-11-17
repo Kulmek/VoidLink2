@@ -59,6 +59,10 @@ pub struct Config {
     /// и при смене сервера чужие gid вошли бы в посторонние группы.
     #[serde(default)]
     pub autojoin_by_server: BTreeMap<String, Vec<u32>>,
+    /// Встроенный DNS для имён пиров (`<member>.vl`, `<member>.<group>.vl`
+    /// на 100.66.0.53) и настройка split-DNS ОС для `.vl`.
+    #[serde(default = "default_true")]
+    pub dns: bool,
 }
 
 impl Default for Config {
@@ -76,6 +80,7 @@ impl Default for Config {
             invisible: false,
             active_server: String::new(),
             autojoin_by_server: BTreeMap::new(),
+            dns: true,
         }
     }
 }

@@ -1386,3 +1386,112 @@ fn e2e_запоздавший_group_state_не_возвращает_отозва
     server.stop();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// DNS-запрос (A) к встроенному DNS 100.66.0.53:53 от `src`.
+fn dns_query(src: u32, id: u16, name: &str) -> Vec<u8> {
+    let mut q = Vec::new();
+    q.extend_from_slice(&id.to_be_bytes());
+    q.extend_from_slice(&0x0100u16.to_be_bytes()); // RD
+    q.extend_from_slice(&[0, 1, 0, 0, 0, 0, 0, 0]);
+    for l in name.split('.') {
+        q.push(l.len() as u8);
+        q.extend_from_slice(l.as_bytes());
+    }
+    q.push(0);
+    q.extend_from_slice(&1u16.to_be_bytes()); // A
+    q.extend_from_slice(&1u16.to_be_bytes()); // IN
+    let mut udp = Vec::new();
+    udp.extend_from_slice(&40000u16.to_be_bytes());
+    udp.extend_from_slice(&53u16.to_be_bytes());
+    udp.extend_from_slice(&((8 + q.len()) as u16).to_be_bytes());
+    udp.extend_from_slice(&[0, 0]);
+    udp.extend_from_slice(&q);
+    ipv4(src, u32::from(crate::dns::DNS_ADDR), &udp)
+}
+
+/// Ответ встроенного DNS с ID `id` среди вброшенных в TUN.
+fn dns_answer(n: &Node, id: u16) -> Option<Vec<u8>> {
+    let inj = n.tun.injected.lock().unwrap();
+    inj.iter()
+        .find(|p| p.len() >= 30 && p[12..16] == crate::dns::DNS_ADDR.octets() && p[28..30] == id.to_be_bytes())
+        .cloned()
+}
+
+/// Минимальный IPv6-пакет (UDP, без контрольной суммы — TUN её не проверяет).
+fn ipv6_pkt(src: std::net::Ipv6Addr, dst: std::net::Ipv6Addr, data: &[u8]) -> Vec<u8> {
+    let mut p = vec![0u8; 40];
+    p[0] = 0x60;
+    p[4..6].copy_from_slice(&(data.len() as u16).to_be_bytes());
+    p[6] = 17;
+    p[7] = 64;
+    p[8..24].copy_from_slice(&src.octets());
+    p[24..40].copy_from_slice(&dst.octets());
+    p.extend_from_slice(data);
+    p
+}
+
+#[test]
+fn e2e_dns_имена_участников_и_ipv6_оверлей() {
+    let dir = temp_dir("dns6");
+    let server = start_server(&dir, 0);
+    let mut a = Node::start("Alpha", &server);
+    let mut b = Node::start("Bravo Two", &server);
+    a.wait("A подключён", T, |e| matches!(e, Event::Connected(_)));
+    b.wait("B подключён", T, |e| matches!(e, Event::Connected(_)));
+    let gid = a.create("Game Room", false);
+    b.join(gid);
+    a.wait("A видит B онлайн", T, |e| matches!(e, Event::PeerOnline { .. }));
+    let (ia, ib) = (a.my_ip(gid), b.my_ip(gid));
+
+    // DNS: ответ вброшен в TUN самого A, в туннель не уходит.
+    for (id, name, want) in [
+        (1u16, "bravo-two.vl", Some(ib)),
+        (2, "BRAVO-TWO.game-room.vl", Some(ib)),
+        (3, "alpha.vl", Some(ia)),
+        (4, "bravo-two.other.vl", None),
+    ] {
+        a.eng.send_ip_packet(&dns_query(ia, id, name));
+        let r = dns_answer(&a, id).unwrap_or_else(|| panic!("{name}: нет ответа DNS"));
+        assert_eq!(r[16..20], ia.to_be_bytes(), "ответ — запросившему");
+        let ancount = u16::from_be_bytes([r[34], r[35]]);
+        match want {
+            Some(ip) => {
+                assert_eq!(ancount, 1, "{name}: одна A-запись");
+                assert_eq!(r[r.len() - 4..], ip.to_be_bytes(), "{name}: адрес");
+            }
+            None => assert_eq!((ancount, r[31] & 0x0f), (0, 3), "{name}: NXDOMAIN"),
+        }
+    }
+
+    // IPv6 оверлея A → B доходит до TUN B.
+    let (a6, b6) = (crate::ipv6::v6_of(ia).unwrap(), crate::ipv6::v6_of(ib).unwrap());
+    let pkt = ipv6_pkt(a6, b6, b"hello6");
+    wait_until("IPv6 A→B", T, || {
+        a.eng.send_ip_packet(&pkt);
+        std::thread::sleep(Duration::from_millis(50));
+        b.got(&pkt) > 0
+    });
+    // Подделанный IPv6-источник (чужой хост группы) и источник вне
+    // префикса отбрасываются у B (раздел 7, п. 6).
+    let fake = ipv6_pkt(crate::ipv6::v6_of(ia ^ 0x80).unwrap(), b6, b"spoof6");
+    let alien = ipv6_pkt("fe80::1".parse().unwrap(), b6, b"alien6");
+    for _ in 0..5 {
+        a.eng.send_ip_packet(&fake);
+        a.eng.send_ip_packet(&alien);
+    }
+    let marker = ipv6_pkt(a6, b6, b"marker6");
+    wait_until("IPv6 маркер", T, || {
+        a.eng.send_ip_packet(&marker);
+        std::thread::sleep(Duration::from_millis(50));
+        b.got(&marker) > 0
+    });
+    assert_eq!((b.got(&fake), b.got(&alien)), (0, 0), "подделки IPv6 не доставлены");
+    assert!(
+        !b.tun.injected.lock().unwrap().iter().any(|p| p.len() > 16 && p[12..16] == crate::dns::DNS_ADDR.octets()),
+        "DNS-запросы A не уходят пирам"
+    );
+
+    drop((a, b));
+    server.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
