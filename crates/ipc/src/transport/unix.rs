@@ -1,7 +1,9 @@
 //! Unix: `UnixListener` / `UnixStream`, файл сокета с правами `0600`.
 //!
-//! Каталог сокета (каталог данных) должен быть `0700`: между `bind` и `chmod`
-//! файл короткое время имеет права по umask.
+//! Каталог сокета (каталог данных) обязан принадлежать текущему пользователю
+//! и иметь права без доступа группе/остальным (`mode & 0o077 == 0`): между
+//! `bind` и `chmod` файл короткое время имеет права по umask, и закрытый
+//! каталог не даёт чужим подключиться в это окно. `bind` это проверяет.
 
 use std::fs;
 use std::io::{self, Read, Write};
@@ -22,8 +24,10 @@ pub struct Listener {
 impl Listener {
     /// Создаёт сокет по пути `name` с правами `0600`. Если файл уже есть —
     /// `AddrInUse`: устаревший сокет убирает [`cleanup_stale`] (под замком демона).
+    /// Каталог сокета должен быть нашим и закрытым (`0700`), иначе `PermissionDenied`.
     pub fn bind(name: impl AsRef<Path>) -> io::Result<Listener> {
         let path = name.as_ref().to_path_buf();
+        check_private_dir(&path)?;
         let inner = UnixListener::bind(&path)?;
         let setup = (|| {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
@@ -58,6 +62,33 @@ impl Drop for Listener {
             let _ = fs::remove_file(&self.path);
         }
     }
+}
+
+unsafe extern "C" {
+    safe fn geteuid() -> u32;
+}
+
+/// Проверяет, что каталог сокета принадлежит текущему пользователю и закрыт
+/// для группы и остальных. umask процесса библиотека не трогает.
+fn check_private_dir(sock: &Path) -> io::Result<()> {
+    let dir = match sock.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    let md = fs::metadata(dir)?;
+    let uid = geteuid();
+    if !md.is_dir() || md.uid() != uid || md.mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "каталог сокета {} должен принадлежать uid {uid} и иметь права 0700 (сейчас uid {}, {:o})",
+                dir.display(),
+                md.uid(),
+                md.mode() & 0o777
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Удаляет устаревший файл сокета, к которому никто не слушает.

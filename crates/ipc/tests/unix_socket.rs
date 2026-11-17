@@ -15,11 +15,20 @@ use tunnel_ipc::{
     check_hello, connect, read_msg, write_msg,
 };
 
-/// Короткий путь (лимит sun_path ~104 байта на macOS).
-fn sock_path() -> PathBuf {
+/// Свежий закрытый (`0700`) каталог под тест.
+fn private_dir() -> PathBuf {
     static N: AtomicU32 = AtomicU32::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("tipc-{}-{n}.sock", std::process::id()))
+    let d = std::env::temp_dir().join(format!("tipc-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir(&d).unwrap();
+    std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
+    d
+}
+
+/// Короткий путь (лимит sun_path ~104 байта на macOS).
+fn sock_path() -> PathBuf {
+    private_dir().join("s.sock")
 }
 
 #[test]
@@ -161,4 +170,18 @@ fn stale_socket_cleanup() {
         std::io::ErrorKind::InvalidInput
     );
     std::fs::remove_file(&f).unwrap();
+}
+
+#[test]
+fn bind_rejects_open_dir() {
+    let d = private_dir();
+    std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = d.join("s.sock");
+    assert_eq!(
+        Listener::bind(&path).err().unwrap().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert!(!path.exists());
+    std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
+    drop(Listener::bind(&path).unwrap());
 }
