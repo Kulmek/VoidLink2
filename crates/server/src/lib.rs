@@ -3009,6 +3009,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Падение сразу после BAN (без сохранения при остановке): с диска не
+    /// возвращается ни забаненный участник, ни уже выданный номер эпохи.
+    #[test]
+    fn бан_и_эпоха_переживают_падение() {
+        let (server, dir) = test_server("ban-crash");
+        let a = Raw::connect(server.addr, "alpha");
+        let gid = a.create("g", false).gid;
+        let b = Raw::connect(server.addr, "bravo");
+        b.send(ctrl::JOIN_GROUP, &payloads::enc_gid(gid));
+        b.state();
+        let store = persist::Store::new(&dir);
+        // «Падение» — загрузка того, что сейчас на диске, без shutdown.
+        let crashed = || {
+            let c = temp_dir("ban-crash-copy");
+            std::fs::create_dir_all(&c).unwrap();
+            std::fs::copy(dir.join("server.json"), c.join("server.json")).unwrap();
+            let l = load_state(&persist::Store::new(&c)).unwrap();
+            let _ = std::fs::remove_dir_all(&c);
+            l
+        };
+        let banned_on_disk =
+            |pk: &[u8; 32]| store.load().unwrap().unwrap().groups.iter().any(|g| g.id == gid && g.banned.contains(&hex(pk)));
+        a.send(ctrl::BAN, &payloads::enc_gid_target(gid, &b.pk));
+        b.expect(ctrl::KICKED);
+        let t0 = Instant::now();
+        wait_until_srv(Duration::from_secs(5), || banned_on_disk(&b.pk));
+        assert!(t0.elapsed() < Duration::from_millis(1500), "бан сохранён за {:?}", t0.elapsed());
+        let issued = server.shared.state.read().unwrap().groups[&gid].epoch;
+        let l = crashed();
+        let g = &l.groups[&gid];
+        assert!(g.banned.contains_key(&b.pk) && !g.members.contains_key(&b.pk), "забаненный вернулся");
+        assert!(g.epoch > issued, "эпоха {} повторяет выданную {issued}", g.epoch);
+        // UNBAN — тоже сразу.
+        a.send(ctrl::UNBAN, &payloads::enc_gid_target(gid, &b.pk));
+        a.expect(ctrl::ADMIN_INFO);
+        let t0 = Instant::now();
+        wait_until_srv(Duration::from_secs(5), || !banned_on_disk(&b.pk));
+        assert!(t0.elapsed() < Duration::from_millis(1500), "разбан сохранён за {:?}", t0.elapsed());
+        server.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn wait_until_srv(within: Duration, mut f: impl FnMut() -> bool) {
         let end = Instant::now() + within;
         while !f() {
