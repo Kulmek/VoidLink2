@@ -92,9 +92,7 @@ const GET_GROUP_EVERY: Duration = Duration::from_secs(1);
 /// нет, а повтор без изменения сервер не считает изменением: потерянная
 /// датаграмма чинится не дольше чем за период.
 const CAND_EVERY: Duration = Duration::from_secs(60);
-/// После смены статуса или невидимки — ещё столько повторов через
-/// `SELF_RETRY`: потерянный PRESENCE не оставляет клиента видимым на минуту.
-const SELF_RETRIES: u8 = 3;
+/// Пауза между повторами PRESENCE до подтверждения.
 const SELF_RETRY: Duration = Duration::from_secs(1);
 /// PRESENCE повторяется раз в `SELF_RETRY`, пока сервер не подтвердит его
 /// PRESENCE_ACK с тем же значением; дальше — только периодический повтор.
@@ -524,8 +522,8 @@ impl Meta {
     }
 }
 
-/// События движок → UI.
-#[derive(Clone, Debug)]
+/// События движок → UI. JSON (serde, внешний тег) — форма событий IPC демона.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Event {
     Connected(SocketAddr),
     Disconnected(String),
@@ -572,8 +570,8 @@ pub enum Event {
     Notice(String),
 }
 
-/// Команды UI → движок.
-#[derive(Clone, Debug)]
+/// Команды UI → движок. JSON (serde, внешний тег) — форма `Req.cmd` IPC демона.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Cmd {
     RefreshList,
     Create { name: String, private: bool },
@@ -601,6 +599,19 @@ pub enum Cmd {
     /// Переключить автовход в группу (локальная настройка).
     ToggleAutojoin(u32),
     FriendGroups([u8; 32]),
+    /// Друг в конфиг (PLAN.md 7.1): тот же pubkey — обновить alias.
+    AddFriend { pubkey: [u8; 32], alias: String },
+    /// Удалить друга из конфига.
+    DelFriend([u8; 32]),
+    /// Alias друга (переименование; друга нет — `Event::Error`).
+    SetAlias { pubkey: [u8; 32], alias: String },
+    /// Сервер в конфиг (`addr` — `ip:port`); тот же адрес — обновить ключ и
+    /// метку.
+    AddServer { addr: String, pubkey: [u8; 32], label: String },
+    /// Удалить сервер по индексу; текущий сервер движка не удаляется.
+    DelServer { idx: usize },
+    /// Сервер по умолчанию (первый в списке — его берёт следующий запуск).
+    SetPrimaryServer { idx: usize },
     Quit,
 }
 
@@ -637,6 +648,18 @@ impl Engine {
     #[allow(dead_code)]
     pub fn send_ip_packet(&self, packet: &[u8]) {
         route_packet(&self.env, packet);
+    }
+
+    /// Приёмник исходящих IP-пакетов для своего tun-потока (TUN, который
+    /// движок не читает сам: utun/Linux TUN в демоне).
+    pub fn ip_sink(&self) -> Arc<dyn Fn(&[u8]) + Send + Sync> {
+        let env = self.env.clone();
+        Arc::new(move |p: &[u8]| route_packet(&env, p))
+    }
+
+    /// Движок остановлен (Drop или `Cmd::Quit`) — tun-потокам пора выйти.
+    pub fn quitting(&self) -> bool {
+        self.env.quitting()
     }
 
     /// Эпоха, ключ и свой IP группы (тесты: «старый ключ» исключённого).
@@ -2337,6 +2360,15 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
             switch_server(env, st, addr, pubkey, label);
             return;
         }
+        Cmd::AddFriend { .. }
+        | Cmd::DelFriend(_)
+        | Cmd::SetAlias { .. }
+        | Cmd::AddServer { .. }
+        | Cmd::DelServer { .. }
+        | Cmd::SetPrimaryServer { .. } => {
+            cfg_cmd(env, st, cmd);
+            return;
+        }
         _ => {}
     }
     if !st.connected() {
@@ -2387,7 +2419,125 @@ fn do_cmd(env: &Env, st: &mut State, cmd: Cmd) {
         | Cmd::SetStatus(_)
         | Cmd::SetInvisible(_)
         | Cmd::SwitchServer { .. }
+        | Cmd::AddFriend { .. }
+        | Cmd::DelFriend(_)
+        | Cmd::SetAlias { .. }
+        | Cmd::AddServer { .. }
+        | Cmd::DelServer { .. }
+        | Cmd::SetPrimaryServer { .. }
         | Cmd::Leave(_) => {}
+    }
+}
+
+/// Проверка команды правки конфига до отправки движку (демон отвечает
+/// `Ack` Err сразу): `None` — команда допустима при текущем конфиге и
+/// сервере `current`.
+pub fn check_cfg_cmd(cfg: &Config, current: SocketAddr, cmd: &Cmd) -> Option<String> {
+    let same = |a: &str| a.parse::<SocketAddr>().ok() == Some(current);
+    match cmd {
+        Cmd::SetAlias { pubkey, .. } => {
+            let hex = proto::hex_of(pubkey);
+            (!cfg.friends.iter().any(|f| f.pubkey == hex)).then(|| "такого друга нет".into())
+        }
+        Cmd::DelFriend(pubkey) => {
+            let hex = proto::hex_of(pubkey);
+            (!cfg.friends.iter().any(|f| f.pubkey == hex)).then(|| "такого друга нет".into())
+        }
+        Cmd::AddServer { addr, .. } => {
+            addr.parse::<SocketAddr>().is_err().then(|| format!("неверный адрес сервера «{addr}» (нужен ip:port)"))
+        }
+        Cmd::DelServer { idx } => match cfg.servers.get(*idx) {
+            None => Some(format!("нет сервера №{idx}")),
+            Some(s) if same(&s.addr) => Some("текущий сервер не удаляется — сначала переключитесь".into()),
+            Some(_) => None,
+        },
+        Cmd::SetPrimaryServer { idx } => match cfg.servers.get(*idx) {
+            None => Some(format!("нет сервера №{idx}")),
+            Some(s) => {
+                let bad_addr = s.addr.parse::<SocketAddr>().is_err();
+                let bad_key = proto::hex_to_bytes(&s.pubkey).map(|v| v.len() != 32).unwrap_or(true);
+                (bad_addr || bad_key).then(|| format!("сервер №{idx}: неверный адрес или ключ"))
+            }
+        },
+        _ => None,
+    }
+}
+
+/// Команды правки конфига (PLAN.md 7.1): правка `env.cfg` + колбэк
+/// сохранения; результат — `Notice`, отказ — `Error`.
+fn cfg_cmd(env: &Env, st: &mut State, cmd: Cmd) {
+    let current = env.server();
+    if let Some(e) = check_cfg_cmd(&env.cfg.lock().unwrap(), current, &cmd) {
+        env.emit(Event::Error(e));
+        return;
+    }
+    match cmd {
+        Cmd::AddFriend { pubkey, alias } => {
+            let hex = proto::hex_of(&pubkey);
+            let a = alias.clone();
+            env.update_cfg(|c| match c.friends.iter_mut().find(|f| f.pubkey == hex) {
+                Some(f) => f.alias = a,
+                None => c.friends.push(crate::store::StoredFriend { pubkey: hex, alias: a }),
+            });
+            env.emit(Event::Notice(format!("друг добавлен: {alias}")));
+        }
+        Cmd::DelFriend(pubkey) => {
+            let hex = proto::hex_of(&pubkey);
+            env.update_cfg(|c| c.friends.retain(|f| f.pubkey != hex));
+            env.emit(Event::Notice("друг удалён".into()));
+        }
+        Cmd::SetAlias { pubkey, alias } => {
+            let hex = proto::hex_of(&pubkey);
+            let a = alias.clone();
+            env.update_cfg(|c| {
+                if let Some(f) = c.friends.iter_mut().find(|f| f.pubkey == hex) {
+                    f.alias = a;
+                }
+            });
+            env.emit(Event::Notice(format!("alias: {alias}")));
+        }
+        Cmd::AddServer { addr, pubkey, label } => {
+            let hex = proto::hex_of(&pubkey);
+            let sa: SocketAddr = addr.parse().expect("проверено в check_cfg_cmd");
+            let l = label.clone();
+            env.update_cfg(|c| {
+                match c.servers.iter_mut().find(|s| s.addr.parse::<SocketAddr>().ok() == Some(sa)) {
+                    Some(s) => {
+                        s.pubkey = hex;
+                        s.label = l;
+                    }
+                    None => c.servers.push(crate::store::StoredServer { addr: sa.to_string(), pubkey: hex, label: l }),
+                }
+            });
+            if sa == current {
+                env.meta.lock().unwrap().server_label = label.clone();
+            }
+            env.emit(Event::Notice(format!("сервер добавлен: {sa}")));
+        }
+        Cmd::DelServer { idx } => {
+            let mut gone = String::new();
+            env.update_cfg(|c| gone = c.servers.remove(idx).addr);
+            env.emit(Event::Notice(format!("сервер удалён: {gone}")));
+        }
+        Cmd::SetPrimaryServer { idx } => {
+            // Первый в списке — сервер по умолчанию; если это не текущий —
+            // движок сразу переключается на него (он же станет активным).
+            let mut entry = None;
+            env.update_cfg(|c| {
+                let s = c.servers.remove(idx);
+                entry = Some(s.clone());
+                c.servers.insert(0, s);
+            });
+            let s = entry.expect("сервер есть (проверено)");
+            let addr: SocketAddr = s.addr.parse().expect("проверено в check_cfg_cmd");
+            env.emit(Event::Notice(format!("сервер по умолчанию: {addr}")));
+            if addr != current {
+                let mut pk = [0u8; 32];
+                pk.copy_from_slice(&proto::hex_to_bytes(&s.pubkey).expect("проверено в check_cfg_cmd"));
+                switch_server(env, st, addr, pk, s.label);
+            }
+        }
+        _ => {}
     }
 }
 

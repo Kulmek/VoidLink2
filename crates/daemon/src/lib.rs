@@ -1,11 +1,12 @@
 //! tunnel-daemon: кроссплатформенное ядро демона (PLAN.md, этап 7.3).
 //!
-//! Движок сюда не подключён — демон знает о нём только через трейт
-//! [`hub::Backend`] (JSON-снимки и события). IPC — [`server`] поверх
-//! `tunnel-ipc`; [`fake::FakeBackend`] — бэкенд в памяти для тестов и
-//! `console --fake`.
+//! Хаб и IPC знают о движке только через трейт [`hub::Backend`]
+//! (JSON-снимки и события); [`engine_backend::EngineBackend`] — бэкенд на
+//! настоящем движке `tunnel-client`. IPC — [`server`] поверх `tunnel-ipc`;
+//! [`fake::FakeBackend`] — бэкенд в памяти для тестов и `console --fake`.
 
 pub mod cli;
+pub mod engine_backend;
 pub mod fake;
 pub mod hub;
 pub mod lock;
@@ -13,6 +14,7 @@ pub mod log;
 pub mod server;
 pub mod service;
 
+pub use engine_backend::EngineBackend;
 pub use fake::FakeBackend;
 pub use hub::{Backend, Hub, HubMsg, Subscription};
 pub use lock::{InstanceLock, LockError};
