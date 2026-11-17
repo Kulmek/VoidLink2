@@ -124,8 +124,10 @@ pub fn badges(state: &BadgeState, th: &Theme) -> Vec<Badge> {
         out.push(Badge {
             kind: BadgeKind::Invites,
             spans: vec![
+                // '✦' (U+2726): без emoji-представления, во всех терминалах — 1 ячейка
+                // ('✉' в Windows Terminal/iTerm рисуется шириной 2 и сдвигает зону клика).
                 Span::styled(
-                    format!("✉ {}", state.pending_invites),
+                    format!("✦ {}", state.pending_invites),
                     th.accent.add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(format!(" [{INVITES_KEY}]"), th.dim),
@@ -257,8 +259,6 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    const THEMES: [ThemeKind; 3] = [ThemeKind::Dark, ThemeKind::Light, ThemeKind::Contrast];
-
     fn full() -> BadgeState {
         BadgeState {
             pending_invites: 3,
@@ -283,10 +283,10 @@ mod tests {
 
     #[test]
     fn все_бейджи_на_широком_экране() {
-        for kind in THEMES {
+        for kind in ThemeKind::ALL {
             let (text, hits) = render(&full(), kind, 120);
             assert!(text.contains("В сети"), "{text}");
-            assert!(text.contains("✉ 3"), "{text}");
+            assert!(text.contains("✦ 3"), "{text}");
             assert!(text.contains("[o]"), "{text}");
             assert!(text.contains("◌ невидимка"), "{text}");
             assert!(text.contains("TCP"), "{text}");
@@ -298,7 +298,7 @@ mod tests {
 
     #[test]
     fn узкий_экран_теряет_маловажное() {
-        for kind in THEMES {
+        for kind in ThemeKind::ALL {
             for w in [40u16, 80, 120] {
                 let th = Theme::of(kind);
                 let line = fit_badges(&full(), &th, w);
@@ -308,7 +308,7 @@ mod tests {
                 assert!(line.kinds.contains(&BadgeKind::Invites), "w={w}");
                 let (text, hits) = render(&full(), kind, w);
                 assert!(text.contains("В сети"), "w={w}: {text}");
-                assert!(text.contains("✉ 3"), "w={w}: {text}");
+                assert!(text.contains("✦ 3"), "w={w}: {text}");
                 assert_eq!(hits.len(), 1);
             }
             let line = fit_badges(&full(), &Theme::of(kind), 40);
@@ -336,7 +336,7 @@ mod tests {
     fn приглашения_скрыты_при_нуле() {
         let st = BadgeState { pending_invites: 0, ..full() };
         let (text, hits) = render(&st, ThemeKind::Dark, 120);
-        assert!(!text.contains('✉'), "{text}");
+        assert!(!text.contains('✦'), "{text}");
         assert!(hits.is_empty());
     }
 
@@ -346,7 +346,7 @@ mod tests {
         let r = hits[0].0;
         let cells: Vec<String> = text.chars().map(String::from).collect();
         let got: String = cells[r.x as usize..(r.x + r.width) as usize].concat();
-        assert_eq!(got, "✉ 3 [o]");
+        assert_eq!(got, "✦ 3 [o]");
     }
 
     #[test]
@@ -366,5 +366,10 @@ mod tests {
             assert!(text.contains("UDP"), "{text}");
             assert!(!text.contains("невидимка"));
         }
+    }
+
+    #[test]
+    fn глиф_приглашений_одна_ячейка() {
+        assert_eq!(Span::raw("✦").width(), 1);
     }
 }
