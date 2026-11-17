@@ -14,8 +14,10 @@ use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::fd::AsRawFd;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -28,14 +30,18 @@ const IFF_NO_PI: libc::c_short = 0x1000;
 /// Максимальная длина имени интерфейса с завершающим нулём.
 const IFNAMSIZ: usize = 16;
 
-/// struct ifreq для TUNSETIFF: имя + флаги, остаток union добит нулями
-/// (полный размер ifreq на 64-битном Linux — 40 байт).
+/// Размер добивки union до полного sizeof(ifreq) текущей платформы
+/// (40 байт на 64-битном Linux, 32 — на 32-битном).
+const IFREQ_PAD: usize =
+    std::mem::size_of::<libc::ifreq>() - IFNAMSIZ - std::mem::size_of::<libc::c_short>();
+
+/// struct ifreq для TUNSETIFF: имя + флаги, остаток union добит нулями.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct IfReqFlags {
     name: [u8; IFNAMSIZ],
     flags: libc::c_short,
-    _pad: [u8; 22],
+    _pad: [u8; IFREQ_PAD],
 }
 
 /// Собирает ifreq для TUNSETIFF. Имя должно быть непустым ASCII без '/', пробелов
@@ -45,7 +51,7 @@ fn build_ifreq(name: &str) -> Result<IfReqFlags> {
     let mut req = IfReqFlags {
         name: [0; IFNAMSIZ],
         flags: IFF_TUN | IFF_NO_PI,
-        _pad: [0; 22],
+        _pad: [0; IFREQ_PAD],
     };
     req.name[..name.len()].copy_from_slice(name.as_bytes());
     Ok(req)
@@ -223,29 +229,97 @@ impl LinuxTun {
     }
 }
 
+/// Как часто поток-читатель проверяет флаг остановки, если пакетов нет.
+const READER_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Ждёт готовности fd на чтение не дольше `timeout`. true — данные есть.
+fn wait_readable(fd: libc::c_int, timeout: Duration) -> Result<bool> {
+    let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+    let ms = timeout.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
+    loop {
+        // SAFETY: pfd — валидный указатель на один pollfd.
+        let rc = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if rc < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e).context("poll TUN");
+        }
+        if rc == 0 {
+            return Ok(false);
+        }
+        if pfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            bail!("TUN закрыт или в ошибке (revents={:#x})", pfd.revents);
+        }
+        // POLLIN или POLLHUP: read вернёт данные либо 0 (конец потока).
+        return Ok(true);
+    }
+}
+
+/// Хендл потока-читателя TUN. `stop()` останавливает поток и дожидается его;
+/// при drop без `stop()` поток тоже получает сигнал остановки (без ожидания).
+pub struct TunReader {
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<Result<()>>>,
+}
+
+impl TunReader {
+    /// Останавливает поток (не позже чем через ~250 мс) и возвращает его результат.
+    pub fn stop(mut self) -> Result<()> {
+        self.stop.store(true, Ordering::Relaxed);
+        match self.thread.take() {
+            Some(h) => h.join().map_err(|_| anyhow!("поток чтения TUN паникнул"))?,
+            None => Ok(()),
+        }
+    }
+
+    /// Поток уже завершился сам (ошибка, EOF или on_packet вернул false).
+    pub fn is_finished(&self) -> bool {
+        self.thread.as_ref().is_none_or(|h| h.is_finished())
+    }
+}
+
+impl Drop for TunReader {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Запускает поток-читатель: каждый пакет из TUN передаётся в `on_packet`.
-/// Поток завершается, когда `on_packet` вернёт false или чтение упадёт с ошибкой
-/// (ошибка возвращается из join).
-pub fn spawn_reader<F>(tun: Arc<LinuxTun>, mut on_packet: F) -> Result<JoinHandle<Result<()>>>
+/// Поток завершается по `TunReader::stop()`, когда `on_packet` вернёт false,
+/// на конце потока (read вернул 0) или при ошибке чтения (ошибка — из `stop()`).
+/// Ожидание идёт через poll с таймаутом, поэтому остановка не зависит от
+/// прихода следующего пакета и `Arc<LinuxTun>` (а с ним fd) освобождается.
+pub fn spawn_reader<F>(tun: Arc<LinuxTun>, mut on_packet: F) -> Result<TunReader>
 where
     F: FnMut(&[u8]) -> bool + Send + 'static,
 {
     let buf_len = tun.mtu().max(1500) + 64;
-    std::thread::Builder::new()
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_rx = stop.clone();
+    let thread = std::thread::Builder::new()
         .name("tun-linux-rx".into())
         .spawn(move || {
+            let fd = tun.file.as_raw_fd();
             let mut buf = vec![0u8; buf_len];
-            loop {
+            while !stop_rx.load(Ordering::Relaxed) {
+                if !wait_readable(fd, READER_POLL_INTERVAL)? {
+                    continue;
+                }
                 let n = tun.read(&mut buf)?;
                 if n == 0 {
-                    continue;
+                    // EOF: устройство разобрано — дальше читать нечего.
+                    return Ok(());
                 }
                 if !on_packet(&buf[..n]) {
                     return Ok(());
                 }
             }
+            Ok(())
         })
-        .context("запуск потока чтения TUN")
+        .context("запуск потока чтения TUN")?;
+    Ok(TunReader { stop, thread: Some(thread) })
 }
 
 #[cfg(test)]
@@ -254,7 +328,6 @@ mod tests {
 
     #[test]
     fn ifreq_size_matches_kernel() {
-        assert_eq!(std::mem::size_of::<IfReqFlags>(), 40);
         assert_eq!(std::mem::size_of::<IfReqFlags>(), std::mem::size_of::<libc::ifreq>());
     }
 
@@ -294,6 +367,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn wait_readable_timeout_and_data() {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: fds — массив из двух int.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        assert!(!wait_readable(fds[0], Duration::from_millis(10)).unwrap());
+        // SAFETY: fds[1] — валидный fd записи pipe.
+        assert_eq!(unsafe { libc::write(fds[1], b"x".as_ptr().cast(), 1) }, 1);
+        assert!(wait_readable(fds[0], Duration::from_millis(10)).unwrap());
+        // SAFETY: закрываем свои fd.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+    }
+
     /// Требует root: `sudo -E cargo test -p tunnel-client tun_linux -- --ignored`.
     #[test]
     #[ignore]
@@ -313,5 +402,11 @@ mod tests {
         pkt[12..16].copy_from_slice(&[10, 250, 1, 3]);
         pkt[16..20].copy_from_slice(&[10, 250, 1, 2]);
         let _ = tun.write(&pkt);
+        // Читатель без пакетов должен останавливаться по stop() за ~250 мс.
+        let reader = spawn_reader(tun.clone(), |_| true).unwrap();
+        let t = std::time::Instant::now();
+        reader.stop().unwrap();
+        assert!(t.elapsed() < Duration::from_secs(2));
+        assert_eq!(Arc::strong_count(&tun), 1);
     }
 }
