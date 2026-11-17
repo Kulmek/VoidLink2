@@ -41,7 +41,7 @@
 |---|---|---|---|
 | Конфиг клиента `client.json` | `%APPDATA%\tunnel\` | `~/.tunnel-client/` | `tunnel-client --dir <путь>` |
 | Профиль клиента | `%APPDATA%\tunnel\profiles\<имя>\` | `~/.tunnel-client/profiles/<имя>/` | `--profile <имя>` |
-| Настройки UI `ui.json` | `%APPDATA%\tunnel\` | `~/.tunnel-client/` | **план**, в коде не читается |
+| Настройки UI `ui.json` | `%APPDATA%\tunnel\` | `~/.tunnel-client/` | тема TUI в тонком режиме (при демоне) |
 | Конфиг и данные демона | `%ProgramData%\tunnel\` (`C:\ProgramData\tunnel`, если переменной нет) | `~/.tunnel-client/` (как у клиента) | `tunnel-daemon console\|service --data-dir <каталог>` |
 | Состояние сервера `server.json` | — | `tunnel-data/` рядом с запуском по умолчанию, в systemd-юните `/var/lib/tunnel/` | `--data <каталог>` |
 | IPC демона | пайп `\\.\pipe\tunnel-daemon` | сокет `daemon.sock` в каталоге данных | — |
@@ -175,7 +175,7 @@ flowchart TD
 ```text
 %APPDATA%\tunnel\                     (или ~/.tunnel-client/)
 ├── client.json                       профиль по умолчанию
-├── ui.json                           настройки UI (план, не читается)
+├── ui.json                           настройки UI: тема тонкого TUI
 └── profiles/
     ├── work/
     │   └── client.json
@@ -222,12 +222,12 @@ flowchart TD
 
 ## ui.json
 
-Файл `ui.json` — **план**. Задуман для настроек интерфейса, которые не должны
-попадать в конфиг службы. Пример: тема оформления для трея и TUI под
-учётной записью пользователя, а не SYSTEM. В текущей версии тема хранится в
-`client.json` (поле `theme`), и `ui.json` не читается.
-
-При появлении он будет лежать в `%APPDATA%\tunnel\ui.json`:
+Файл `ui.json` — локальные настройки тонкого TUI (`tunnel-client tui`, когда
+движок в демоне). Нужен потому, что `client.json` принадлежит демону и TUI его не
+пишет. Лежит в каталоге данных клиента (`%APPDATA%\tunnel\ui.json`,
+`~/.tunnel-client/ui.json` или `--dir`); читается и записывается атомарно
+(`remote.rs`, `UiPrefs`). Без демона (embedded) тема хранится в `client.json`
+(поле `theme`).
 
 ```json
 {

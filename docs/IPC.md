@@ -22,6 +22,12 @@
 
 ## Обзор
 
+Потребители протокола: трей (`crates/tray`), TUI и CLI (`tunnel-client`:
+`IpcEngine` в `remote.rs` держит соединение, кэширует снимок и переподключается раз
+в секунду; `remote_cli.rs` выполняет однострочные команды через демона). Замок
+single-instance (`tunnel-ipc::lock`) общий для демона, embedded TUI и `run`.
+Подробнее — [DAEMON.md](DAEMON.md).
+
 ```mermaid
 sequenceDiagram
     participant F as Фронтенд (TUI / трей / CLI)

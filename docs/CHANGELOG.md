@@ -62,6 +62,12 @@
 
 **Интерфейс (TUI и CLI)**
 
+- TUI и CLI поверх демона (этап 7.4, `25717ac`): трейт `EngineApi`
+  (`LocalEngine` / `IpcEngine`), `tunnel-client tui [--embedded|--remote]`,
+  маршрутизация CLI «демон / замок занят / напрямую», общий замок
+  single-instance в `tunnel-ipc`, тема тонкого TUI в `ui.json`. При демоне
+  `set-transport`, `set-mtu`, `dns`, `import-identity` и `run` отказывают.
+
 - Окно приглашения с действиями «Принять», «Отклонить», «Позже»; очередь
   без дублей, защита от случайного нажатия (400 мс). Отложенные
   приглашения доступны по `o` или `:invites`.
